@@ -1,13 +1,20 @@
 import pydantic
 
 from .core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
-from ..services.errors import ConfigurationNotFound
-from ..services.utils import find_config_for_action
+from app.services.errors import ConfigurationNotFound
+from app.services.utils import find_config_for_action, GlobalUISchemaOptions
 
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     username: str
     password: pydantic.SecretStr = pydantic.Field(..., format="password")
+
+    ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
+        order=[
+            "username",
+            "password",
+        ],
+    )
 
 
 class PullObservationsConfig(PullActionConfiguration):
