@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y autoconf automake libtool make python3-
 WORKDIR /code
 
 COPY requirements.txt .
-RUN pip install --upgrade pip && pip install -r /code/requirements.txt
+RUN pip install --upgrade "pip<25.3" && pip install -r /code/requirements.txt
 COPY ./app app/
 
 FROM baseimage AS devimage
