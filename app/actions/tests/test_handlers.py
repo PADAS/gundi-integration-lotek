@@ -4,9 +4,9 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 from gundi_core.schemas.v2 import Integration, LogLevel
-from app.actions.handlers import action_auth, transform, action_pull_observations
+from app.actions.handlers import action_auth, filter_and_transform_positions, action_pull_observations
 from app.actions.configurations import AuthenticateConfig, PullObservationsConfig
-from app.actions.client import LotekPosition, LotekDevice, LotekException, LotekConnectionException
+from app.actions.client import LotekPosition, LotekDevice, LotekException, LotekUnauthorizedException
 
 @pytest.fixture
 def lotek_integration():
@@ -89,7 +89,7 @@ async def test_action_auth_success(mocker, lotek_integration, auth_config):
 
 @pytest.mark.asyncio
 async def test_action_auth_invalid_credentials(mocker, lotek_integration, auth_config):
-    mocker.patch("app.actions.client.get_token", new=AsyncMock(side_effect=LotekConnectionException(Exception(), "Invalid credentials")))
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(side_effect=LotekUnauthorizedException(Exception(), "Invalid credentials")))
     result = await action_auth(lotek_integration, auth_config)
     assert result == {"valid_credentials": False, "message": "Invalid credentials"}
 
@@ -99,14 +99,16 @@ async def test_action_auth_http_error(mocker, lotek_integration, auth_config):
     result = await action_auth(lotek_integration, auth_config)
     assert result == {"error": "An internal error occurred while trying to test credentials. Please try again later."}
 
-def test_transform_success(mocker, lotek_position, lotek_integration):
-    result = transform(lotek_position, lotek_integration)
-    assert result["source"] == lotek_position.DeviceID
-    assert result["location"]["lat"] == lotek_position.Latitude
-    assert result["location"]["lon"] == lotek_position.Longitude
+def test_filter_and_transform_positions_success(mocker, lotek_position, lotek_integration):
+    result = filter_and_transform_positions([lotek_position], lotek_integration)
+    assert len(result) == 1
+    assert result[0]["source"] == lotek_position.DeviceID
+    assert result[0]["source_name"] == lotek_position.DevName
+    assert result[0]["location"]["lat"] == lotek_position.Latitude
+    assert result[0]["location"]["lon"] == lotek_position.Longitude
 
 @pytest.mark.asyncio
-async def test_invalid_position_sends_log_activity(mocker, lotek_position, lotek_integration, pull_config, mock_redis):
+async def test_invalid_position_is_filtered_and_sends_log_activity_if_no_valid_observations(mocker, lotek_position, lotek_integration, pull_config, mock_redis):
     mocker.patch("app.services.state.redis", mock_redis)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
@@ -114,7 +116,7 @@ async def test_invalid_position_sends_log_activity(mocker, lotek_position, lotek
     # remove Latitude from lotek position
     lotek_position.Latitude = None
     mocker.patch("app.actions.client.get_positions", new=AsyncMock(return_value=[lotek_position]))
-    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value=None))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
     result = await action_pull_observations(lotek_integration, pull_config)
@@ -123,7 +125,7 @@ async def test_invalid_position_sends_log_activity(mocker, lotek_position, lotek
         integration_id=str(lotek_integration.id),
         action_id="pull_observations",
         level=LogLevel.WARNING,
-        title=f"Found 1 bad points in Lotek data for device {lotek_position.DeviceID}."
+        title=f"No positions fetched for device {lotek_position.DeviceID} integration ID: {lotek_integration.id}."
     )
 
 @pytest.mark.asyncio
@@ -133,7 +135,7 @@ async def test_action_pull_observations_success(mocker, lotek_integration, pull_
     mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
     mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=[LotekDevice(nDeviceID="1", strSpecialID="special", dtCreated=datetime.now(), strSatellite="satellite")]))
     mocker.patch("app.actions.client.get_positions", new=AsyncMock(return_value=[]))
-    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value=None))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
     result = await action_pull_observations(lotek_integration, pull_config)
     assert result == {'observations_extracted': 0}
@@ -153,6 +155,6 @@ async def test_action_pull_observations_error(mocker, lotek_integration, pull_co
     mock_log_action_activity.assert_called_with(
         integration_id=str(lotek_integration.id),
         action_id="pull_observations",
-        level=LogLevel.WARNING,
+        level=LogLevel.ERROR,
         title=f"Error fetching devices from Lotek. Integration ID: {str(lotek_integration.id)} Exception: '500: Lotek get_devices failed for user test_user., Error: '"
     )
