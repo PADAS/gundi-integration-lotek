@@ -119,7 +119,7 @@ async def get_token_from_api(integration, auth):
         else:
             if not response:
                 msg = f'Lotek login failed for user {auth.username}. Token response is: {response.text}'
-                raise LotekException(message=msg, status_code=response.status_code, error=Exception())
+                raise LotekException(message=msg, status_code=response.status_code)
             data = response.json()
             return data.get('access_token', None)
 
