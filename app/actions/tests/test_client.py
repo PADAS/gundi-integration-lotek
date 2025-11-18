@@ -124,6 +124,7 @@ async def test_get_positions_unauthorized_raises(mocker, lotek_integration, auth
     exc = httpx.HTTPStatusError("401", request=resp.request, response=resp)
     mock_client = _make_mock_client(raise_exc=exc, method="get")
     mocker.patch("app.actions.client.get_token", return_value="token")
+    mocker.patch("app.actions.client.state_manager.delete_state", return_value=None)
     mocker.patch("app.actions.client.httpx.AsyncClient", return_value=mock_client)
 
     from_date = datetime.now(timezone.utc)
