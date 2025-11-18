@@ -39,7 +39,7 @@ def get_auth_config(integration):
     return AuthenticateConfig.parse_obj(auth_config.data)
 
 def get_pull_config(integration):
-    # Look for the login credentials, needed for any action
+    # Look for pull observations configuration
     pull_config = find_config_for_action(
         configurations=integration.configurations,
         action_id="pull_observations"
