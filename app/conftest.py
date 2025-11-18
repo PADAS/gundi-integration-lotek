@@ -43,6 +43,9 @@ from app.webhooks import (
     WebhookConfiguration,
 )
 
+from app.actions.configurations import AuthenticateConfig, PullObservationsConfig
+from app.actions.client import LotekPosition
+
 
 class AsyncMock(MagicMock):
     async def __call__(self, *args, **kwargs):
@@ -2124,3 +2127,78 @@ def mock_webhook_request_payload_for_fixed_schema():
         "lat": -2.3828796,
         "lon": 35.3380609,
     }
+
+#  Lotek specific fixtures
+
+@pytest.fixture
+def lotek_integration():
+    return Integration.parse_obj(
+        {
+            "id": "779ff3ab-5589-4f4c-9e0a-ae8d6c9edff0",
+            "name": "Lotek TEST",
+            "base_url": "https://lotek-test.com",
+            "enabled": True,
+            "type": {
+                "id": "50229e21-a9fe-4caa-862c-8592dfb2479b",
+                "name": "Lotek",
+                "value": "lotek",
+                "description": "Integration type for Lotek",
+            },
+            "owner": {
+                "id": "a91b400b-482a-4546-8fcb-ee42b01deeb6",
+                "name": "Test Org",
+                "description": "",
+            },
+            "configurations": [
+                {
+                    "id": "30f8878c-4a98-4c95-88eb-79f73c40fb2f",
+                    "integration": "779ff3ab-5589-4f4c-9e0a-ae8d6c9edff0",
+                    "action": {
+                        "id": "80448d1c-4696-4b32-a59f-f3494fc949ac",
+                        "type": "auth",
+                        "name": "Authenticate",
+                        "value": "auth",
+                    },
+                    "data": {"username": "test_user", "password": "test_pass"},
+                },
+            ],
+            "additional": {},
+            "status": "healthy",
+            "status_details": ""
+        }
+    )
+
+@pytest.fixture
+def auth_config():
+    return AuthenticateConfig(username="test_user", password="test_pass")
+
+@pytest.fixture
+def pull_config():
+    return PullObservationsConfig()
+
+@pytest.fixture
+def lotek_position():
+    return LotekPosition(
+        ChannelStatus="OK",
+        UploadTimeStamp=datetime.datetime.now(datetime.timezone.utc),
+        Latitude=12.34,
+        Longitude=56.78,
+        Altitude=100.0,
+        ECEFx=1,
+        ECEFy=2,
+        ECEFz=3,
+        RxStatus=0,
+        PDOP=1.0,
+        MainV=3.7,
+        BkUpV=3.7,
+        Temperature=25.0,
+        FixDuration=10,
+        bHasTempVoltage=True,
+        DevName="Device1",
+        DeltaTime=0,
+        FixType=1,
+        CEPRadius=5,
+        CRC=12345,
+        DeviceID=1,
+        RecDateTime=datetime.datetime.now(datetime.timezone.utc)
+    )

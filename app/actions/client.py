@@ -4,6 +4,7 @@ import pydantic
 
 from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
+from typing import Optional
 from app.services.state import IntegrationStateManager
 
 
@@ -16,19 +17,22 @@ state_manager = IntegrationStateManager()
 
 
 class LotekException(Exception):
-    def __init__(self, error: Exception, message: str, status_code=500):
+    def __init__(self, message: str, error: Optional[Exception] = None, status_code: int = 500):
         self.status_code = status_code
         self.message = message
         self.error = error
-        super().__init__(f"'{self.status_code}: {self.message}, Error: {self.error}'")
+        super().__init__(self.__str__())
+
+    def __str__(self) -> str:
+        base = f"{self.status_code}: {self.message}"
+        if self.error is not None:
+            return f"{base} | Error: {self.error}"
+        return base
 
 
 class LotekUnauthorizedException(LotekException):
-    def __init__(self, error: Exception, message: str, status_code=401):
-        self.status_code = status_code
-        self.message = message
-        self.error = error
-        super().__init__(error=error, message=message, status_code=status_code)
+    def __init__(self, message: str = "Unauthorized", error: Optional[Exception] = None, status_code: int = 401):
+        super().__init__(message=message, error=error, status_code=status_code)
 
 
 class LotekPosition(BaseModel):
@@ -113,13 +117,10 @@ async def get_token_from_api(integration, auth):
             base_url = integration.base_url or 'https://webservice.lotek.com/API'
             response = await session.post(base_url + "/user/login", data=params)
             response.raise_for_status()
-        except httpx.HTTPError as ex:
+        except httpx.HTTPStatusError as ex:
             msg = f'Lotek login failed for user {auth.username}. Caught exception: {ex}'
-            raise LotekException(message=msg, error=ex, status_code=response.status_code)
+            raise LotekException(message=msg, error=ex, status_code=ex.response.status_code)
         else:
-            if not response:
-                msg = f'Lotek login failed for user {auth.username}. Token response is: {response.text}'
-                raise LotekException(message=msg, status_code=response.status_code)
             data = response.json()
             return data.get('access_token', None)
 
@@ -135,8 +136,8 @@ async def get_devices(integration, auth):
             base_url = integration.base_url or 'https://webservice.lotek.com/API'
             response = await session.get(base_url + "/devices", headers=headers)
             response.raise_for_status()
-    except httpx.HTTPError as ex:
-        if response.status_code == 401:
+    except httpx.HTTPStatusError as ex:
+        if ex.response.status_code == 401:
             msg = "Received status code 401 - Token expired, fetching a new one..."
             logger.info(msg)
             await state_manager.delete_state(
@@ -147,7 +148,7 @@ async def get_devices(integration, auth):
             raise LotekUnauthorizedException(message=f"401 Response from Lotek API", error=ex)
         else:
             msg = f'Lotek get_devices failed for user {auth.username}. Caught exception: {ex}'
-            raise LotekException(status_code=response.status_code, message=msg, error=ex)
+            raise LotekException(status_code=ex.response.status_code, message=msg, error=ex)
     else:
         data = response.json()
         devices = [LotekDevice(**device) for device in data]
@@ -179,11 +180,11 @@ async def get_positions(device_id, auth, integration, start_datetime=None, end_d
             base_url = integration.base_url or 'https://webservice.lotek.com/API'
             response = await session.get(base_url + "/positions/findByDate", params=params, headers=headers)
             response.raise_for_status()
-        except httpx.HTTPError as e:
-            if response.status_code == 400:
+        except httpx.HTTPStatusError as ex:
+            if ex.response.status_code == 400:
                 logger.info("Received status code 400 - Lotek throws this when there are no data")
                 return []
-            if response.status_code == 401:
+            if ex.response.status_code == 401:
                 msg = "Received status code 401 - Token expired, fetching a new one..."
                 logger.info(msg)
                 await state_manager.delete_state(
@@ -191,17 +192,18 @@ async def get_positions(device_id, auth, integration, start_datetime=None, end_d
                     "pull_observations",
                     "token"
                 )
-                raise LotekUnauthorizedException(message=f"401 Response from Lotek API", error=e)
+                raise LotekUnauthorizedException(message=f"401 Response from Lotek API", error=ex)
 
+            msg = f'Lotek get_positions failed for user {auth.username}. Caught exception: {ex}'
             logger.exception(
-                f'Lotek get_positions failed for user {auth.username}. Caught exception: {e}',
+                msg,
                 extra={
                     "attention_needed": True,
                     "device_id": str(device_id),
                     "integration_type": "lotek"
                 }
             )
-            raise e
+            raise LotekException(status_code=ex.response.status_code, error=ex, message=msg)
         else:
             positions = response.json()
             logger.debug('Got %d positions using params=%s', len(positions), params)

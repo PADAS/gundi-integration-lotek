@@ -54,8 +54,8 @@ def get_pull_config(integration):
 async def action_auth(integration, action_config: AuthenticateConfig):
     logger.info(f"Executing auth action with integration {integration} and action_config {action_config}...")
     try:
-        token = await client.get_token(integration, action_config)
-    except LotekUnauthorizedException as e:
+        token = await client.get_token_from_api(integration, action_config)
+    except LotekException as e:
         logger.exception(f"Auth unsuccessful for integration {integration.id}. Lotek returned 401 (Unauthorized). Exc: {e}")
         return {"valid_credentials": False, "message": "Invalid credentials"}
     except httpx.HTTPError as e:
