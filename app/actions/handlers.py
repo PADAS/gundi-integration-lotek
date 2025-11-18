@@ -167,7 +167,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                     })
                     raise e
                 else:
-                    observations_extracted += len(cdip_positions)
+                    observations_extracted += len(batch)
 
             latest_time = max(cdip_positions, key=lambda obs: obs["recorded_at"])["recorded_at"]
             state = {"updated_at": latest_time}
