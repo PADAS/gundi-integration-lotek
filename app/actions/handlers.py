@@ -128,7 +128,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         try:
             saved_state = await state_manager.get_state(str(integration.id), "pull_observations", device.nDeviceID)
             state = client.IntegrationState.parse_obj({"updated_at": saved_state.get("updated_at")})
-        except pydantic.ValidationError:
+        except pydantic.ValidationError as e:
+            logger.debug(f"Failed to parse saved state for device {device.nDeviceID}, using default state. Error: {e}")
             state = client.IntegrationState()
 
         lower_date = max(present_time - timedelta(days=7), state.updated_at)
