@@ -108,7 +108,7 @@ def test_filter_and_transform_positions_success(mocker, lotek_position, lotek_in
     assert result[0]["location"]["lon"] == lotek_position.Longitude
 
 @pytest.mark.asyncio
-async def test_invalid_position_is_filtered_and_sends_log_activity_if_no_valid_observations(mocker, lotek_position, lotek_integration, pull_config, mock_redis):
+async def test_invalid_position_filtered_and_logs_warning_when_no_valid_observations(mocker, lotek_position, lotek_integration, pull_config, mock_redis):
     mocker.patch("app.services.state.redis", mock_redis)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
