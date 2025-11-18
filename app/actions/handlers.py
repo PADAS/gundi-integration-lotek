@@ -73,7 +73,7 @@ def filter_and_transform_positions(positions, integration):
     valid_positions = []
     for position in positions:
         try:
-            if not position.Longitude or not position.Latitude:
+            if position.Longitude is None or position.Latitude is None:
                 msg = f"Filtering {position} (bad location) for device {position.DeviceID}."
                 logger.info(msg)
                 continue
