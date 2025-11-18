@@ -9,8 +9,10 @@ import app.settings.integration as settings
 
 from datetime import datetime, timezone, timedelta
 
-from app.actions.client import LotekException, LotekConnectionException
-from app.actions.configurations import get_auth_config, AuthenticateConfig, PullObservationsConfig
+from app.services.errors import ConfigurationNotFound
+from app.actions.client import LotekException, LotekUnauthorizedException
+from app.services.utils import find_config_for_action
+from app.actions.configurations import AuthenticateConfig, PullObservationsConfig
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.state import IntegrationStateManager
 from gundi_core.schemas.v2.gundi import LogLevel
@@ -18,12 +20,43 @@ from gundi_core.schemas.v2.gundi import LogLevel
 logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
+
+def generate_batches(iterable, n=settings.OBSERVATIONS_BATCH_SIZE):
+    for i in range(0, len(iterable), n):
+        yield iterable[i: i + n]
+
+def get_auth_config(integration):
+    # Look for the login credentials, needed for any action
+    auth_config = find_config_for_action(
+        configurations=integration.configurations,
+        action_id="auth"
+    )
+    if not auth_config:
+        raise ConfigurationNotFound(
+            f"Authentication settings for integration {str(integration.id)} "
+            f"are missing. Please fix the integration setup in the portal."
+        )
+    return AuthenticateConfig.parse_obj(auth_config.data)
+
+def get_pull_config(integration):
+    # Look for pull observations configuration
+    pull_config = find_config_for_action(
+        configurations=integration.configurations,
+        action_id="pull_observations"
+    )
+    if not pull_config:
+        raise ConfigurationNotFound(
+            f"Pull Observations settings for integration {str(integration.id)} "
+            f"are missing. Please fix the integration setup in the portal."
+        )
+    return PullObservationsConfig.parse_obj(pull_config.data)
+
 async def action_auth(integration, action_config: AuthenticateConfig):
     logger.info(f"Executing auth action with integration {integration} and action_config {action_config}...")
     try:
-        token = await client.get_token(integration, action_config)
-    except LotekConnectionException:
-        logger.exception(f"Auth unsuccessful for integration {integration.id}. Lotek returned 400 (bad request)")
+        token = await client.get_token_from_api(integration, action_config)
+    except LotekException as e:
+        logger.exception(f"Auth unsuccessful for integration {integration.id}. Exception: {e}")
         return {"valid_credentials": False, "message": "Invalid credentials"}
     except httpx.HTTPError as e:
         logger.exception(f"Auth action failed for integration {integration.id}. Exception: {e}")
@@ -37,36 +70,30 @@ async def action_auth(integration, action_config: AuthenticateConfig):
             return {"valid_credentials": False}
 
 def filter_and_transform_positions(positions, integration):
-    bad_points = 0
     valid_positions = []
-
     for position in positions:
-        if not position.Longitude or not position.Latitude:
-            bad_points += 1
-        else:
-            cdip_pos = transform(position, integration)
-            if cdip_pos:
-                valid_positions.append(cdip_pos)
+        try:
+            if position.Longitude is None or position.Latitude is None:
+                msg = f"Filtering {position} (bad location) for device {position.DeviceID}."
+                logger.info(msg)
+                continue
 
-    return valid_positions, bad_points
+            cdip_pos = {
+                "source": position.DeviceID,
+                "source_name": position.DevName,
+                'type': 'tracking-device',
+                "recorded_at": ensure_timezone_aware(position.RecDateTime).isoformat(),
+                "location": {
+                    "lat": position.Latitude,
+                    "lon": position.Longitude
+                },
+                "additional": position.dict(exclude={'DeviceID', 'Latitude', 'Longitude', 'RecDateTime'})
+            }
+            valid_positions.append(cdip_pos)
+        except Exception as ex:
+            logger.error(f"Failed to parse Lotek point: {position} for Integration ID {str(integration.id)}. Exception: {ex}")
 
-def transform(p: client.LotekPosition, integration):
-    try:
-        data = {
-            "source": p.DeviceID,
-            "source_name": p.DeviceID,
-            'type': 'tracking-device',
-            "recorded_at": ensure_timezone_aware(p.RecDateTime).isoformat(),
-            "location": {
-                "lat": p.Latitude,
-                "lon": p.Longitude
-            },
-            "additional": p.dict(exclude={'DeviceID', 'Latitude', 'Longitude', 'RecDateTime'})
-        }
-        return data
-    except Exception as ex:
-        logger.error(f"Failed to parse Lotek point: {p} for Integration ID {str(integration.id)}. Exception: {ex}")
-        raise ex
+    return valid_positions
 
 def ensure_timezone_aware(val: datetime, default_tz: timezone = timezone.utc) -> datetime:
     if not val.tzinfo:
@@ -77,74 +104,57 @@ def ensure_timezone_aware(val: datetime, default_tz: timezone = timezone.utc) ->
 async def action_pull_observations(integration, action_config: PullObservationsConfig):
     logger.info(f"Executing pull_observations action with integration {integration} and action_config {action_config}...")
 
-    present_time = datetime.now(tz=timezone.utc)
-
+    auth = get_auth_config(integration)
     try:
-        saved_state = await state_manager.get_state(str(integration.id), "pull_observations")
-        state = client.IntegrationState.parse_obj({"last_run": saved_state})
-    except pydantic.ValidationError as ve:
-        state = client.IntegrationState()
-
-    logger.info(f"Running Lotek integration for integration '{integration.name}({integration.id})'. State: {state}")
-
-    async for attempt in stamina.retry_context(on=(LotekException, LotekConnectionException), attempts=3, wait_initial=timedelta(seconds=10), wait_max=timedelta(seconds=10)):
-        with attempt:
-            auth = get_auth_config(integration)
-            try:
+        async for attempt in stamina.retry_context(on=LotekUnauthorizedException, attempts=3, wait_initial=1.0, wait_jitter=5.0, wait_max=32.0):
+            with attempt:
                 device_list = await client.get_devices(integration, auth)
-            except client.LotekException as e:
-                message = f"Error fetching devices from Lotek. Integration ID: {integration.id} Exception: {e}"
+    except Exception as e:
+        message = f"Error fetching devices from Lotek. Integration ID: {integration.id} Exception: {e}"
+        logger.exception(message)
+        await log_action_activity(
+            integration_id=str(integration.id),
+            action_id="pull_observations",
+            title=message,
+            level=LogLevel.ERROR
+        )
+        raise e
+
+    logger.info(f"Extracted {len(device_list)} devices from Lotek for inbound: {integration.id}")
+    present_time = datetime.now(tz=timezone.utc)
+    observations_extracted = 0
+    for device in device_list:
+        cdip_positions = []
+        try:
+            saved_state = await state_manager.get_state(str(integration.id), "pull_observations", device.nDeviceID)
+            state = client.IntegrationState.parse_obj({"updated_at": saved_state.get("updated_at")})
+        except pydantic.ValidationError as e:
+            logger.debug(f"Failed to parse saved state for device {device.nDeviceID}, using default state. Error: {e}")
+            state = client.IntegrationState()
+
+        lower_date = max(present_time - timedelta(days=7), state.updated_at)
+        while lower_date < present_time:
+            upper_date = min(present_time, lower_date + timedelta(days=7))
+            try:
+                async for attempt in stamina.retry_context(on=LotekUnauthorizedException, attempts=3, wait_initial=1.0, wait_jitter=5.0, wait_max=32.0):
+                    with attempt:
+                        positions = await client.get_positions(device.nDeviceID, auth, integration, lower_date, upper_date, True)
+                logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device.nDeviceID} between {lower_date} and {upper_date}.")
+            except httpx.HTTPError as e:
+                message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration.id} Exception: {e}"
                 logger.exception(message)
                 await log_action_activity(
                     integration_id=str(integration.id),
                     action_id="pull_observations",
                     title=message,
-                    level=LogLevel.WARNING
+                    level=LogLevel.ERROR
                 )
-                raise e
-
-    logger.info(f"Extracted {len(device_list)} devices from Lotek for inbound: {integration.id}")
-    observations_extracted = 0
-    for device in device_list:
-        cdip_positions = []
-        lower_date = max(present_time - timedelta(days=7), state.last_run)
-        while lower_date < present_time:
-            upper_date = min(present_time, lower_date + timedelta(days=7))
-            async for attempt in stamina.retry_context(on=(LotekException, LotekConnectionException), attempts=3, wait_initial=timedelta(seconds=10), wait_max=timedelta(seconds=10)):
-                with attempt:
-                    try:
-                        positions = await client.get_positions(device.nDeviceID, auth, integration, lower_date, upper_date, True)
-                    except httpx.HTTPError as e:
-                        message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration.id} Exception: {e}"
-                        logger.exception(message)
-                        await log_action_activity(
-                            integration_id=str(integration.id),
-                            action_id="pull_observations",
-                            title=message,
-                            level=LogLevel.WARNING
-                        )
-                        raise LotekException(message=message, error=e)
-            logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device.nDeviceID} between {lower_date} and {upper_date}.")
-            cdip_positions, bad_lotek_points = filter_and_transform_positions(positions, integration)
-            logger.debug(f"Extracted {len(cdip_positions)} of {len(positions)} points between {lower_date} and {upper_date}.")
-            if bad_lotek_points > 0:
-                msg = f"Found {bad_lotek_points} bad points in Lotek data for device {device.nDeviceID}."
-                logger.warning(msg)
-                await log_action_activity(
-                    integration_id=str(integration.id),
-                    action_id="pull_observations",
-                    title=msg,
-                    level=LogLevel.WARNING
-                )
+                raise LotekException(message=message, error=e)
+            cdip_positions.extend(filter_and_transform_positions(positions, integration))
             lower_date = upper_date
 
         if cdip_positions:
-            logger.info(f"Observations pulled successfully for integration ID: {integration.id}.")
-
-            def generate_batches(iterable, n=settings.OBSERVATIONS_BATCH_SIZE):
-                for i in range(0, len(iterable), n):
-                    yield iterable[i: i + n]
-
+            logger.info(f"{len(cdip_positions)} observations pulled successfully for device {device.nDeviceID} integration ID: {integration.id}.")
             for i, batch in enumerate(generate_batches(cdip_positions)):
                 try:
                     logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Device: {device.nDeviceID}')
@@ -158,7 +168,17 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                     })
                     raise e
                 else:
-                    observations_extracted += len(cdip_positions)
+                    observations_extracted += len(batch)
+
+            latest_time = max(cdip_positions, key=lambda obs: obs["recorded_at"])["recorded_at"]
+            state = {"updated_at": latest_time}
+
+            await state_manager.set_state(
+                str(integration.id),
+                "pull_observations",
+                state,
+                device.nDeviceID
+            )
         else:
             message = f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}."
             logger.info(message)
@@ -166,11 +186,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 integration_id=str(integration.id),
                 action_id="pull_observations",
                 title=message,
-                level=LogLevel.DEBUG
+                level=LogLevel.WARNING
             )
-    await state_manager.set_state(
-        str(integration.id),
-        "pull_observations",
-        upper_date
-    )
+
     return {'observations_extracted': observations_extracted}
