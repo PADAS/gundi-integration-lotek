@@ -89,8 +89,7 @@ def filter_and_transform_positions(positions, integration):
                 },
                 "additional": position.dict(exclude={'DeviceID', 'Latitude', 'Longitude', 'RecDateTime'})
             }
-            if cdip_pos:
-                valid_positions.append(cdip_pos)
+            valid_positions.append(cdip_pos)
         except Exception as ex:
             logger.error(f"Failed to parse Lotek point: {position} for Integration ID {str(integration.id)}. Exception: {ex}")
 
