@@ -136,7 +136,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         while lower_date < present_time:
             upper_date = min(present_time, lower_date + timedelta(days=7))
             try:
-                async for attempt in stamina.retry_context(on=LotekUnauthorizedException, attempts=3, wait_initial=timedelta(seconds=10), wait_max=timedelta(seconds=10)):
+                async for attempt in stamina.retry_context(on=LotekUnauthorizedException, attempts=3, wait_initial=1.0, wait_jitter=5.0, wait_max=32.0):
                     with attempt:
                         positions = await client.get_positions(device.nDeviceID, auth, integration, lower_date, upper_date, True)
                         logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device.nDeviceID} between {lower_date} and {upper_date}.")
