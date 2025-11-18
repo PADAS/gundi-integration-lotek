@@ -43,7 +43,7 @@ async def test_get_token_from_api_success(mocker, lotek_integration, auth_config
 @pytest.mark.asyncio
 async def test_get_token_from_api_bad_credentials_raises_lotek_exception(mocker, lotek_integration, auth_config):
     resp = httpx.Response(400, request=httpx.Request("POST", lotek_integration.base_url))
-    exc = httpx.HTTPStatusError("401", request=resp.request, response=resp)
+    exc = httpx.HTTPStatusError("400", request=resp.request, response=resp)
     mock_client = _make_mock_client(raise_exc=exc, method="post")
     mocker.patch("app.actions.client.httpx.AsyncClient", return_value=mock_client)
 
