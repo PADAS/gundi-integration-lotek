@@ -135,7 +135,7 @@ async def test_get_positions_unauthorized_raises(mocker, lotek_integration, auth
 
 @pytest.mark.asyncio
 async def test_get_positions_http_error_raises_lotek_exception(mocker, lotek_integration, auth_config):
-    exc = httpx.HTTPStatusError("500", request=httpx.Request("POST", lotek_integration.base_url), response=httpx.Response(500))
+    exc = httpx.HTTPStatusError("500", request=httpx.Request("GET", lotek_integration.base_url), response=httpx.Response(500))
     mock_client = _make_mock_client(raise_exc=exc, method="get")
     mocker.patch("app.actions.client.get_token", return_value="token")
     mocker.patch("app.actions.client.httpx.AsyncClient", return_value=mock_client)
