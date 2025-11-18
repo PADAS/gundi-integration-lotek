@@ -56,7 +56,7 @@ async def action_auth(integration, action_config: AuthenticateConfig):
     try:
         token = await client.get_token_from_api(integration, action_config)
     except LotekException as e:
-        logger.exception(f"Auth unsuccessful for integration {integration.id}. Lotek returned 401 (Unauthorized). Exc: {e}")
+        logger.exception(f"Auth unsuccessful for integration {integration.id}. Exception: {e}")
         return {"valid_credentials": False, "message": "Invalid credentials"}
     except httpx.HTTPError as e:
         logger.exception(f"Auth action failed for integration {integration.id}. Exception: {e}")
