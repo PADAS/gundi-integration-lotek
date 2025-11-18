@@ -139,7 +139,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 async for attempt in stamina.retry_context(on=LotekUnauthorizedException, attempts=3, wait_initial=1.0, wait_jitter=5.0, wait_max=32.0):
                     with attempt:
                         positions = await client.get_positions(device.nDeviceID, auth, integration, lower_date, upper_date, True)
-                        logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device.nDeviceID} between {lower_date} and {upper_date}.")
+                logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device.nDeviceID} between {lower_date} and {upper_date}.")
             except httpx.HTTPError as e:
                 message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration.id} Exception: {e}"
                 logger.exception(message)
