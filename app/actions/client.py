@@ -162,23 +162,21 @@ async def get_positions(device_id, auth, integration, start_datetime=None, end_d
         'Content-Type': 'application/json'
     }
     if not start_datetime:
-        start_datetime = datetime.today() - timedelta(days=DEFAULT_LOOKBACK_DAYS)
+        start_datetime = datetime.now(tz=timezone.utc) - timedelta(days=DEFAULT_LOOKBACK_DAYS)
+    if not end_datetime:
+        end_datetime = datetime.now(tz=timezone.utc)
 
     params = {
         'deviceId': device_id,
-        'from': start_datetime.strftime('%Y-%m-%d')
+        'from': start_datetime.strftime('%Y-%m-%dT%H:%M:%S+0000'),
+        'to': end_datetime.strftime('%Y-%m-%dT%H:%M:%S+0000')
     }
-    if end_datetime:
-        end_datetime = (end_datetime.date() if isinstance(end_datetime, datetime) else end_datetime) + timedelta(days=1)
-        params['to'] = end_datetime.strftime('%Y-%m-%d')
-    else:
-        params['to'] = (datetime.today() + timedelta(days=1)).strftime('%Y-%m-%d')
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=30.0, write=15.0, pool=5.0)) as session:
         try:
             logger.debug('Getting positions for user: %s, params: %s', auth.username, params)
             base_url = integration.base_url or 'https://webservice.lotek.com/API'
-            response = await session.get(base_url + "/positions/findByDate", params=params, headers=headers)
+            response = await session.get(base_url + "/positions/findByUploadDate", params=params, headers=headers)
             response.raise_for_status()
         except httpx.HTTPStatusError as ex:
             if ex.response.status_code == 400:

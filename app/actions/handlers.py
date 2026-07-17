@@ -69,13 +69,23 @@ async def action_auth(integration, action_config: AuthenticateConfig):
             logger.error(f"Auth unsuccessful for integration {integration}.")
             return {"valid_credentials": False}
 
-def filter_and_transform_positions(positions, integration):
+def filter_and_transform_positions(positions, integration, action_config=None):
+    max_pdop = action_config.max_pdop if action_config else None
+    filtered_by_pdop = 0
     valid_positions = []
     for position in positions:
         try:
             if position.Longitude is None or position.Latitude is None:
                 msg = f"Filtering {position} (bad location) for device {position.DeviceID}."
                 logger.info(msg)
+                continue
+
+            if max_pdop is not None and position.PDOP > max_pdop:
+                logger.debug(
+                    f"Filtering position for device {position.DeviceID} "
+                    f"(PDOP={position.PDOP} > max_pdop={max_pdop})."
+                )
+                filtered_by_pdop += 1
                 continue
 
             cdip_pos = {
@@ -85,13 +95,17 @@ def filter_and_transform_positions(positions, integration):
                 "recorded_at": ensure_timezone_aware(position.RecDateTime).isoformat(),
                 "location": {
                     "lat": position.Latitude,
-                    "lon": position.Longitude
+                    "lon": position.Longitude,
+                    "alt": position.Altitude
                 },
                 "additional": position.dict(exclude={'DeviceID', 'Latitude', 'Longitude', 'RecDateTime'})
             }
             valid_positions.append(cdip_pos)
         except Exception as ex:
             logger.error(f"Failed to parse Lotek point: {position} for Integration ID {str(integration.id)}. Exception: {ex}")
+
+    if filtered_by_pdop:
+        logger.info(f"Filtered {filtered_by_pdop} of {len(positions)} positions by PDOP > {max_pdop}.")
 
     return valid_positions
 
@@ -122,17 +136,20 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
     logger.info(f"Extracted {len(device_list)} devices from Lotek for inbound: {integration.id}")
     present_time = datetime.now(tz=timezone.utc)
+    lookback = timedelta(days=action_config.default_lookback_days)
+    default_start = present_time - lookback
     observations_extracted = 0
     for device in device_list:
         cdip_positions = []
         try:
             saved_state = await state_manager.get_state(str(integration.id), "pull_observations", device.nDeviceID)
-            state = client.IntegrationState.parse_obj({"updated_at": saved_state.get("updated_at")})
+            state = client.IntegrationState.parse_obj({"updated_at": saved_state.get("updated_at") or default_start})
         except pydantic.ValidationError as e:
             logger.debug(f"Failed to parse saved state for device {device.nDeviceID}, using default state. Error: {e}")
-            state = client.IntegrationState()
+            state = client.IntegrationState(updated_at=default_start)
 
-        lower_date = max(present_time - timedelta(days=7), state.updated_at)
+        # Hard limit on query window; 2h overlap buffer to catch late-arriving uploads.
+        lower_date = max(default_start, state.updated_at - timedelta(hours=2))
         while lower_date < present_time:
             upper_date = min(present_time, lower_date + timedelta(days=7))
             try:
@@ -150,7 +167,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                     level=LogLevel.ERROR
                 )
                 raise LotekException(message=message, error=e)
-            cdip_positions.extend(filter_and_transform_positions(positions, integration))
+            cdip_positions.extend(filter_and_transform_positions(positions, integration, action_config))
             lower_date = upper_date
 
         if cdip_positions:
@@ -169,16 +186,6 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                     raise e
                 else:
                     observations_extracted += len(batch)
-
-            latest_time = max(cdip_positions, key=lambda obs: obs["recorded_at"])["recorded_at"]
-            state = {"updated_at": latest_time}
-
-            await state_manager.set_state(
-                str(integration.id),
-                "pull_observations",
-                state,
-                device.nDeviceID
-            )
         else:
             message = f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}."
             logger.info(message)
@@ -188,5 +195,15 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 title=message,
                 level=LogLevel.WARNING
             )
+
+        # Advance state by the queried window (upload time), not recorded_at.
+        # Queries are by upload date, so wall clock is the correct cursor,
+        # and it must advance even when a device returns no positions.
+        await state_manager.set_state(
+            str(integration.id),
+            "pull_observations",
+            {"updated_at": present_time.isoformat()},
+            device.nDeviceID
+        )
 
     return {'observations_extracted': observations_extracted}
