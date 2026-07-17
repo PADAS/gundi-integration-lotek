@@ -624,6 +624,15 @@ def integration_v2_with_webhook_generic():
 
 
 @pytest.fixture
+def integration_v2_with_diagnostic_webhook(integration_v2_with_webhook_generic):
+    data = integration_v2_with_webhook_generic.dict()
+    data["webhook_configuration"]["data"]["diagnostic_destination_url"] = (
+        "https://diagnostics.example.com/webhook-dump"
+    )
+    return Integration.parse_obj(data)
+
+
+@pytest.fixture
 def mock_generic_webhook_config():
     return {
         "jq_filter": '{     "source": .end_device_ids.device_id,     "source_name": .end_device_ids.device_id,     "type": .uplink_message.locations."frm-payload".source,     "recorded_at": .uplink_message.settings.time,     "location": {       "lat": .uplink_message.locations."frm-payload".latitude,       "lon": .uplink_message.locations."frm-payload".longitude     },     "additional": {       "application_id": .end_device_ids.application_ids.application_id,       "dev_eui": .end_device_ids.dev_eui,       "dev_addr": .end_device_ids.dev_addr,       "batterypercent": .uplink_message.decoded_payload.batterypercent,       "gps": .uplink_message.decoded_payload.gps     }   }',
@@ -914,6 +923,9 @@ def mock_state_manager(mocker):
         {"last_execution": "2023-11-17T11:20:00+0200"}
     )
     mock_state_manager.set_state.return_value = async_return(None)
+    # Default: throttle window is open (first-in-window), so throttled events
+    # publish. Tests that exercise the suppressed path override this.
+    mock_state_manager.set_if_absent.return_value = async_return(True)
     return mock_state_manager
 
 
@@ -1028,6 +1040,7 @@ def mock_pull_observations_action_handler():
     mock_pull_observations_action_handler = AsyncMock()
     mock_pull_observations_action_handler.return_value = {"observations_extracted": 10}
     mock_pull_observations_action_handler.crontab_schedule = CrontabSchedule.parse_obj_from_crontab("*/10 * * * * -5")
+    del mock_pull_observations_action_handler.action_title
     return mock_pull_observations_action_handler
 
 
@@ -1036,6 +1049,7 @@ def mock_pull_observations_by_date_action_handler():
     mock_pull_observations_by_date_action_handler = AsyncMock()
     mock_pull_observations_by_date_action_handler.return_value = {"observations_extracted": 10}
     del mock_pull_observations_by_date_action_handler.crontab_schedule
+    del mock_pull_observations_by_date_action_handler.action_title
     return mock_pull_observations_by_date_action_handler
 
 
@@ -1043,6 +1057,7 @@ def mock_pull_observations_by_date_action_handler():
 def mock_push_observations_handler():
     mock_push_observations_handler = AsyncMock()
     mock_push_observations_handler.return_value = {"observations_pushed": 1}
+    del mock_push_observations_handler.action_title
     return mock_push_observations_handler
 
 
@@ -1137,6 +1152,7 @@ def mock_auth_action_handlers():
         "username": "me@example.com",
         "password": "something-fancy",
     }
+    del mock_action_handler.action_title
     mock_action_handlers = {
         "auth": (mock_action_handler, MockAuthenticateActionConfiguration, None)
     }
