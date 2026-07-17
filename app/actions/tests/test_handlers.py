@@ -1,6 +1,6 @@
 import pytest
 import httpx
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 from gundi_core.schemas.v2 import LogLevel
@@ -34,6 +34,53 @@ def test_filter_and_transform_positions_success(mocker, lotek_position, lotek_in
     assert result[0]["location"]["lat"] == lotek_position.Latitude
     assert result[0]["location"]["lon"] == lotek_position.Longitude
 
+def test_filter_and_transform_positions_falls_back_to_device_id_for_blank_dev_name(mocker, lotek_position, lotek_integration):
+    # Lotek's API can return an empty DevName; Gundi's sensors API rejects a blank source_name.
+    lotek_position.DevName = ""
+    result = filter_and_transform_positions([lotek_position], lotek_integration)
+    assert result[0]["source_name"] == str(lotek_position.DeviceID)
+
+def test_recorded_at_normalized_to_utc_for_non_utc_offset(lotek_position, lotek_integration):
+    # A RecDateTime with a non-UTC offset must be converted to UTC, not
+    # forwarded with its original offset (PR goal: UTC datetimes throughout).
+    from datetime import timedelta
+    lotek_position.RecDateTime = datetime(
+        2026, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=2))
+    )
+    result = filter_and_transform_positions([lotek_position], lotek_integration)
+    assert result[0]["recorded_at"] == "2026-01-01T10:00:00+00:00"
+
+
+def test_recorded_at_assumes_utc_for_naive_datetime(lotek_position, lotek_integration):
+    # A naive RecDateTime is assumed to already be UTC.
+    lotek_position.RecDateTime = datetime(2026, 1, 1, 12, 0, 0)
+    result = filter_and_transform_positions([lotek_position], lotek_integration)
+    assert result[0]["recorded_at"] == "2026-01-01T12:00:00+00:00"
+
+
+def test_filter_by_pdop_drops_positions_above_max(lotek_position, lotek_integration, pull_config):
+    pull_config.max_pdop = 4.0
+    lotek_position.PDOP = 4.1
+    result = filter_and_transform_positions([lotek_position], lotek_integration, pull_config)
+    assert result == []
+
+def test_filter_by_pdop_keeps_positions_at_or_below_max(lotek_position, lotek_integration, pull_config):
+    pull_config.max_pdop = 4.0
+    lotek_position.PDOP = 4.0  # boundary: <= is kept
+    result = filter_and_transform_positions([lotek_position], lotek_integration, pull_config)
+    assert len(result) == 1
+    assert result[0]["additional"]["PDOP"] == 4.0
+
+def test_filter_by_pdop_disabled_by_default(lotek_position, lotek_integration, pull_config):
+    assert pull_config.max_pdop is None
+    lotek_position.PDOP = 99.9
+    result = filter_and_transform_positions([lotek_position], lotek_integration, pull_config)
+    assert len(result) == 1
+
+def test_pdop_present_in_additional(lotek_position, lotek_integration, pull_config):
+    result = filter_and_transform_positions([lotek_position], lotek_integration, pull_config)
+    assert result[0]["additional"]["PDOP"] == lotek_position.PDOP
+
 @pytest.mark.asyncio
 async def test_invalid_position_filtered_and_logs_warning_when_no_valid_observations(mocker, lotek_position, lotek_integration, pull_config, mock_redis):
     mocker.patch("app.services.state.redis", mock_redis)
@@ -54,6 +101,24 @@ async def test_invalid_position_filtered_and_logs_warning_when_no_valid_observat
         level=LogLevel.WARNING,
         title=f"No positions fetched for device {lotek_position.DeviceID} integration ID: {lotek_integration.id}."
     )
+
+@pytest.mark.asyncio
+async def test_lookback_days_config_sets_first_run_window(mocker, lotek_integration, pull_config, mock_redis):
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=[LotekDevice(nDeviceID="1", strSpecialID="special", dtCreated=datetime.now(), strSatellite="satellite")]))
+    mock_get_positions = mocker.patch("app.actions.client.get_positions", new=AsyncMock(return_value=[]))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    pull_config.default_lookback_days = 30
+    await action_pull_observations(lotek_integration, pull_config)
+    # first chunk starts ~30 days back
+    first_call_start = mock_get_positions.call_args_list[0].args[3]
+    age_days = (datetime.now(timezone.utc) - first_call_start).days
+    assert age_days == 30
+    # window walked in 7-day chunks up to now
+    assert len(mock_get_positions.call_args_list) == 5
 
 @pytest.mark.asyncio
 async def test_action_pull_observations_success(mocker, lotek_integration, pull_config, mock_redis):

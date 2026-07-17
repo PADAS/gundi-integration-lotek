@@ -136,3 +136,5 @@ dmypy.json
 .vscode
 
 sample-docs
+local/docker-compose.override.yml
+local/.env
