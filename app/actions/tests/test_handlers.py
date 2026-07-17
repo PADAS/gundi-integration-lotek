@@ -40,6 +40,24 @@ def test_filter_and_transform_positions_falls_back_to_device_id_for_blank_dev_na
     result = filter_and_transform_positions([lotek_position], lotek_integration)
     assert result[0]["source_name"] == str(lotek_position.DeviceID)
 
+def test_recorded_at_normalized_to_utc_for_non_utc_offset(lotek_position, lotek_integration):
+    # A RecDateTime with a non-UTC offset must be converted to UTC, not
+    # forwarded with its original offset (PR goal: UTC datetimes throughout).
+    from datetime import timedelta
+    lotek_position.RecDateTime = datetime(
+        2026, 1, 1, 12, 0, 0, tzinfo=timezone(timedelta(hours=2))
+    )
+    result = filter_and_transform_positions([lotek_position], lotek_integration)
+    assert result[0]["recorded_at"] == "2026-01-01T10:00:00+00:00"
+
+
+def test_recorded_at_assumes_utc_for_naive_datetime(lotek_position, lotek_integration):
+    # A naive RecDateTime is assumed to already be UTC.
+    lotek_position.RecDateTime = datetime(2026, 1, 1, 12, 0, 0)
+    result = filter_and_transform_positions([lotek_position], lotek_integration)
+    assert result[0]["recorded_at"] == "2026-01-01T12:00:00+00:00"
+
+
 def test_filter_by_pdop_drops_positions_above_max(lotek_position, lotek_integration, pull_config):
     pull_config.max_pdop = 4.0
     lotek_position.PDOP = 4.1

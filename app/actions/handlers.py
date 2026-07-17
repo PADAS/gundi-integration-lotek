@@ -112,9 +112,11 @@ def filter_and_transform_positions(positions, integration, action_config=None):
     return valid_positions
 
 def ensure_timezone_aware(val: datetime, default_tz: timezone = timezone.utc) -> datetime:
+    # Assume the configured default tz for naive values, then normalize any
+    # aware value to UTC so recorded_at is always emitted in UTC.
     if not val.tzinfo:
         val = val.replace(tzinfo=default_tz)
-    return val
+    return val.astimezone(timezone.utc)
 
 @action_title("Integration Settings")
 @activity_logger()

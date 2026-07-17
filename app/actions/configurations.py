@@ -39,6 +39,10 @@ class PullObservationsConfig(PullActionConfiguration, ExecutableActionMixin):
         ),
     )
 
+    # Intentionally hidden from the portal UI: scheduled execution for this
+    # integration is managed out-of-band, not exposed as an operator toggle.
+    # The field is kept (defaulting to True) so the action_runner's
+    # skip-when-disabled logic still has a value to read.
     run_on_schedule: bool = FieldWithUIOptions(
         True,
         ui_options=UIOptions(widget="hidden"),
