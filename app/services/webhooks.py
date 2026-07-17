@@ -19,6 +19,11 @@ from app.services.config_manager import IntegrationConfigurationManager
 config_manager = IntegrationConfigurationManager()
 logger = logging.getLogger(__name__)
 _diagnostic_client: httpx.AsyncClient | None = None
+# Keep strong references to fire-and-forget diagnostic tasks. The event loop
+# only holds a weak reference to a bare task, so without this a scheduled
+# forward could be garbage-collected before it runs. Tasks discard themselves
+# on completion.
+_background_tasks: set = set()
 
 
 def _get_diagnostic_client() -> httpx.AsyncClient:
@@ -95,7 +100,7 @@ async def forward_payload_to_diagnostic_url(
         await _validate_diagnostic_url(destination_url)
         metadata = {
             "integration_id": integration_id,
-            "received_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            "received_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         }
         if isinstance(json_content, dict):
             body = {**json_content, "__gundi_diagnostic_metadata": metadata}
@@ -162,13 +167,15 @@ async def process_webhook(request: Request):
             json_content["hex_format"] = json_content.get("hex_format", parsed_config.hex_format)
         # Forward raw payload to diagnostic URL before any transformation or validation
         if diag_url := getattr(parsed_config, "diagnostic_destination_url", None):
-            asyncio.ensure_future(
+            task = asyncio.ensure_future(
                 forward_payload_to_diagnostic_url(
                     destination_url=diag_url,
                     integration_id=str(integration.id),
                     json_content=json_content,
                 )
             )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
         # Parse payload if a model was defined in webhooks/configurations.py
         if payload_model:
             try:
