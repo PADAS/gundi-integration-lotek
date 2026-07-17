@@ -13,6 +13,9 @@ from app.services.errors import ConfigurationNotFound
 from app.actions.client import LotekException, LotekUnauthorizedException
 from app.services.utils import find_config_for_action
 from app.actions.configurations import AuthenticateConfig, PullObservationsConfig
+# NOTE: import via module reference — `from app.actions.core import action_title` would put a
+# function named `action_*` in this namespace and discover_actions would pick it up as an action.
+from app.actions import core as actions_core
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.state import IntegrationStateManager
 from gundi_core.schemas.v2.gundi import LogLevel
@@ -51,6 +54,7 @@ def get_pull_config(integration):
         )
     return PullObservationsConfig.parse_obj(pull_config.data)
 
+@actions_core.action_title("Connect with Lotek")
 async def action_auth(integration, action_config: AuthenticateConfig):
     logger.info(f"Executing auth action with integration {integration} and action_config {action_config}...")
     try:
@@ -114,6 +118,7 @@ def ensure_timezone_aware(val: datetime, default_tz: timezone = timezone.utc) ->
         val = val.replace(tzinfo=default_tz)
     return val
 
+@actions_core.action_title("Integration Settings")
 @activity_logger()
 async def action_pull_observations(integration, action_config: PullObservationsConfig):
     logger.info(f"Executing pull_observations action with integration {integration} and action_config {action_config}...")

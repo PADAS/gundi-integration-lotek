@@ -1,14 +1,12 @@
 import pydantic
 
-from typing import ClassVar, Optional
+from typing import Optional
 
 from .core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
 from app.services.utils import GlobalUISchemaOptions
 
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
-    action_name: ClassVar[str] = "Connect with Lotek"
-
     username: str
     password: pydantic.SecretStr = pydantic.Field(..., format="password")
 
@@ -21,8 +19,6 @@ class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
 
 
 class PullObservationsConfig(PullActionConfiguration, ExecutableActionMixin):
-    action_name: ClassVar[str] = "Integration Settings"
-
     default_lookback_days: int = pydantic.Field(
         7,
         ge=1,
