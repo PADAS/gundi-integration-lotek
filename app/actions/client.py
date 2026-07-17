@@ -67,6 +67,13 @@ class LotekDevice(BaseModel):
     strSatellite: str
 
 
+def _to_utc(val: datetime) -> datetime:
+    '''Normalize a datetime to UTC; naive datetimes are assumed to be UTC.'''
+    if not val.tzinfo:
+        return val.replace(tzinfo=timezone.utc)
+    return val.astimezone(timezone.utc)
+
+
 def default_updated_at():
     '''
     Default for a new configuration is to pretend the last run was 7 days ago
@@ -168,8 +175,8 @@ async def get_positions(device_id, auth, integration, start_datetime=None, end_d
 
     params = {
         'deviceId': device_id,
-        'from': start_datetime.strftime('%Y-%m-%dT%H:%M:%S+0000'),
-        'to': end_datetime.strftime('%Y-%m-%dT%H:%M:%S+0000')
+        'from': _to_utc(start_datetime).strftime('%Y-%m-%dT%H:%M:%S+0000'),
+        'to': _to_utc(end_datetime).strftime('%Y-%m-%dT%H:%M:%S+0000')
     }
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=30.0, write=15.0, pool=5.0)) as session:
