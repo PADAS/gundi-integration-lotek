@@ -92,7 +92,7 @@ def filter_and_transform_positions(positions, integration, action_config=None):
 
             cdip_pos = {
                 "source": position.DeviceID,
-                "source_name": position.DevName,
+                "source_name": position.DevName or str(position.DeviceID),
                 'type': 'tracking-device',
                 "recorded_at": ensure_timezone_aware(position.RecDateTime).isoformat(),
                 "location": {

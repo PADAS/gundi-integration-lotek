@@ -34,6 +34,12 @@ def test_filter_and_transform_positions_success(mocker, lotek_position, lotek_in
     assert result[0]["location"]["lat"] == lotek_position.Latitude
     assert result[0]["location"]["lon"] == lotek_position.Longitude
 
+def test_filter_and_transform_positions_falls_back_to_device_id_for_blank_dev_name(mocker, lotek_position, lotek_integration):
+    # Lotek's API can return an empty DevName; Gundi's sensors API rejects a blank source_name.
+    lotek_position.DevName = ""
+    result = filter_and_transform_positions([lotek_position], lotek_integration)
+    assert result[0]["source_name"] == str(lotek_position.DeviceID)
+
 def test_filter_by_pdop_drops_positions_above_max(lotek_position, lotek_integration, pull_config):
     pull_config.max_pdop = 4.0
     lotek_position.PDOP = 4.1
