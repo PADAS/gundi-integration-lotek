@@ -48,7 +48,8 @@ async def register_integration_in_gundi(gundi_client, type_slug=None, service_ur
         if issubclass(config_model, InternalActionConfiguration):
             logger.info(f"Skipping internal action '{action_id}'.")
             continue  # Internal actions are not registered in Gundi
-        action_name = action_id.replace("_", " ").title()
+        # Allow a display-name override via an `action_name` ClassVar on the config model
+        action_name = getattr(config_model, "action_name", None) or action_id.replace("_", " ").title()
         action_schema = json.loads(config_model.schema_json())
         action_ui_schema = config_model.ui_schema()
         if issubclass(config_model, AuthActionConfiguration):

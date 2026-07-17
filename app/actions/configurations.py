@@ -1,12 +1,14 @@
 import pydantic
 
-from typing import Optional
+from typing import ClassVar, Optional
 
 from .core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
 from app.services.utils import GlobalUISchemaOptions
 
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
+    action_name: ClassVar[str] = "Connect with Lotek"
+
     username: str
     password: pydantic.SecretStr = pydantic.Field(..., format="password")
 
@@ -18,7 +20,9 @@ class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
     )
 
 
-class PullObservationsConfig(PullActionConfiguration):
+class PullObservationsConfig(PullActionConfiguration, ExecutableActionMixin):
+    action_name: ClassVar[str] = "Integration Settings"
+
     default_lookback_days: int = pydantic.Field(
         7,
         ge=1,
@@ -37,4 +41,11 @@ class PullObservationsConfig(PullActionConfiguration):
             "If set, only observations with PDOP <= this value will be sent. "
             "Leave blank to send all observations."
         ),
+    )
+
+    ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
+        order=[
+            "default_lookback_days",
+            "max_pdop",
+        ],
     )
