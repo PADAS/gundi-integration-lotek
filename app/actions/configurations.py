@@ -3,7 +3,7 @@ import pydantic
 from typing import Optional
 
 from .core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
-from app.services.utils import GlobalUISchemaOptions
+from app.services.utils import GlobalUISchemaOptions, UIOptions, FieldWithUIOptions
 
 
 class AuthenticateConfig(AuthActionConfiguration, ExecutableActionMixin):
@@ -39,9 +39,15 @@ class PullObservationsConfig(PullActionConfiguration, ExecutableActionMixin):
         ),
     )
 
+    run_on_schedule: bool = FieldWithUIOptions(
+        True,
+        ui_options=UIOptions(widget="hidden"),
+    )
+
     ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
         order=[
             "default_lookback_days",
             "max_pdop",
+            "run_on_schedule",
         ],
     )
