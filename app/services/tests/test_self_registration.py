@@ -716,11 +716,15 @@ def test_action_title_decorator_stacks_with_crontab_schedule():
 
 def _discover_actions_in_fake_module(module):
     module_name = "fake_handlers_module"
+    previous = sys.modules.get(module_name)
     sys.modules[module_name] = module
     try:
         return discover_actions(module_name=module_name, prefix="action_")
     finally:
-        del sys.modules[module_name]
+        if previous is not None:
+            sys.modules[module_name] = previous
+        else:
+            del sys.modules[module_name]
 
 
 def test_discover_actions_ignores_imported_action_title_decorator():
