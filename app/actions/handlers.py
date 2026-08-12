@@ -10,7 +10,7 @@ import app.settings.integration as settings
 from datetime import datetime, timezone, timedelta
 
 from app.services.errors import ConfigurationNotFound
-from app.actions.client import LotekException, LotekUnauthorizedException
+from app.actions.client import LotekException, LotekTokenExpiredException, LotekUnauthorizedException
 from app.services.utils import find_config_for_action
 from app.actions.configurations import AuthenticateConfig, PullObservationsConfig
 from app.actions.core import action_title
@@ -23,9 +23,11 @@ state_manager = IntegrationStateManager()
 
 
 # Lotek read timeouts are the common transient failure; retrying them costs one extra
-# request but saves a device from being skipped for a whole cycle. Unauthorized is here
+# request but saves a device from being skipped for a whole cycle. Token expiry is here
 # because the client clears the cached token before raising, so a retry re-authenticates.
-RETRYABLE_ERRORS = (LotekUnauthorizedException, httpx.TransportError)  # TransportError covers timeouts
+# A refused login (LotekUnauthorizedException) is deliberately NOT retryable: it is
+# fatal to the run, and retrying a rejected password risks account lockout.
+RETRYABLE_ERRORS = (LotekTokenExpiredException, httpx.TransportError)  # TransportError covers timeouts
 RETRY_ATTEMPTS = 3
 RETRY_WAIT_INITIAL = 1.0
 RETRY_WAIT_JITTER = 5.0
@@ -75,9 +77,14 @@ async def action_auth(integration, action_config: AuthenticateConfig):
     logger.info(f"Executing auth action with integration {integration} and action_config {action_config}...")
     try:
         token = await client.get_token_from_api(integration, action_config)
-    except LotekException as e:
+    except LotekUnauthorizedException as e:
         logger.exception(f"Auth unsuccessful for integration {integration.id}. Exception: {e}")
         return {"valid_credentials": False, "message": "Invalid credentials"}
+    except LotekException as e:
+        # Login 5xx/429: Lotek is down or throttling, not a credentials problem —
+        # don't send the operator off to reset a working password.
+        logger.exception(f"Auth action failed for integration {integration.id}. Exception: {e}")
+        return {"error": "An internal error occurred while trying to test credentials. Please try again later."}
     except httpx.HTTPError as e:
         logger.exception(f"Auth action failed for integration {integration.id}. Exception: {e}")
         return {"error": "An internal error occurred while trying to test credentials. Please try again later."}
@@ -143,7 +150,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
     auth = get_auth_config(integration)
     try:
-        async for attempt in stamina.retry_context(on=LotekUnauthorizedException, attempts=3, wait_initial=1.0, wait_jitter=5.0, wait_max=32.0):
+        async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
             with attempt:
                 device_list = await client.get_devices(integration, auth)
     except Exception as e:
@@ -190,18 +197,6 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         if device_failed:
             failed_devices.append(device.nDeviceID)
 
-    if device_list and len(failed_devices) == len(device_list) and observations_extracted == 0:
-        # Every device failed and nothing was delivered: report the run as failed rather
-        # than returning normally, otherwise a wholly broken integration keeps publishing
-        # action_complete and looks healthy in the portal. A device that delivered part
-        # of its window before failing still counts as progress, so it stays a warning.
-        raise LotekException(
-            message=(
-                f"All {len(device_list)} device(s) failed for integration {integration.id}. "
-                f"See the per-device errors in this action's activity log."
-            )
-        )
-
     if failed_devices:
         listed = ', '.join(failed_devices[:MAX_DEVICES_IN_SUMMARY])
         if len(failed_devices) > MAX_DEVICES_IN_SUMMARY:
@@ -217,6 +212,19 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             action_id="pull_observations",
             title=message,
             level=LogLevel.WARNING
+        )
+
+    if device_list and len(failed_devices) == len(device_list) and observations_extracted == 0:
+        # Every device failed and nothing was delivered: report the run as failed rather
+        # than returning normally, otherwise a wholly broken integration keeps publishing
+        # action_complete and looks healthy in the portal. A device that delivered part
+        # of its window before failing still counts as progress, so it stays a warning.
+        # This comes after the summary so the worst case keeps its device-naming log.
+        raise LotekException(
+            message=(
+                f"All {len(device_list)} device(s) failed for integration {integration.id}. "
+                f"See the per-device errors in this action's activity log."
+            )
         )
 
     return {'observations_extracted': observations_extracted, 'devices_failed': failed_devices}
@@ -248,6 +256,9 @@ async def _pull_device_observations(device, integration, auth, action_config, pr
                 with attempt:
                     positions = await client.get_positions(device.nDeviceID, auth, integration, lower_date, upper_date, True)
             logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device.nDeviceID} between {lower_date} and {upper_date}.")
+            # Transform inside the try: a malformed payload is a per-device, fetch-class
+            # failure and must get the same device/date-window log and isolation.
+            cdip_positions.extend(filter_and_transform_positions(positions, integration, action_config))
         except LotekUnauthorizedException:
             # Credentials are an integration-wide problem: every remaining device
             # would fail the same way, so fail fast instead of N identical errors.
@@ -267,9 +278,23 @@ async def _pull_device_observations(device, integration, auth, action_config, pr
             )
             device_failed = True
             break
-        cdip_positions.extend(filter_and_transform_positions(positions, integration, action_config))
         last_successful_upper = upper_date
         lower_date = upper_date
+
+    if not cdip_positions and not device_failed:
+        # Purely informational; must never affect the device's outcome. A pubsub blip
+        # here must not mark a healthy quiet device as failed or stall its cursor.
+        message = f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}."
+        logger.info(message)
+        try:
+            await log_action_activity(
+                integration_id=str(integration.id),
+                action_id="pull_observations",
+                title=message,
+                level=LogLevel.WARNING
+            )
+        except Exception as e:
+            logger.warning(f"Could not publish activity log for device {device.nDeviceID}: {describe_exception(e)}")
 
     observations_sent = 0
     try:
@@ -279,15 +304,6 @@ async def _pull_device_observations(device, integration, auth, action_config, pr
                 logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Device: {device.nDeviceID}')
                 await gundi_tools.send_observations_to_gundi(observations=batch, integration_id=integration.id)
                 observations_sent += len(batch)
-        elif not device_failed:
-            message = f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}."
-            logger.info(message)
-            await log_action_activity(
-                integration_id=str(integration.id),
-                action_id="pull_observations",
-                title=message,
-                level=LogLevel.WARNING
-            )
     except Exception as e:
         # Handled here rather than in the caller so batches already delivered keep
         # counting toward the run's total — otherwise a send/checkpoint failure after a

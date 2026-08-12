@@ -10,6 +10,7 @@ from app.actions.client import (
     get_positions,
     LotekDevice,
     LotekException,
+    LotekTokenExpiredException,
     LotekUnauthorizedException, LotekPosition,
 )
 
@@ -88,7 +89,9 @@ async def test_get_devices_unauthorized_raises(mocker, lotek_integration, auth_c
     mocker.patch("app.actions.client.state_manager.delete_state", return_value=None)
     mocker.patch("app.actions.client.httpx.AsyncClient", return_value=mock_client)
 
-    with pytest.raises(LotekUnauthorizedException):
+    # 401 with a cached token means the token expired, not that credentials were
+    # refused; it must not carry the type that aborts the whole run.
+    with pytest.raises(LotekTokenExpiredException):
         await get_devices(lotek_integration, auth_config)
 
 
@@ -129,7 +132,7 @@ async def test_get_positions_unauthorized_raises(mocker, lotek_integration, auth
 
     from_date = datetime.now(timezone.utc)
     to_date = datetime.now(timezone.utc)
-    with pytest.raises(LotekUnauthorizedException):
+    with pytest.raises(LotekTokenExpiredException):
         await get_positions(1, auth_config, lotek_integration, from_date, to_date, True)
 
 

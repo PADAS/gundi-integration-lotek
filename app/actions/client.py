@@ -34,7 +34,18 @@ class LotekException(Exception):
 
 
 class LotekUnauthorizedException(LotekException):
+    """The login endpoint refused the credentials. Integration-wide and fatal:
+    callers abort the whole run rather than repeat the failure per device."""
     def __init__(self, message: str = "Unauthorized", error: Optional[Exception] = None, status_code: int = 401):
+        super().__init__(message=message, error=error, status_code=status_code)
+
+
+class LotekTokenExpiredException(LotekException):
+    """A 401 on a data call with a (possibly stale) cached token. The cached token
+    is cleared before raising, so a retry re-authenticates; if it persists it is a
+    per-device problem, NOT proof of refused credentials. Deliberately not a
+    subclass of LotekUnauthorizedException so it never triggers the fatal path."""
+    def __init__(self, message: str = "Token expired", error: Optional[Exception] = None, status_code: int = 401):
         super().__init__(message=message, error=error, status_code=status_code)
 
 
@@ -163,7 +174,7 @@ async def get_devices(integration, auth):
                 "pull_observations",
                 "token"
             )
-            raise LotekUnauthorizedException(message=f"401 Response from Lotek API", error=ex)
+            raise LotekTokenExpiredException(message=f"401 Response from Lotek API", error=ex)
         else:
             msg = f'Lotek get_devices failed for user {auth.username}. Caught exception: {ex}'
             raise LotekException(status_code=ex.response.status_code, message=msg, error=ex)
@@ -208,7 +219,7 @@ async def get_positions(device_id, auth, integration, start_datetime=None, end_d
                     "pull_observations",
                     "token"
                 )
-                raise LotekUnauthorizedException(message=f"401 Response from Lotek API", error=ex)
+                raise LotekTokenExpiredException(message=f"401 Response from Lotek API", error=ex)
 
             msg = f'Lotek get_positions failed for user {auth.username}. Caught exception: {ex}'
             logger.exception(

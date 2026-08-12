@@ -589,3 +589,171 @@ async def test_action_pull_observations_error(mocker, lotek_integration, pull_co
         level=LogLevel.ERROR,
         title=f"Error fetching devices from Lotek. Integration ID: {str(lotek_integration.id)} Exception: 500: Lotek get_devices failed for user test_user. | Error: "
     )
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_isolates_persistent_401_on_one_device(
+    mocker, lotek_integration, pull_config, mock_redis, lotek_position
+):
+    # A 401 that persists for one device after re-auth retries is a device problem
+    # (or an auth flake), not proof of refused credentials — it must not abort the
+    # run. Only a refused login (LotekUnauthorizedException from the login endpoint)
+    # aborts. This is the GUNDI-5601 starvation bug via a third path.
+    from app.actions.client import LotekTokenExpiredException
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2", "3")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mocker.patch("app.services.gundi.send_observations_to_gundi", new=AsyncMock())
+
+    queried = []
+
+    async def get_positions(device_id, *args, **kwargs):
+        queried.append(device_id)
+        if device_id == "2":
+            raise LotekTokenExpiredException(message="401 Response from Lotek API")
+        return [lotek_position]
+
+    mocker.patch("app.actions.client.get_positions", new=get_positions)
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert queried[-1] == "3", "devices after the 401 device were never queried"
+    assert result["devices_failed"] == ["2"]
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_does_not_retry_rejected_login_at_get_devices(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # A definitively refused login must fail immediately, not be retried with waits.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+
+    attempts = []
+
+    async def get_devices(integration, auth):
+        attempts.append(1)
+        raise LotekUnauthorizedException(message="Lotek login failed", status_code=400)
+
+    mocker.patch("app.actions.client.get_devices", new=get_devices)
+
+    with pytest.raises(LotekUnauthorizedException):
+        await action_pull_observations(lotek_integration, pull_config)
+
+    assert len(attempts) == 1, f"refused login was retried {len(attempts)} times"
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_quiet_device_unaffected_by_logging_failure(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # The "No positions fetched" entry is informational; a pubsub blip while logging
+    # it must not mark a healthy quiet device as failed or stall its cursor.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mock_set_state = mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mocker.patch("app.actions.client.get_positions", new=AsyncMock(return_value=[]))
+    mocker.patch("app.actions.handlers.log_action_activity",
+                 new=AsyncMock(side_effect=RuntimeError("pubsub down")))
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert result["devices_failed"] == []
+    assert [c.args[-1] for c in mock_set_state.call_args_list] == ["1"], "cursor was not advanced"
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_delivers_partial_chunks_when_transform_fails(
+    mocker, lotek_integration, pull_config, mock_redis, lotek_position
+):
+    # A transform failure on a later chunk is a per-device failure like any other:
+    # chunks already fetched must still be delivered and checkpointed.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mock_send = mocker.patch("app.services.gundi.send_observations_to_gundi", new=AsyncMock())
+    pull_config.default_lookback_days = 30
+
+    windows = []
+
+    async def get_positions(device_id, auth, integration, lower, upper, geo_only):
+        if lower not in windows:
+            windows.append(lower)
+        if windows.index(lower) == 2:
+            return None  # malformed response: filter_and_transform will blow up iterating
+        return [lotek_position]
+
+    mocker.patch("app.actions.client.get_positions", new=get_positions)
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert result["devices_failed"] == ["1"]
+    assert mock_send.call_count >= 1, "chunks fetched before the transform failure were discarded"
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_emits_summary_before_all_failed_raise(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # In the worst case (everything failed) the summary naming the devices is the
+    # most valuable diagnostic — it must be emitted before the raise, not skipped.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mocker.patch("app.actions.client.get_positions", new=AsyncMock(side_effect=httpx.ReadTimeout("")))
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+
+    with pytest.raises(LotekException):
+        await action_pull_observations(lotek_integration, pull_config)
+
+    warnings = [c.kwargs["title"] for c in mock_log_action_activity.call_args_list
+                if c.kwargs.get("level") == LogLevel.WARNING and "failing" in c.kwargs["title"]]
+    assert warnings, "summary was not emitted before the all-failed raise"
+    assert "2 of 2" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_action_auth_reports_server_error_as_internal_not_invalid_credentials(
+    mocker, lotek_integration, auth_config
+):
+    # A Lotek 500 on login is not the operator's fault; saying "Invalid credentials"
+    # sends them to reset a working password.
+    mocker.patch("app.actions.client.get_token_from_api",
+                 new=AsyncMock(side_effect=LotekException(message="login 500", status_code=500)))
+    result = await action_auth(lotek_integration, auth_config)
+    assert "error" in result
+    assert result.get("valid_credentials") is not False
+
+
+@pytest.mark.asyncio
+async def test_action_auth_reports_rejected_login_as_invalid_credentials(
+    mocker, lotek_integration, auth_config
+):
+    mocker.patch("app.actions.client.get_token_from_api",
+                 new=AsyncMock(side_effect=LotekUnauthorizedException(message="login 400", status_code=400)))
+    result = await action_auth(lotek_integration, auth_config)
+    assert result == {"valid_credentials": False, "message": "Invalid credentials"}
