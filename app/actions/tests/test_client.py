@@ -144,3 +144,30 @@ async def test_get_positions_http_error_raises_lotek_exception(mocker, lotek_int
     to_date = datetime.now(timezone.utc)
     with pytest.raises(LotekException):
         await get_positions(1, auth_config, lotek_integration, from_date, to_date, True)
+
+
+@pytest.mark.parametrize("status", [400, 401, 403])
+@pytest.mark.asyncio
+async def test_get_token_from_api_rejected_login_is_unauthorized(mocker, lotek_integration, auth_config, status):
+    # Only a genuine credentials rejection should be Unauthorized, because callers
+    # abort the whole run on it. Lotek answers a bad login with 400.
+    resp = httpx.Response(status, json={"error": "invalid_grant"}, request=httpx.Request("POST", lotek_integration.base_url))
+    mock_client = _make_mock_client(response=resp, method="post")
+    mocker.patch("app.actions.client.httpx.AsyncClient", return_value=mock_client)
+
+    with pytest.raises(LotekUnauthorizedException):
+        await get_token_from_api(lotek_integration, auth_config)
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503])
+@pytest.mark.asyncio
+async def test_get_token_from_api_server_failure_is_not_unauthorized(mocker, lotek_integration, auth_config, status):
+    # A Lotek outage or rate limit is not a credentials problem; reporting it as one
+    # would tell operators their credentials are wrong when the server is just down.
+    resp = httpx.Response(status, json={"error": "server"}, request=httpx.Request("POST", lotek_integration.base_url))
+    mock_client = _make_mock_client(response=resp, method="post")
+    mocker.patch("app.actions.client.httpx.AsyncClient", return_value=mock_client)
+
+    with pytest.raises(LotekException) as excinfo:
+        await get_token_from_api(lotek_integration, auth_config)
+    assert not isinstance(excinfo.value, LotekUnauthorizedException)

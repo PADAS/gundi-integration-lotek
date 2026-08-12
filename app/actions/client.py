@@ -10,6 +10,9 @@ from app.services.state import IntegrationStateManager
 
 DEFAULT_TIMEOUT = (3.1, 20)
 DEFAULT_LOOKBACK_DAYS = 60
+# Statuses from the login endpoint that mean the credentials themselves were refused.
+# Lotek answers a bad login with 400; 401/403 are included in case that ever changes.
+CREDENTIAL_REJECTION_STATUSES = frozenset({400, 401, 403})
 
 
 logger = logging.getLogger(__name__)
@@ -126,11 +129,15 @@ async def get_token_from_api(integration, auth):
             response.raise_for_status()
         except httpx.HTTPStatusError as ex:
             msg = f'Lotek login failed for user {auth.username}. Caught exception: {ex}'
-            # A rejected login is an integration-wide credentials problem, not a
-            # per-device blip. Raising the Unauthorized subclass lets callers fail the
-            # whole run instead of retrying the same bad login once per device. Lotek
-            # answers a bad login with 400, so match on the login call, not the status.
-            raise LotekUnauthorizedException(message=msg, error=ex, status_code=ex.response.status_code)
+            status_code = ex.response.status_code
+            if status_code in CREDENTIAL_REJECTION_STATUSES:
+                # A rejected login is an integration-wide credentials problem, not a
+                # per-device blip, and callers abort the whole run on it. Lotek answers
+                # a bad login with 400. Server errors and rate limits are NOT credential
+                # problems — reporting them as such would tell operators their password
+                # is wrong when Lotek is merely down.
+                raise LotekUnauthorizedException(message=msg, error=ex, status_code=status_code)
+            raise LotekException(message=msg, error=ex, status_code=status_code)
         else:
             data = response.json()
             return data.get('access_token', None)
