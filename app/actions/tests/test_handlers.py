@@ -757,3 +757,36 @@ async def test_action_auth_reports_rejected_login_as_invalid_credentials(
                  new=AsyncMock(side_effect=LotekUnauthorizedException(message="login 400", status_code=400)))
     result = await action_auth(lotek_integration, auth_config)
     assert result == {"valid_credentials": False, "message": "Invalid credentials"}
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_retries_token_expiry_and_recovers(
+    mocker, lotek_integration, pull_config, mock_redis, lotek_position
+):
+    # A single token expiry must be retried (the client cleared the cached token, so
+    # the retry re-authenticates), not treated as a device failure for the cycle.
+    from app.actions.client import LotekTokenExpiredException
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mocker.patch("app.services.gundi.send_observations_to_gundi", new=AsyncMock())
+
+    attempts = []
+
+    async def get_positions(device_id, *args, **kwargs):
+        attempts.append(device_id)
+        if len(attempts) == 1:
+            raise LotekTokenExpiredException(message="401 Response from Lotek API")
+        return [lotek_position]
+
+    mocker.patch("app.actions.client.get_positions", new=get_positions)
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert len(attempts) == 2, "token expiry was not retried"
+    assert result == {"observations_extracted": 1, "devices_failed": []}
