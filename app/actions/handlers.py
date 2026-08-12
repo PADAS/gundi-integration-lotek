@@ -25,7 +25,7 @@ state_manager = IntegrationStateManager()
 # Lotek read timeouts are the common transient failure; retrying them costs one extra
 # request but saves a device from being skipped for a whole cycle. Unauthorized is here
 # because the client clears the cached token before raising, so a retry re-authenticates.
-RETRYABLE_ERRORS = (LotekUnauthorizedException, httpx.TimeoutException, httpx.TransportError)
+RETRYABLE_ERRORS = (LotekUnauthorizedException, httpx.TransportError)  # TransportError covers timeouts
 RETRY_ATTEMPTS = 3
 RETRY_WAIT_INITIAL = 1.0
 RETRY_WAIT_JITTER = 5.0
@@ -184,7 +184,11 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 # Credentials are an integration-wide problem: every remaining device
                 # would fail the same way, so fail fast instead of N identical errors.
                 raise
-            except (httpx.HTTPError, LotekException) as e:
+            except Exception as e:
+                # Deliberately broad: malformed data from Lotek surfaces as KeyError or
+                # pydantic.ValidationError out of the client's parsing, and those must
+                # not take down the devices behind this one either. CancelledError is a
+                # BaseException, so the action timeout still unwinds normally.
                 message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration.id} Exception: {describe_exception(e)}"
                 logger.exception(message)
                 await log_action_activity(

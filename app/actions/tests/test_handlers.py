@@ -209,6 +209,38 @@ async def test_action_pull_observations_continues_after_lotek_error_status(
 
 
 @pytest.mark.asyncio
+async def test_action_pull_observations_continues_after_malformed_device_data(
+    mocker, lotek_integration, pull_config, mock_redis, lotek_position
+):
+    # Lotek returning a malformed record raises out of the client's parsing (KeyError /
+    # ValidationError), which is neither an httpx error nor a LotekException.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2", "3")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mocker.patch("app.services.gundi.send_observations_to_gundi", new=AsyncMock())
+
+    queried = []
+
+    async def get_positions(device_id, *args, **kwargs):
+        queried.append(device_id)
+        if device_id == "2":
+            raise KeyError("Latitude")
+        return [lotek_position]
+
+    mocker.patch("app.actions.client.get_positions", new=get_positions)
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert queried[-1] == "3"
+    assert result == {"observations_extracted": 2, "devices_failed": ["2"]}
+
+
+@pytest.mark.asyncio
 async def test_action_pull_observations_does_not_advance_state_for_failed_device(
     mocker, lotek_integration, pull_config, mock_redis, lotek_position
 ):
