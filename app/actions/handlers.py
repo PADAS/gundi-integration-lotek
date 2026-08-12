@@ -22,6 +22,22 @@ logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
 
+# Lotek read timeouts are the common transient failure; retrying them costs one extra
+# request but saves a device from being skipped for a whole cycle. Unauthorized is here
+# because the client clears the cached token before raising, so a retry re-authenticates.
+RETRYABLE_ERRORS = (LotekUnauthorizedException, httpx.TimeoutException, httpx.TransportError)
+RETRY_ATTEMPTS = 3
+RETRY_WAIT_INITIAL = 1.0
+RETRY_WAIT_JITTER = 5.0
+RETRY_WAIT_MAX = 32.0
+
+
+def describe_exception(exc):
+    # httpx timeout exceptions carry an empty message, which used to render as a bare
+    # "Exception: " in the activity log and told operators nothing.
+    return str(exc) or type(exc).__name__
+
+
 def generate_batches(iterable, n=settings.OBSERVATIONS_BATCH_SIZE):
     for i in range(0, len(iterable), n):
         yield iterable[i: i + n]
@@ -144,8 +160,10 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     lookback = timedelta(days=action_config.default_lookback_days)
     default_start = present_time - lookback
     observations_extracted = 0
+    failed_devices = []
     for device in device_list:
         cdip_positions = []
+        device_failed = False
         try:
             saved_state = await state_manager.get_state(str(integration.id), "pull_observations", device.nDeviceID)
             state = client.IntegrationState.parse_obj({"updated_at": saved_state.get("updated_at") or default_start})
@@ -158,12 +176,16 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         while lower_date < present_time:
             upper_date = min(present_time, lower_date + timedelta(days=7))
             try:
-                async for attempt in stamina.retry_context(on=LotekUnauthorizedException, attempts=3, wait_initial=1.0, wait_jitter=5.0, wait_max=32.0):
+                async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
                     with attempt:
                         positions = await client.get_positions(device.nDeviceID, auth, integration, lower_date, upper_date, True)
                 logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device.nDeviceID} between {lower_date} and {upper_date}.")
-            except httpx.HTTPError as e:
-                message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration.id} Exception: {e}"
+            except LotekUnauthorizedException:
+                # Credentials are an integration-wide problem: every remaining device
+                # would fail the same way, so fail fast instead of N identical errors.
+                raise
+            except (httpx.HTTPError, LotekException) as e:
+                message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration.id} Exception: {describe_exception(e)}"
                 logger.exception(message)
                 await log_action_activity(
                     integration_id=str(integration.id),
@@ -171,9 +193,17 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                     title=message,
                     level=LogLevel.ERROR
                 )
-                raise LotekException(message=message, error=e)
+                device_failed = True
+                break
             cdip_positions.extend(filter_and_transform_positions(positions, integration, action_config))
             lower_date = upper_date
+
+        if device_failed:
+            # Drop whatever chunks did succeed and leave the cursor untouched, so the
+            # whole window is re-fetched next run rather than partly sent now and sent
+            # again later. Keep going: one unreachable device must not stop the others.
+            failed_devices.append(device.nDeviceID)
+            continue
 
         if cdip_positions:
             logger.info(f"{len(cdip_positions)} observations pulled successfully for device {device.nDeviceID} integration ID: {integration.id}.")
@@ -211,4 +241,18 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             device.nDeviceID
         )
 
-    return {'observations_extracted': observations_extracted}
+    if failed_devices:
+        message = (
+            f"Pulled observations with {len(failed_devices)} device(s) failing for integration "
+            f"{integration.id}: {', '.join(failed_devices)}. Their cursors were left untouched "
+            f"and will be retried on the next run."
+        )
+        logger.warning(message)
+        await log_action_activity(
+            integration_id=str(integration.id),
+            action_id="pull_observations",
+            title=message,
+            level=LogLevel.WARNING
+        )
+
+    return {'observations_extracted': observations_extracted, 'devices_failed': failed_devices}
