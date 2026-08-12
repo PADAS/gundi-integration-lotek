@@ -241,6 +241,162 @@ async def test_action_pull_observations_continues_after_malformed_device_data(
 
 
 @pytest.mark.asyncio
+async def test_action_pull_observations_aborts_when_login_is_rejected(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # A rejected login is integration-wide. It reaches the handler from inside
+    # get_positions (cached token expires mid-run), and must not be retried once per
+    # device against a rejecting endpoint.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2", "3")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+
+    logins = []
+
+    async def get_token_from_api(integration, auth):
+        logins.append(auth.username)
+        response = httpx.Response(400, request=httpx.Request("POST", "https://lotek/user/login"))
+        raise LotekUnauthorizedException(
+            message="Lotek login failed", error=httpx.HTTPStatusError("bad", request=response.request, response=response),
+            status_code=400,
+        )
+
+    mocker.patch("app.actions.client.get_token_from_api", new=get_token_from_api)
+    mocker.patch("app.services.state.IntegrationStateManager.delete_state", new=AsyncMock(return_value=None))
+
+    with pytest.raises(LotekUnauthorizedException):
+        await action_pull_observations(lotek_integration, pull_config)
+
+    assert len(logins) <= RETRY_ATTEMPTS, f"login retried per device: {len(logins)} attempts"
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_continues_when_one_device_send_fails(
+    mocker, lotek_integration, pull_config, mock_redis, lotek_position
+):
+    # Failing to deliver one device's observations must not stop the other devices
+    # either — the batch is only as isolated as its least-guarded step.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mocker.patch("app.actions.client.get_positions", new=AsyncMock(return_value=[lotek_position]))
+
+    sent_for = []
+
+    async def send_observations_to_gundi(observations, integration_id):
+        sent_for.append(observations[0]["source"])
+        if len(sent_for) == 1:
+            raise httpx.ConnectError("gundi unreachable")
+
+    mocker.patch("app.services.gundi.send_observations_to_gundi", new=send_observations_to_gundi)
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert len(sent_for) == 2, "second device was never attempted"
+    assert result["devices_failed"] == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_continues_when_one_device_checkpoint_fails(
+    mocker, lotek_integration, pull_config, mock_redis, lotek_position
+):
+    # A Redis hiccup while checkpointing one device must not abort the run.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mocker.patch("app.services.gundi.send_observations_to_gundi", new=AsyncMock())
+    mocker.patch("app.actions.client.get_positions", new=AsyncMock(return_value=[lotek_position]))
+
+    checkpointed = []
+
+    async def set_state(self, integration_id, action_id, state, source_id="no-source"):
+        checkpointed.append(source_id)
+        if source_id == "1":
+            raise RuntimeError("redis down")
+
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=set_state)
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert "2" in checkpointed, "second device was never processed"
+    assert result["devices_failed"] == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_fails_when_every_device_fails(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # A wholly broken integration must not report success, or the portal shows it green.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mocker.patch("app.actions.client.get_positions", new=AsyncMock(side_effect=httpx.ReadTimeout("")))
+
+    with pytest.raises(LotekException):
+        await action_pull_observations(lotek_integration, pull_config)
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_keeps_successful_chunks_when_later_chunk_fails(
+    mocker, lotek_integration, pull_config, mock_redis, lotek_position
+):
+    # With a lookback wider than one chunk, data already fetched should be delivered and
+    # checkpointed up to the last good window instead of being thrown away every run.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mock_set_state = mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mock_send = mocker.patch("app.services.gundi.send_observations_to_gundi", new=AsyncMock())
+    pull_config.default_lookback_days = 30
+
+    windows = []
+
+    async def get_positions(device_id, auth, integration, lower, upper, geo_only):
+        if lower not in windows:
+            windows.append(lower)
+        # the third window fails every time, so retries are exhausted on it
+        if windows.index(lower) == 2:
+            raise httpx.ReadTimeout("")
+        return [lotek_position]
+
+    mocker.patch("app.actions.client.get_positions", new=get_positions)
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert mock_send.call_count >= 1, "successful chunks were discarded"
+    assert result["devices_failed"] == ["1"]
+    # cursor advanced only as far as the last chunk that actually succeeded
+    checkpoint = mock_set_state.call_args_list[0].args[2]["updated_at"]
+    assert checkpoint < present_time_isoformat_upper_bound()
+
+
+def present_time_isoformat_upper_bound():
+    return datetime.now(timezone.utc).isoformat()
+
+
+@pytest.mark.asyncio
 async def test_action_pull_observations_does_not_advance_state_for_failed_device(
     mocker, lotek_integration, pull_config, mock_redis, lotek_position
 ):
@@ -285,7 +441,9 @@ async def test_action_pull_observations_logs_exception_type_when_message_is_empt
     mocker.patch("app.actions.client.get_positions", new=AsyncMock(side_effect=httpx.ReadTimeout("")))
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
 
-    await action_pull_observations(lotek_integration, pull_config)
+    # the only device fails and delivers nothing, so the run is reported as failed
+    with pytest.raises(LotekException):
+        await action_pull_observations(lotek_integration, pull_config)
 
     titles = [call.kwargs["title"] for call in mock_log_action_activity.call_args_list]
     error_titles = [t for t in titles if "Error fetching positions" in t]

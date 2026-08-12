@@ -126,7 +126,11 @@ async def get_token_from_api(integration, auth):
             response.raise_for_status()
         except httpx.HTTPStatusError as ex:
             msg = f'Lotek login failed for user {auth.username}. Caught exception: {ex}'
-            raise LotekException(message=msg, error=ex, status_code=ex.response.status_code)
+            # A rejected login is an integration-wide credentials problem, not a
+            # per-device blip. Raising the Unauthorized subclass lets callers fail the
+            # whole run instead of retrying the same bad login once per device. Lotek
+            # answers a bad login with 400, so match on the login call, not the status.
+            raise LotekUnauthorizedException(message=msg, error=ex, status_code=ex.response.status_code)
         else:
             data = response.json()
             return data.get('access_token', None)
