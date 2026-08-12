@@ -10,6 +10,9 @@ from app.services.state import IntegrationStateManager
 
 DEFAULT_TIMEOUT = (3.1, 20)
 DEFAULT_LOOKBACK_DAYS = 60
+# Statuses from the login endpoint that mean the credentials themselves were refused.
+# Lotek answers a bad login with 400; 401/403 are included in case that ever changes.
+CREDENTIAL_REJECTION_STATUSES = frozenset({400, 401, 403})
 
 
 logger = logging.getLogger(__name__)
@@ -31,7 +34,18 @@ class LotekException(Exception):
 
 
 class LotekUnauthorizedException(LotekException):
+    """The login endpoint refused the credentials. Integration-wide and fatal:
+    callers abort the whole run rather than repeat the failure per device."""
     def __init__(self, message: str = "Unauthorized", error: Optional[Exception] = None, status_code: int = 401):
+        super().__init__(message=message, error=error, status_code=status_code)
+
+
+class LotekTokenExpiredException(LotekException):
+    """A 401 on a data call with a (possibly stale) cached token. The cached token
+    is cleared before raising, so a retry re-authenticates; if it persists it is a
+    per-device problem, NOT proof of refused credentials. Deliberately not a
+    subclass of LotekUnauthorizedException so it never triggers the fatal path."""
+    def __init__(self, message: str = "Token expired", error: Optional[Exception] = None, status_code: int = 401):
         super().__init__(message=message, error=error, status_code=status_code)
 
 
@@ -126,7 +140,15 @@ async def get_token_from_api(integration, auth):
             response.raise_for_status()
         except httpx.HTTPStatusError as ex:
             msg = f'Lotek login failed for user {auth.username}. Caught exception: {ex}'
-            raise LotekException(message=msg, error=ex, status_code=ex.response.status_code)
+            status_code = ex.response.status_code
+            if status_code in CREDENTIAL_REJECTION_STATUSES:
+                # A rejected login is an integration-wide credentials problem, not a
+                # per-device blip, and callers abort the whole run on it. Lotek answers
+                # a bad login with 400. Server errors and rate limits are NOT credential
+                # problems — reporting them as such would tell operators their password
+                # is wrong when Lotek is merely down.
+                raise LotekUnauthorizedException(message=msg, error=ex, status_code=status_code)
+            raise LotekException(message=msg, error=ex, status_code=status_code)
         else:
             data = response.json()
             return data.get('access_token', None)
@@ -152,7 +174,7 @@ async def get_devices(integration, auth):
                 "pull_observations",
                 "token"
             )
-            raise LotekUnauthorizedException(message=f"401 Response from Lotek API", error=ex)
+            raise LotekTokenExpiredException(message=f"401 Response from Lotek API", error=ex)
         else:
             msg = f'Lotek get_devices failed for user {auth.username}. Caught exception: {ex}'
             raise LotekException(status_code=ex.response.status_code, message=msg, error=ex)
@@ -197,7 +219,7 @@ async def get_positions(device_id, auth, integration, start_datetime=None, end_d
                     "pull_observations",
                     "token"
                 )
-                raise LotekUnauthorizedException(message=f"401 Response from Lotek API", error=ex)
+                raise LotekTokenExpiredException(message=f"401 Response from Lotek API", error=ex)
 
             msg = f'Lotek get_positions failed for user {auth.username}. Caught exception: {ex}'
             logger.exception(
