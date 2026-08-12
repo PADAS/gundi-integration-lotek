@@ -272,21 +272,40 @@ async def _pull_device_observations(device, integration, auth, action_config, pr
         lower_date = upper_date
 
     observations_sent = 0
-    if cdip_positions:
-        logger.info(f"{len(cdip_positions)} observations pulled successfully for device {device.nDeviceID} integration ID: {integration.id}.")
-        for i, batch in enumerate(generate_batches(cdip_positions)):
-            logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Device: {device.nDeviceID}')
-            await gundi_tools.send_observations_to_gundi(observations=batch, integration_id=integration.id)
-            observations_sent += len(batch)
-    elif not device_failed:
-        message = f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}."
-        logger.info(message)
+    try:
+        if cdip_positions:
+            logger.info(f"{len(cdip_positions)} observations pulled successfully for device {device.nDeviceID} integration ID: {integration.id}.")
+            for i, batch in enumerate(generate_batches(cdip_positions)):
+                logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Device: {device.nDeviceID}')
+                await gundi_tools.send_observations_to_gundi(observations=batch, integration_id=integration.id)
+                observations_sent += len(batch)
+        elif not device_failed:
+            message = f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}."
+            logger.info(message)
+            await log_action_activity(
+                integration_id=str(integration.id),
+                action_id="pull_observations",
+                title=message,
+                level=LogLevel.WARNING
+            )
+    except Exception as e:
+        # Handled here rather than in the caller so batches already delivered keep
+        # counting toward the run's total — otherwise a send/checkpoint failure after a
+        # successful delivery reports "nothing delivered". Cursor stays untouched below,
+        # so the un-delivered remainder is re-fetched next run (re-sends are tolerated,
+        # silent skips are not).
+        message = (
+            f"Error delivering observations for device {device.nDeviceID}. Integration ID: "
+            f"{integration.id} Exception: {describe_exception(e)}"
+        )
+        logger.exception(message)
         await log_action_activity(
             integration_id=str(integration.id),
             action_id="pull_observations",
             title=message,
-            level=LogLevel.WARNING
+            level=LogLevel.ERROR
         )
+        return observations_sent, True
 
     # Advance state by the queried window (upload time), not recorded_at. Queries are by
     # upload date, so wall clock is the correct cursor, and it must advance even when a
@@ -295,11 +314,25 @@ async def _pull_device_observations(device, integration, auth, action_config, pr
     # re-sending what already landed; if nothing succeeded, leave the cursor alone.
     checkpoint = present_time if not device_failed else last_successful_upper
     if checkpoint is not None:
-        await state_manager.set_state(
-            str(integration.id),
-            "pull_observations",
-            {"updated_at": checkpoint.isoformat()},
-            device.nDeviceID
-        )
+        try:
+            await state_manager.set_state(
+                str(integration.id),
+                "pull_observations",
+                {"updated_at": checkpoint.isoformat()},
+                device.nDeviceID
+            )
+        except Exception as e:
+            message = (
+                f"Error saving cursor for device {device.nDeviceID}. Integration ID: "
+                f"{integration.id} Exception: {describe_exception(e)}"
+            )
+            logger.exception(message)
+            await log_action_activity(
+                integration_id=str(integration.id),
+                action_id="pull_observations",
+                title=message,
+                level=LogLevel.ERROR
+            )
+            return observations_sent, True
 
     return observations_sent, device_failed

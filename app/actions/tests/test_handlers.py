@@ -1,6 +1,6 @@
 import pytest
 import httpx
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 from gundi_core.schemas.v2 import LogLevel
@@ -287,7 +287,7 @@ async def test_action_pull_observations_continues_when_one_device_send_fails(
     mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
     mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2")))
     mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
-    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mock_set_state = mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
     mocker.patch("app.actions.client.get_positions", new=AsyncMock(return_value=[lotek_position]))
 
     sent_for = []
@@ -303,6 +303,65 @@ async def test_action_pull_observations_continues_when_one_device_send_fails(
 
     assert len(sent_for) == 2, "second device was never attempted"
     assert result["devices_failed"] == ["1"]
+    # the failed device's cursor must stay put: checkpointing fetched-but-undelivered
+    # data would silently skip it forever
+    advanced = [call.args[-1] for call in mock_set_state.call_args_list]
+    assert "1" not in advanced
+    assert "2" in advanced
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_counts_data_delivered_before_downstream_failure(
+    mocker, lotek_integration, pull_config, mock_redis, lotek_position
+):
+    # A single device that DID deliver a batch and then failed at checkpointing must
+    # not trip the "all devices failed and nothing delivered" raise: the data landed.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mocker.patch("app.services.state.IntegrationStateManager.set_state",
+                 new=AsyncMock(side_effect=RuntimeError("redis down")))
+    mocker.patch("app.actions.client.get_positions", new=AsyncMock(return_value=[lotek_position]))
+    mocker.patch("app.services.gundi.send_observations_to_gundi", new=AsyncMock())
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert result == {"observations_extracted": 1, "devices_failed": ["1"]}
+
+
+@pytest.mark.asyncio
+async def test_action_pull_observations_summary_names_failed_devices(
+    mocker, lotek_integration, pull_config, mock_redis, lotek_position
+):
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2")))
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mocker.patch("app.services.gundi.send_observations_to_gundi", new=AsyncMock())
+    mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+
+    async def get_positions(device_id, *args, **kwargs):
+        if device_id == "2":
+            raise httpx.ReadTimeout("")
+        return [lotek_position]
+
+    mocker.patch("app.actions.client.get_positions", new=get_positions)
+
+    await action_pull_observations(lotek_integration, pull_config)
+
+    warnings = [c.kwargs["title"] for c in mock_log_action_activity.call_args_list
+                if c.kwargs.get("level") == LogLevel.WARNING and "failing" in c.kwargs["title"]]
+    assert warnings, "no failure summary was logged"
+    assert "1 of 2" in warnings[0]
+    assert "2" in warnings[0]
 
 
 @pytest.mark.asyncio
@@ -387,13 +446,14 @@ async def test_action_pull_observations_keeps_successful_chunks_when_later_chunk
 
     assert mock_send.call_count >= 1, "successful chunks were discarded"
     assert result["devices_failed"] == ["1"]
-    # cursor advanced only as far as the last chunk that actually succeeded
-    checkpoint = mock_set_state.call_args_list[0].args[2]["updated_at"]
-    assert checkpoint < present_time_isoformat_upper_bound()
-
-
-def present_time_isoformat_upper_bound():
-    return datetime.now(timezone.utc).isoformat()
+    # The cursor must land exactly on the end of the second (last successful) 7-day
+    # window — i.e. ~16 days ago with a 30-day lookback — NOT at present_time, which
+    # would silently skip the failed window forever.
+    checkpoint = datetime.fromisoformat(mock_set_state.call_args_list[0].args[2]["updated_at"])
+    expected = datetime.now(timezone.utc) - timedelta(days=30) + timedelta(days=14)
+    assert abs((checkpoint - expected).total_seconds()) < 300, (
+        f"cursor at {checkpoint}, expected the last successful window's end ~{expected}"
+    )
 
 
 @pytest.mark.asyncio
