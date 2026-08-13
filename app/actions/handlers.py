@@ -28,7 +28,7 @@ state_manager = IntegrationStateManager()
 # A refused login (LotekUnauthorizedException) is deliberately NOT retryable: it is
 # fatal to the run, and retrying a rejected password risks account lockout.
 RETRYABLE_ERRORS = (LotekTokenExpiredException, httpx.TransportError)  # TransportError covers timeouts
-RETRY_ATTEMPTS = 3
+RETRY_ATTEMPTS = 2
 RETRY_WAIT_INITIAL = 1.0
 RETRY_WAIT_JITTER = 5.0
 RETRY_WAIT_MAX = 32.0

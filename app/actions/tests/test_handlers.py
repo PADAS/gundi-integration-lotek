@@ -811,3 +811,9 @@ async def test_get_devices_failure_logs_exception_type_when_message_is_empty(
         await action_pull_observations(lotek_integration, pull_config)
     title = mock_log.call_args.kwargs["title"]
     assert "ReadTimeout" in title
+
+
+def test_retry_attempts_is_two():
+    # 3 attempts × 9 windows amplified Lotek's slowness into our own 9-min
+    # timeouts (GUNDI-5602). One retry still recovers token expiry.
+    assert RETRY_ATTEMPTS == 2
