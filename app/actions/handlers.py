@@ -217,7 +217,9 @@ def ensure_timezone_aware(val: datetime, default_tz: timezone = timezone.utc) ->
 @action_title("Integration Settings")
 @activity_logger()
 async def action_pull_observations(integration, action_config: PullObservationsConfig):
-    logger.info(f"Executing pull_observations action with integration {integration} and action_config {action_config}...")
+    # Log only the id: the full Integration object embeds auth config data in
+    # plaintext (same leak family as the action-runner _handle_error ticket).
+    logger.info(f"Executing pull_observations action for integration {integration.id}...")
 
     # The clock starts before get_devices: it spends the same action budget.
     run_started = datetime.now(tz=timezone.utc)
@@ -235,7 +237,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             title=message,
             level=LogLevel.ERROR
         )
-        raise e
+        raise  # bare: preserve the original traceback
 
     logger.info(f"Extracted {len(device_list)} devices from Lotek for inbound: {integration.id}")
     present_time = datetime.now(tz=timezone.utc)
@@ -698,7 +700,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 title=message,
                 level=LogLevel.ERROR
             )
-            raise e
+            raise  # bare: preserve the original traceback
 
         gapped = []
         for device in device_list:

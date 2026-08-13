@@ -222,17 +222,10 @@ async def test_backfill_orders_devices_least_recently_backfilled_first(
         mocker, mock_redis, _devices("recent", "never", "old"), states
     )
     await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+    # Each device's 6-day gap fits a single 7-day window, so exactly one fetch
+    # per device, least-recently-backfilled first (never-backfilled leads).
     order = [c.args[0] for c in get_positions.await_args_list]
-    assert order == ["never", "never", "old", "old", "recent", "recent"] or order == [
-        "never", "old", "recent"
-    ]
-    # each device has a 6-day gap → a single window; exact per-device counts
-    # are covered elsewhere, ordering is what matters here
-    deduped = []
-    for d in order:
-        if not deduped or deduped[-1] != d:
-            deduped.append(d)
-    assert deduped == ["never", "old", "recent"]
+    assert order == ["never", "old", "recent"]
 
 
 @pytest.mark.asyncio
