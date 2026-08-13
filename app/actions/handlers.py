@@ -618,7 +618,9 @@ async def action_backfill_observations(integration, action_config: BackfillObser
     pass, oldest-first, least-recently-backfilled device first. Triggered by
     pull_observations; the Redis lease keeps overlapping triggers from
     double-running when a backfill grinds past the next head-pass trigger."""
-    logger.info(f"Executing backfill_observations action with integration {integration}...")
+    # Log only the id: the full Integration object embeds auth config data in
+    # plaintext (same leak family as the action-runner _handle_error ticket).
+    logger.info(f"Executing backfill_observations action for integration {integration.id}...")
     integration_id = str(integration.id)
     run_started = datetime.now(tz=timezone.utc)
     auth = get_auth_config(integration)
