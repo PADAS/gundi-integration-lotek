@@ -2,7 +2,12 @@ import pydantic
 
 from typing import Optional
 
-from .core import AuthActionConfiguration, PullActionConfiguration, ExecutableActionMixin
+from .core import (
+    AuthActionConfiguration,
+    ExecutableActionMixin,
+    InternalActionConfiguration,
+    PullActionConfiguration,
+)
 from app.services.utils import GlobalUISchemaOptions, UIOptions, FieldWithUIOptions
 
 
@@ -24,10 +29,19 @@ class PullObservationsConfig(PullActionConfiguration, ExecutableActionMixin):
         ge=1,
         le=60,
         title="Default lookback (days)",
+        description="How many days of historic data to import when a device is first seen.",
+    )
+    max_data_age_hours: int = FieldWithUIOptions(
+        12,
+        ge=1,
+        le=12,
+        title="Max data age (hours)",
         description=(
-            "How many days of historic data to fetch for new devices or on the first run. "
-            "Also caps how far back the connector catches up after an outage."
+            "Freshness bound: every run fetches at most this many hours back. "
+            "Positions uploaded longer ago than this that could not be fetched "
+            "are skipped permanently."
         ),
+        ui_options=UIOptions(widget="range"),
     )
     max_pdop: Optional[float] = pydantic.Field(
         None,
@@ -51,7 +65,13 @@ class PullObservationsConfig(PullActionConfiguration, ExecutableActionMixin):
     ui_global_options: GlobalUISchemaOptions = GlobalUISchemaOptions(
         order=[
             "default_lookback_days",
+            "max_data_age_hours",
             "max_pdop",
             "run_on_schedule",
         ],
     )
+
+
+class BackfillObservationsConfig(InternalActionConfiguration):
+    """Internal-only: triggered by pull_observations, never configured in the portal."""
+    pass
