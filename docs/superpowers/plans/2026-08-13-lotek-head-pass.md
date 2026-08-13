@@ -553,7 +553,7 @@ async def test_steady_state_advances_high_water_and_keeps_gap_closed(
 async def test_stale_span_is_dropped_with_warning_and_not_added_to_gap(
     mocker, lotek_integration, pull_config, mock_redis
 ):
-    # Bounded staleness (Victor's call): a cursor further back than max_age
+    # Bounded staleness (agreed design decision): a cursor further back than max_age
     # means that span is dropped permanently — WARNING with the range, gap unchanged.
     stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
     get_positions, _, set_state, log = _setup_pull_mocks(
@@ -1798,7 +1798,7 @@ gh pr create --repo PADAS/gundi-integration-lotek \
 PR body must include (draft in the scratchpad, then pass via `--body-file`):
 - Link to GUNDI-5602 and the spec file in-repo.
 - The architecture summary (head pass / internal backfill / single shrinking gap / lease).
-- **The bounded-staleness trade-off stated explicitly**: data older than `max_data_age_hours` that could not be fetched is dropped permanently (WARNING with device + range). This supersedes the earlier "no data loss, only delay" framing — deliberate call, approved by Victor: gaps can't grow, catch-up can't compound, rangers always get fresh positions. Default 12 h with a 10-min cadence ≈ 72 missed runs of slack.
+- **The bounded-staleness trade-off stated explicitly**: data older than `max_data_age_hours` that could not be fetched is dropped permanently (WARNING with device + range). This supersedes the earlier "no data loss, only delay" framing — an agreed design decision: gaps can't grow, catch-up can't compound, rangers always get fresh positions. Default 12 h with a 10-min cadence ≈ 72 missed runs of slack.
 - Safety rails: soft deadline (80% of 540 s), circuit breaker (K=3 consecutive transport failures), zero-progress raise, backfill lease (NX + TTL).
 - Error-semantics table (what stays ERROR vs demoted to WARNING) and why (health = ERROR count in 60 min).
 - Load math: steady state 1 request/device/run vs up to ~27 today.

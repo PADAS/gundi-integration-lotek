@@ -898,7 +898,7 @@ async def test_steady_state_advances_high_water_and_keeps_gap_closed(
 async def test_stale_span_is_dropped_with_warning_and_not_added_to_gap(
     mocker, lotek_integration, pull_config, mock_redis
 ):
-    # Bounded staleness (Victor's call): a cursor further back than max_age
+    # Bounded staleness (agreed design decision): a cursor further back than max_age
     # means that span is dropped permanently — WARNING with the range, gap unchanged.
     stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
     get_positions, _, set_state, log = _setup_pull_mocks(

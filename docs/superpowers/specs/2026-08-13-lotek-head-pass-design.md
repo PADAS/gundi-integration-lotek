@@ -1,6 +1,6 @@
 # Lotek connector: newest-first fetching (head pass + internal backfill)
 
-**Ticket**: GUNDI-5602 · **Status**: approved by Victor 2026-08-13 · **Repo**: gundi-integration-lotek
+**Ticket**: GUNDI-5602 · **Status**: approved 2026-08-13 · **Repo**: gundi-integration-lotek
 
 ## Problem
 
@@ -65,7 +65,7 @@ Consequences, all intended:
 - The gap cannot grow → per-device catch-up cost cannot compound → runtime converges.
 - Rangers always get recent positions; history is best-effort.
 - **Data loss is possible** when an outage exceeds `max_data_age_hours`. This supersedes the
-  earlier "deferral = no data loss, only delay" framing; Victor's explicit call. The 12h
+  earlier "deferral = no data loss, only delay" framing. The 12h
   default with a 10-min cadence gives ~72 missed runs of slack before anything is lost.
 
 ER handles out-of-order arrival fine (live position = newest `recorded_at` regardless of
