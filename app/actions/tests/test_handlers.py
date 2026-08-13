@@ -980,3 +980,51 @@ async def test_all_failed_run_raises_zero_progress(
     get_positions.side_effect = httpx.ReadTimeout("")
     with pytest.raises(LotekException, match="No devices could be serviced"):
         await action_pull_observations(lotek_integration, pull_config)
+
+
+@pytest.mark.asyncio
+async def test_zero_progress_run_raises_even_when_devices_were_only_deferred(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # A run that services nothing is systemic degradation — it must alert
+    # (ERROR/raise), not warn forever. Deferring every device counts.
+    _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
+    mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
+    with pytest.raises(LotekException, match="No devices could be serviced"):
+        await action_pull_observations(lotek_integration, pull_config)
+
+
+@pytest.mark.asyncio
+async def test_deadline_defers_remaining_devices_with_warning(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Past ~80% of the action budget we stop STARTING device work and exit in
+    # control — never via the asyncio.wait_for guillotine. Call order per
+    # device: should_stop() then _retry_attempts(), hence the side_effect
+    # sequence [False(stop d1), False(retry d1), True(stop d2)].
+    _, _, _, log = _setup_pull_mocks(mocker, mock_redis, _devices("1", "2", "3"))
+    mocker.patch(
+        "app.actions.handlers._deadline_exceeded", side_effect=[False, False, True]
+    )
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_deferred"] == ["2", "3"]
+    assert result["devices_failed"] == []
+    deferral_logs = [
+        c for c in log.await_args_list
+        if c.kwargs["level"] == LogLevel.WARNING and "deadline" in c.kwargs["title"].lower()
+    ]
+    assert len(deferral_logs) == 1
+
+
+def test_retry_attempts_drop_to_one_past_deadline(mocker):
+    from app.actions.handlers import _retry_attempts
+    mocker.patch("app.actions.handlers._deadline_exceeded", return_value=False)
+    assert _retry_attempts(datetime.now(timezone.utc)) == RETRY_ATTEMPTS
+    mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
+    assert _retry_attempts(datetime.now(timezone.utc)) == 1
+
+
+def test_deadline_fraction_of_budget():
+    # 540s budget → soft deadline ~432s. Pin the fraction.
+    from app.actions.handlers import DEADLINE_FRACTION
+    assert DEADLINE_FRACTION == 0.8

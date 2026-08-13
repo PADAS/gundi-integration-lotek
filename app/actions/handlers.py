@@ -5,6 +5,7 @@ import pydantic
 
 import app.services.gundi as gundi_tools
 import app.actions.client as client
+import app.settings as app_settings
 import app.settings.integration as settings
 
 from datetime import datetime, timezone, timedelta
@@ -43,6 +44,52 @@ BREAKER_THRESHOLD = 3
 BACKFILL_MAX_WINDOWS_PER_DEVICE = 2
 BACKFILL_WINDOW = timedelta(days=7)
 BACKFILL_LEASE_SOURCE = "lease"
+
+
+def _deadline_exceeded(run_started_at):
+    elapsed = (datetime.now(tz=timezone.utc) - run_started_at).total_seconds()
+    return elapsed > DEADLINE_FRACTION * app_settings.MAX_ACTION_EXECUTION_TIME
+
+
+def _retry_attempts(run_started_at):
+    # Past the soft deadline, don't spend the remaining budget on retries.
+    return 1 if _deadline_exceeded(run_started_at) else RETRY_ATTEMPTS
+
+
+class RunGuards:
+    """Per-run deadline + circuit-breaker state for a device loop."""
+
+    def __init__(self, run_started_at):
+        self.run_started_at = run_started_at
+        self.consecutive_transport_failures = 0
+
+    def should_stop(self):
+        if _deadline_exceeded(self.run_started_at):
+            return "deadline"
+        return None
+
+    def record(self, transport_failure: bool):
+        if transport_failure:
+            self.consecutive_transport_failures += 1
+        else:
+            self.consecutive_transport_failures = 0
+
+
+async def _log_deferral(integration, action_id, reason, deferred_ids):
+    listed = ', '.join(deferred_ids[:MAX_DEVICES_IN_SUMMARY])
+    if len(deferred_ids) > MAX_DEVICES_IN_SUMMARY:
+        listed += f" and {len(deferred_ids) - MAX_DEVICES_IN_SUMMARY} more"
+    message = (
+        f"Stopping early ({reason}) for integration {integration.id}: deferring "
+        f"{len(deferred_ids)} device(s) to the next run: {listed}."
+    )
+    logger.warning(message)
+    await log_action_activity(
+        integration_id=str(integration.id),
+        action_id=action_id,
+        title=message,
+        level=LogLevel.WARNING
+    )
 
 
 def describe_exception(exc):
@@ -157,6 +204,8 @@ def ensure_timezone_aware(val: datetime, default_tz: timezone = timezone.utc) ->
 async def action_pull_observations(integration, action_config: PullObservationsConfig):
     logger.info(f"Executing pull_observations action with integration {integration} and action_config {action_config}...")
 
+    # The clock starts before get_devices: it spends the same action budget.
+    run_started = datetime.now(tz=timezone.utc)
     auth = get_auth_config(integration)
     try:
         async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
@@ -175,15 +224,20 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
     logger.info(f"Extracted {len(device_list)} devices from Lotek for inbound: {integration.id}")
     present_time = datetime.now(tz=timezone.utc)
+    guards = RunGuards(run_started)
     observations_extracted = 0
     failed_devices = []
     deferred_devices = []
     serviced_devices = 0
     any_open_gap = False
-    for device in device_list:
+    for i, device in enumerate(device_list):
+        if reason := guards.should_stop():
+            deferred_devices = [d.nDeviceID for d in device_list[i:]]
+            await _log_deferral(integration, "pull_observations", reason, deferred_devices)
+            break
         try:
             sent, device_failed, state = await _head_pass_device(
-                device, integration, auth, action_config, present_time
+                device, integration, auth, action_config, present_time, guards
             )
         except LotekUnauthorizedException:
             raise
@@ -202,6 +256,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 level=LogLevel.ERROR
             )
             failed_devices.append(device.nDeviceID)
+            guards.record(transport_failure=False)
             continue
         observations_extracted += sent
         if state is not None and state.has_gap:
@@ -280,7 +335,7 @@ async def _load_device_state(integration_id, device_id, present_time, action_con
     return DeviceState(high_water=head_start)
 
 
-async def _head_pass_device(device, integration, auth, action_config, present_time):
+async def _head_pass_device(device, integration, auth, action_config, present_time, guards):
     """Fetch, deliver and checkpoint one device's freshest window.
 
     Returns (observations_sent, device_failed, state). Raises only for
@@ -312,7 +367,7 @@ async def _head_pass_device(device, integration, auth, action_config, present_ti
 
     lower_date = max(state.high_water, freshness_floor)
     try:
-        async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
+        async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=_retry_attempts(guards.run_started_at), wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
             with attempt:
                 positions = await client.get_positions(device.nDeviceID, auth, integration, lower_date, present_time, True)
         logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device.nDeviceID} between {lower_date} and {present_time}.")
