@@ -44,6 +44,13 @@ BREAKER_THRESHOLD = 3
 BACKFILL_MAX_WINDOWS_PER_DEVICE = 2
 BACKFILL_WINDOW = timedelta(days=7)
 BACKFILL_LEASE_SOURCE = "lease"
+# Head fetches re-cover this much of the cursor's trailing edge: rows whose
+# server-assigned UploadTimeStamp falls inside a window we already queried can
+# become queryable only after our request completed (write latency / clock
+# skew), and the gap never re-opens to catch them. Re-sends are tolerated
+# downstream, so the overlap is cheap insurance (carried over from the
+# pre-5602 cursor, which used the same 2h buffer).
+HEAD_LATE_UPLOAD_OVERLAP = timedelta(hours=2)
 
 
 def _deadline_exceeded(run_started_at):
@@ -338,21 +345,64 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     }
 
 
-async def _load_device_state(integration_id, device_id, present_time, action_config):
+async def _read_device_state(integration_id, device_id, action_id="pull_observations"):
+    """Read one device's saved state. Returns a DeviceState, or None when the
+    key is absent or unparseable. Unparseable state is surfaced at WARNING —
+    it means a cursor is about to be discarded and the lookback re-imported
+    (review finding: this was announced only at DEBUG)."""
     saved = await state_manager.get_state(integration_id, "pull_observations", device_id)
-    if saved:
+    if not saved:
+        return None
+    try:
+        return DeviceState.parse_obj(saved)
+    except pydantic.ValidationError as e:
+        message = (
+            f"Discarding unparseable saved state for device {device_id}: the cursor "
+            f"resets and the lookback window will re-import. Integration ID: "
+            f"{integration_id} Error: {describe_exception(e)}"
+        )
+        logger.warning(message)
         try:
-            return DeviceState.parse_obj(saved)
-        except pydantic.ValidationError as e:
-            logger.debug(f"Failed to parse saved state for device {device_id}, starting fresh. Error: {e}")
+            await log_action_activity(
+                integration_id=integration_id,
+                action_id=action_id,
+                title=message,
+                level=LogLevel.WARNING
+            )
+        except Exception:
+            logger.warning(f"Could not publish state-reset warning for device {device_id}")
+        return None
+
+
+async def _load_device_state(integration_id, device_id, present_time, action_config):
+    """Returns (state, is_new). is_new means no usable saved state existed and
+    the returned state is the first-run initialization (gap birth)."""
+    state = await _read_device_state(integration_id, device_id)
+    if state is not None:
+        return state, False
     # First run: the head pass starts at the freshness floor; everything older,
     # back to the configured lookback, becomes the device's one and only gap —
     # the deliberate historical import. It only ever shrinks from here.
     head_start = present_time - timedelta(hours=action_config.max_data_age_hours)
     gap_start = present_time - timedelta(days=action_config.default_lookback_days)
     if gap_start < head_start:
-        return DeviceState(high_water=head_start, gap_start=gap_start, gap_end=head_start)
-    return DeviceState(high_water=head_start)
+        return DeviceState(high_water=head_start, gap_start=gap_start, gap_end=head_start), True
+    return DeviceState(high_water=head_start), True
+
+
+async def _save_device_state_fields(integration_id, device_id, updates):
+    """Merge-save: re-read the current blob and overwrite only the fields this
+    writer owns (head pass: high_water; backfill: gap_*/last_backfilled).
+
+    The two actions can interleave — the Redis lease only serializes backfill
+    against backfill — and whole-blob writes from a stale snapshot were
+    resurrecting closed gaps and rewinding the head cursor (review finding:
+    lost-update race). The re-read shrinks the race window from the whole
+    action duration to milliseconds; re-sends cover whatever remains.
+    """
+    current = await state_manager.get_state(integration_id, "pull_observations", device_id)
+    merged = {**(current or {}), **updates}
+    await state_manager.set_state(integration_id, "pull_observations", merged, device_id)
 
 
 async def _fetch_window(device, integration, auth, config, lower_date, upper_date, guards, action_id):
@@ -462,7 +512,7 @@ async def _head_pass_device(device, integration, auth, action_config, present_ti
     """
     integration_id = str(integration.id)
     freshness_floor = present_time - timedelta(hours=action_config.max_data_age_hours)
-    state = await _load_device_state(integration_id, device.nDeviceID, present_time, action_config)
+    state, is_new = await _load_device_state(integration_id, device.nDeviceID, present_time, action_config)
 
     if state.high_water < freshness_floor:
         # Bounded staleness (GUNDI-5602, deliberate): anything the cursor still
@@ -474,14 +524,19 @@ async def _head_pass_device(device, integration, auth, action_config, present_ti
             f"{action_config.max_data_age_hours}. Integration ID: {integration_id}"
         )
         logger.warning(message)
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id="pull_observations",
-            title=message,
-            level=LogLevel.WARNING
-        )
+        try:
+            await log_action_activity(
+                integration_id=integration_id,
+                action_id="pull_observations",
+                title=message,
+                level=LogLevel.WARNING
+            )
+        except Exception as e:
+            # Informational: a pubsub blip must not keep a stale device from
+            # ever advancing its cursor (review finding).
+            logger.warning(f"Could not publish stale-drop warning for device {device.nDeviceID}: {describe_exception(e)}")
 
-    lower_date = max(state.high_water, freshness_floor)
+    lower_date = max(state.high_water - HEAD_LATE_UPLOAD_OVERLAP, freshness_floor)
     cdip_positions, transport_failure = await _fetch_window(
         device, integration, auth, action_config, lower_date, present_time, guards, "pull_observations"
     )
@@ -515,13 +570,12 @@ async def _head_pass_device(device, integration, auth, action_config, present_ti
     # untouched so the head window is re-fetched next run (re-sends are tolerated,
     # silent skips are not).
     state.high_water = present_time
+    # The head pass owns only high_water; a first run also births the full
+    # document (the gap). Everything else belongs to the backfill (merge-save,
+    # see _save_device_state_fields).
+    updates = state.dict() if is_new else {"high_water": state.high_water}
     try:
-        await state_manager.set_state(
-            integration_id,
-            "pull_observations",
-            state.dict(),
-            device.nDeviceID
-        )
+        await _save_device_state_fields(integration_id, device.nDeviceID, updates)
     except Exception as e:
         message = (
             f"Error saving cursor for device {device.nDeviceID}. Integration ID: "
@@ -572,18 +626,25 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
             break
 
         # Advance the gap only past the delivered window; close it when done.
+        # The backfill owns only the gap fields (merge-save): a concurrent head
+        # pass advancing high_water must survive this write.
         state.gap_start = upper_date
         if not state.has_gap:
             state.gap_start = None
             state.gap_end = None
-        await state_manager.set_state(integration_id, "pull_observations", state.dict(), device.nDeviceID)
+        await _save_device_state_fields(
+            integration_id, device.nDeviceID,
+            {"gap_start": state.gap_start, "gap_end": state.gap_end}
+        )
 
     # Advances even on zero progress (device_failed on the first window):
     # deliberate LRS-fairness trade-off so one permanently-broken device
     # doesn't monopolize the front of the backfill queue. The zero-progress
     # raise is the actual safety net when it's the only gapped device.
     state.last_backfilled = datetime.now(tz=timezone.utc)
-    await state_manager.set_state(integration_id, "pull_observations", state.dict(), device.nDeviceID)
+    await _save_device_state_fields(
+        integration_id, device.nDeviceID, {"last_backfilled": state.last_backfilled}
+    )
     return observations_sent, device_failed, transport_failure, not state.has_gap
 
 
@@ -602,6 +663,14 @@ async def action_backfill_observations(integration, action_config: BackfillObser
     auth = get_auth_config(integration)
     pull_config = get_pull_config(integration)  # max_pdop applies to backfilled data too
 
+    if not pull_config.run_on_schedule:
+        # The operator's pause toggle must also stop the cascade: internal
+        # actions bypass the runner's skippable_pull pause check, and backfill
+        # is only ever machine-triggered — a paused integration skips cleanly
+        # (review finding).
+        logger.info(f"Integration {integration_id} is paused (run_on_schedule=false); skipping backfill.")
+        return {"skipped": True, "reason": "integration_paused"}
+
     got_lease = await state_manager.set_if_absent(
         integration_id,
         "backfill_observations",
@@ -610,7 +679,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
     )
     if not got_lease:
         logger.info(f"Backfill lease already held for integration {integration_id}; skipping run.")
-        return {"skipped": "lease_held"}
+        return {"skipped": True, "reason": "lease_held"}
 
     try:
         try:
@@ -633,14 +702,10 @@ async def action_backfill_observations(integration, action_config: BackfillObser
 
         gapped = []
         for device in device_list:
-            saved = await state_manager.get_state(integration_id, "pull_observations", device.nDeviceID)
-            if not saved:
-                continue
-            try:
-                state = DeviceState.parse_obj(saved)
-            except pydantic.ValidationError:
-                continue  # the head pass will initialize it; nothing to backfill yet
-            if state.has_gap:
+            # Same reader as the head pass — absent or unparseable state means
+            # the head pass (re-)initializes it; nothing to backfill yet.
+            state = await _read_device_state(integration_id, device.nDeviceID, "backfill_observations")
+            if state is not None and state.has_gap:
                 gapped.append((device, state))
         # Least-recently-backfilled first keeps the import fair; devices never
         # backfilled lead the queue.
@@ -716,7 +781,11 @@ async def action_backfill_observations(integration, action_config: BackfillObser
 
         # _backfill_device mutates the states in place, so this reflects
         # post-run gap status; deferred devices keep their gaps open.
-        gaps_remaining = any(state.has_gap for _, state in gapped)
+        # A hot breaker suppresses the self-retrigger: re-entering immediately
+        # would defeat the pause the breaker exists to buy (review finding) —
+        # the next scheduled head pass re-triggers ~cadence later instead.
+        breaker_hot = guards.consecutive_transport_failures >= BREAKER_THRESHOLD
+        gaps_remaining = any(state.has_gap for _, state in gapped) and not breaker_hot
         result = {
             'observations_extracted': observations_extracted,
             'devices_failed': failed_devices,

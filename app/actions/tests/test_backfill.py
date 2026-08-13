@@ -73,9 +73,84 @@ async def test_backfill_skips_whole_run_when_lease_is_held(
     result = await action_backfill_observations(
         lotek_integration, BackfillObservationsConfig()
     )
-    assert result == {"skipped": "lease_held"}
+    assert result == {"skipped": True, "reason": "lease_held"}
     get_positions.assert_not_awaited()
     release.assert_not_awaited()  # a lease we didn't take is not ours to release
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_when_integration_is_paused(
+    mocker, lotek_integration, mock_redis
+):
+    # Review finding: run_on_schedule=False (the operator's pause toggle) must
+    # also stop the cascade — internal actions bypass the runner's pause check,
+    # so the backfill has to honor it itself.
+    from app.actions.configurations import PullObservationsConfig
+    get_positions, _, lease, _, _ = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {"1": _gap_state()}
+    )
+    mocker.patch(
+        "app.actions.handlers.get_pull_config",
+        return_value=PullObservationsConfig(run_on_schedule=False),
+    )
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result == {"skipped": True, "reason": "integration_paused"}
+    lease.assert_not_awaited()
+    get_positions.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_backfill_does_not_retrigger_while_breaker_is_hot(
+    mocker, lotek_integration, mock_redis
+):
+    # Review finding: an immediate self-retrigger after a breaker trip defeats
+    # the pause the breaker exists to buy — the next scheduled head pass is the
+    # one that should re-trigger, ~cadence later.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    states = {d: _gap_state(days_back_start=5) for d in ("1", "2", "3", "4", "5")}
+    get_positions, _, _, _, _ = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1", "2", "3", "4", "5"), states
+    )
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    # device 1 succeeds (its 4-day gap closes in one window); 2, 3, 4 exhaust
+    # retries on timeouts and trip the breaker; 5 is deferred with its gap open
+    fail = [httpx.ReadTimeout("")] * RETRY_ATTEMPTS
+    get_positions.side_effect = [[]] + fail * 3
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result["devices_deferred"] == ["5"]
+    trigger.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_backfill_save_does_not_clobber_concurrently_advanced_high_water(
+    mocker, lotek_integration, mock_redis
+):
+    # Review finding (lost-update race): the backfill must persist only the
+    # fields it owns (gap_*, last_backfilled). A head pass advancing high_water
+    # mid-backfill must survive the backfill's writes.
+    now = datetime.now(timezone.utc)
+    old_hw = (now - timedelta(hours=6)).isoformat()
+    new_hw = (now - timedelta(minutes=1)).isoformat()
+    snapshot = {**_gap_state(days_back_start=5), "high_water": old_hw}
+    advanced = {**_gap_state(days_back_start=5), "high_water": new_hw}
+    get_positions, set_state, _, _, _ = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {}
+    )
+    reads = mocker.patch(
+        "app.services.state.IntegrationStateManager.get_state",
+        # scanner read (old hw), then merge re-reads (head pass advanced hw)
+        new=AsyncMock(side_effect=[snapshot, advanced, advanced]),
+    )
+    await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+    for c in set_state.await_args_list:
+        assert str(c.args[2].get("high_water")) == new_hw, (
+            "the backfill rewound a high_water a concurrent head pass had advanced"
+        )
 
 
 @pytest.mark.asyncio
@@ -108,9 +183,11 @@ async def test_backfill_caps_windows_per_device_and_advances_gap_start(
     first_start = get_positions.await_args_list[0].args[3]
     second_start = get_positions.await_args_list[1].args[3]
     assert second_start - first_start == timedelta(days=7)
-    final_state = set_state.await_args_list[-1].args[2]
-    assert final_state["gap_start"] - first_start == timedelta(days=14)
-    assert final_state["gap_end"] is not None  # 20d gap: still open after 2 windows
+    # [-1] is the last_backfilled merge-save; [-2] is the last window's gap save
+    window_save = set_state.await_args_list[-2].args[2]
+    assert window_save["gap_start"] - first_start == timedelta(days=14)
+    assert window_save["gap_end"] is not None  # 20d gap: still open after 2 windows
+    assert set_state.await_args_list[-1].args[2]["last_backfilled"] is not None
 
 
 @pytest.mark.asyncio
@@ -124,9 +201,10 @@ async def test_backfill_closes_gap_to_null_when_fully_covered(
         lotek_integration, BackfillObservationsConfig()
     )
     assert get_positions.await_count == 1  # 4-day gap fits one 7-day window
-    final_state = set_state.await_args_list[-1].args[2]
-    assert final_state["gap_start"] is None and final_state["gap_end"] is None
-    assert final_state["last_backfilled"] is not None
+    # [-1] is the last_backfilled merge-save; [-2] is the gap-close save
+    window_save = set_state.await_args_list[-2].args[2]
+    assert window_save["gap_start"] is None and window_save["gap_end"] is None
+    assert set_state.await_args_list[-1].args[2]["last_backfilled"] is not None
     assert result["gaps_closed"] == 1
 
 

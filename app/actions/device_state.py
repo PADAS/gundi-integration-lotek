@@ -20,6 +20,11 @@ class DeviceState(pydantic.BaseModel):
     first run, it only ever shrinks and is never extended. last_backfilled
     orders backfill fairness (least-recently-backfilled first).
     """
+    # Schema version: bump on any breaking field change and add a migration in
+    # _migrate_legacy_cursor — an unparseable blob costs a full-lookback
+    # re-import (review finding), so schema changes must never rely on the
+    # parse-failure fallback.
+    version: int = 1
     high_water: datetime
     gap_start: Optional[datetime] = None
     gap_end: Optional[datetime] = None

@@ -857,9 +857,10 @@ async def test_no_gap_opened_when_lookback_fits_inside_max_age(mocker):
     config = PullObservationsConfig.construct(
         default_lookback_days=1, max_data_age_hours=48, max_pdop=None
     )
-    state = await _load_device_state(
+    state, is_new = await _load_device_state(
         "some-integration-id", "1", datetime.now(timezone.utc), config
     )
+    assert is_new
     assert not state.has_gap
     assert state.gap_start is None and state.gap_end is None
 
@@ -869,14 +870,18 @@ async def test_steady_state_advances_high_water_and_keeps_gap_closed(
     mocker, lotek_integration, pull_config, mock_redis
 ):
     # A device whose cursor is fresh (within max_age) head-fetches from its
-    # cursor and neither opens a gap nor drops anything.
+    # cursor (minus the late-upload overlap) and neither opens a gap nor
+    # drops anything.
     recent = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     get_positions, _, set_state, log = _setup_pull_mocks(
         mocker, mock_redis, _devices("1"), saved_state={"high_water": recent}
     )
     result = await action_pull_observations(lotek_integration, pull_config)
     start = get_positions.call_args.args[3]
-    assert abs((datetime.now(timezone.utc) - start) - timedelta(hours=2)) < timedelta(minutes=1)
+    from app.actions.handlers import HEAD_LATE_UPLOAD_OVERLAP
+    assert abs(
+        (datetime.now(timezone.utc) - start) - (timedelta(hours=2) + HEAD_LATE_UPLOAD_OVERLAP)
+    ) < timedelta(minutes=1)
     saved = set_state.call_args.args[2]
     assert saved.get("gap_start") is None
     assert abs(datetime.now(timezone.utc) - saved["high_water"]) < timedelta(minutes=1), (
@@ -924,7 +929,10 @@ async def test_legacy_updated_at_state_migrates_to_high_water(
     )
     await action_pull_observations(lotek_integration, pull_config)
     start = get_positions.call_args.args[3]
-    assert abs((datetime.now(timezone.utc) - start) - timedelta(hours=3)) < timedelta(minutes=1)
+    from app.actions.handlers import HEAD_LATE_UPLOAD_OVERLAP
+    assert abs(
+        (datetime.now(timezone.utc) - start) - (timedelta(hours=3) + HEAD_LATE_UPLOAD_OVERLAP)
+    ) < timedelta(minutes=1)
     saved = set_state.call_args.args[2]
     assert "high_water" in saved and saved.get("gap_start") is None
 
@@ -1152,3 +1160,80 @@ def test_backfill_action_is_discovered_but_internal():
     assert "backfill_observations" in handlers
     _, config_model, _ = handlers["backfill_observations"]
     assert issubclass(config_model, InternalActionConfiguration)
+
+
+# --- Fable-5 review fix round -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stale_drop_publish_failure_does_not_stall_the_device(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: the stale-drop WARNING publish was the only activity
+    # publish on the fetch path without a guard — a degraded pubsub must not
+    # keep a stale device from ever advancing its cursor.
+    stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    get_positions, _, set_state, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1"), saved_state={"high_water": stale}
+    )
+
+    async def flaky_publish(**kwargs):
+        if "Dropping stale range" in kwargs.get("title", ""):
+            raise Exception("pubsub down")
+
+    log.side_effect = flaky_publish
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_failed"] == []
+    saved = set_state.call_args.args[2]
+    assert abs(datetime.now(timezone.utc) - saved["high_water"]) < timedelta(minutes=1)
+
+
+@pytest.mark.asyncio
+async def test_unparseable_state_reset_is_surfaced_at_warning(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: discarding a cursor and re-importing the whole lookback
+    # was announced only at DEBUG. It must be visible in the activity log.
+    get_positions, _, _, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1"), saved_state={"high_water": "not-a-date"}
+    )
+    await action_pull_observations(lotek_integration, pull_config)
+    reset_warnings = [
+        c for c in log.await_args_list
+        if c.kwargs["level"] == LogLevel.WARNING and "unparseable" in c.kwargs["title"].lower()
+    ]
+    assert len(reset_warnings) == 1
+    assert "device 1" in reset_warnings[0].kwargs["title"]
+
+
+@pytest.mark.asyncio
+async def test_head_pass_save_does_not_clobber_concurrently_closed_gap(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding (lost-update race): the head pass must persist only the
+    # fields it owns (high_water). If a concurrent backfill closed the gap
+    # between our load and our save, the closed gap must survive our write.
+    now = datetime.now(timezone.utc)
+    open_gap_state = {
+        "high_water": (now - timedelta(hours=2)).isoformat(),
+        "gap_start": (now - timedelta(days=7)).isoformat(),
+        "gap_end": (now - timedelta(hours=12)).isoformat(),
+    }
+    gap_closed_state = {
+        "high_water": (now - timedelta(hours=2)).isoformat(),
+        "gap_start": None,
+        "gap_end": None,
+        "last_backfilled": now.isoformat(),
+    }
+    get_positions, get_state, set_state, _ = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1")
+    )
+    # 1st read = the head pass loading its snapshot (gap open);
+    # 2nd read = the merge-save re-read (backfill closed the gap meanwhile).
+    get_state.side_effect = [open_gap_state, gap_closed_state]
+    await action_pull_observations(lotek_integration, pull_config)
+    saved = set_state.call_args.args[2]
+    assert saved.get("gap_start") is None and saved.get("gap_end") is None, (
+        "the head pass resurrected a gap a concurrent backfill had closed"
+    )
+    assert abs(datetime.now(timezone.utc) - saved["high_water"]) < timedelta(minutes=1)
