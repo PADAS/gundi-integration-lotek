@@ -228,16 +228,18 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             level=LogLevel.WARNING
         )
 
-    if device_list and len(failed_devices) == len(device_list) and observations_extracted == 0:
-        # Every device failed and nothing was delivered: report the run as failed rather
-        # than returning normally, otherwise a wholly broken integration keeps publishing
-        # action_complete and looks healthy in the portal. A device that delivered part
-        # of its window before failing still counts as progress, so it stays a warning.
-        # This comes after the summary so the worst case keeps its device-naming log.
+    if device_list and serviced_devices == 0 and observations_extracted == 0:
+        # Zero progress: nothing serviced and nothing delivered — whether every
+        # device failed or the rails deferred them all, this is systemic
+        # degradation and must alert rather than publish action_complete. A
+        # device that delivered part of its window before failing still counts
+        # as progress, so partial runs stay warnings. This comes after the
+        # summary so the worst case keeps its device-naming log.
         raise LotekException(
             message=(
-                f"All {len(device_list)} device(s) failed for integration {integration.id}. "
-                f"See the per-device errors in this action's activity log."
+                f"No devices could be serviced for integration {integration.id}: "
+                f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
+                f"{len(device_list)}. See the per-device errors in this action's activity log."
             )
         )
 

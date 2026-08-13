@@ -966,3 +966,17 @@ async def test_delivery_failure_stays_error_and_does_not_advance_high_water(
     # only device 2's checkpoint was written
     saved_devices = [c.args[3] for c in set_state.await_args_list]
     assert saved_devices == ["2"]
+
+
+@pytest.mark.asyncio
+async def test_all_failed_run_raises_zero_progress(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # A run that services nothing and delivers nothing is systemic degradation —
+    # it must alert (raise/ERROR), not publish action_complete.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    get_positions, _, _, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
+    get_positions.side_effect = httpx.ReadTimeout("")
+    with pytest.raises(LotekException, match="No devices could be serviced"):
+        await action_pull_observations(lotek_integration, pull_config)
