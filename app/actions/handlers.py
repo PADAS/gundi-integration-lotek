@@ -492,3 +492,217 @@ async def _head_pass_device(device, integration, auth, action_config, present_ti
 
     guards.record(transport_failure=False)
     return observations_sent, False, state
+
+
+async def _backfill_device(device, state, integration, auth, pull_config, guards):
+    """Close up to BACKFILL_MAX_WINDOWS_PER_DEVICE oldest windows of one
+    device's gap.
+
+    Returns (observations_sent, device_failed, gap_closed). gap_start advances
+    only past windows that were actually delivered, so a failure re-fetches the
+    same window next trigger (re-sends are tolerated, silent skips are not).
+    """
+    integration_id = str(integration.id)
+    observations_sent = 0
+    device_failed = False
+    for _ in range(BACKFILL_MAX_WINDOWS_PER_DEVICE):
+        if not state.has_gap:
+            break
+        window_start = state.gap_start
+        upper_date = min(state.gap_end, state.gap_start + BACKFILL_WINDOW)
+        try:
+            async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=_retry_attempts(guards.run_started_at), wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
+                with attempt:
+                    positions = await client.get_positions(device.nDeviceID, auth, integration, window_start, upper_date, True)
+            cdip_positions = filter_and_transform_positions(positions, integration, pull_config)
+        except LotekUnauthorizedException:
+            raise
+        except httpx.TransportError as e:
+            message = (
+                f"Error fetching backfill positions from Lotek. Device: {device.nDeviceID}. "
+                f"Dates: [{window_start},{upper_date}]. Integration ID: {integration_id} "
+                f"Exception: {describe_exception(e)}"
+            )
+            logger.warning(message, exc_info=True)
+            await log_action_activity(
+                integration_id=integration_id,
+                action_id="backfill_observations",
+                title=message,
+                level=LogLevel.WARNING
+            )
+            guards.record(transport_failure=True)
+            device_failed = True
+            break
+        except Exception as e:
+            message = (
+                f"Error fetching backfill positions from Lotek. Device: {device.nDeviceID}. "
+                f"Dates: [{window_start},{upper_date}]. Integration ID: {integration_id} "
+                f"Exception: {describe_exception(e)}"
+            )
+            logger.warning(message, exc_info=True)
+            await log_action_activity(
+                integration_id=integration_id,
+                action_id="backfill_observations",
+                title=message,
+                level=LogLevel.WARNING
+            )
+            guards.record(transport_failure=False)
+            device_failed = True
+            break
+
+        try:
+            for i, batch in enumerate(generate_batches(cdip_positions)):
+                logger.info(f'Sending backfill batch #{i}: {len(batch)} observations. Device: {device.nDeviceID}')
+                await gundi_tools.send_observations_to_gundi(observations=batch, integration_id=integration.id)
+                observations_sent += len(batch)
+        except Exception as e:
+            message = (
+                f"Error delivering backfill observations for device {device.nDeviceID}. "
+                f"Integration ID: {integration_id} Exception: {describe_exception(e)}"
+            )
+            # needs_attention drives log-based alerting on delivery failures
+            # (template convention), same as the head pass.
+            logger.exception(message, extra={
+                'needs_attention': True,
+                'integration_id': integration_id,
+                'action_id': "backfill_observations"
+            })
+            await log_action_activity(
+                integration_id=integration_id,
+                action_id="backfill_observations",
+                title=message,
+                level=LogLevel.ERROR
+            )
+            guards.record(transport_failure=False)
+            device_failed = True
+            break
+
+        # Advance the gap only past the delivered window; close it when done.
+        state.gap_start = upper_date
+        if not state.has_gap:
+            state.gap_start = None
+            state.gap_end = None
+        await state_manager.set_state(integration_id, "pull_observations", state.dict(), device.nDeviceID)
+
+    if not device_failed:
+        guards.record(transport_failure=False)
+    state.last_backfilled = datetime.now(tz=timezone.utc)
+    await state_manager.set_state(integration_id, "pull_observations", state.dict(), device.nDeviceID)
+    return observations_sent, device_failed, not state.has_gap
+
+
+@action_title("Backfill Observations")
+@activity_logger()
+async def action_backfill_observations(integration, action_config: BackfillObservationsConfig):
+    """Internal action: closes per-device historical gaps opened by the head
+    pass, oldest-first, least-recently-backfilled device first. Triggered by
+    pull_observations; the Redis lease keeps overlapping triggers from
+    double-running when a backfill grinds past the next head-pass trigger."""
+    logger.info(f"Executing backfill_observations action with integration {integration}...")
+    integration_id = str(integration.id)
+    run_started = datetime.now(tz=timezone.utc)
+    auth = get_auth_config(integration)
+    pull_config = get_pull_config(integration)  # max_pdop applies to backfilled data too
+
+    got_lease = await state_manager.set_if_absent(
+        integration_id,
+        "backfill_observations",
+        ttl_seconds=app_settings.MAX_ACTION_EXECUTION_TIME,
+        source_id=BACKFILL_LEASE_SOURCE,
+    )
+    if not got_lease:
+        logger.info(f"Backfill lease already held for integration {integration_id}; skipping run.")
+        return {"skipped": "lease_held"}
+
+    try:
+        try:
+            async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
+                with attempt:
+                    device_list = await client.get_devices(integration, auth)
+        except Exception as e:
+            message = (
+                f"Error fetching devices from Lotek for backfill. Integration ID: "
+                f"{integration_id} Exception: {describe_exception(e)}"
+            )
+            logger.exception(message)
+            await log_action_activity(
+                integration_id=integration_id,
+                action_id="backfill_observations",
+                title=message,
+                level=LogLevel.ERROR
+            )
+            raise e
+
+        gapped = []
+        for device in device_list:
+            saved = await state_manager.get_state(integration_id, "pull_observations", device.nDeviceID)
+            if not saved:
+                continue
+            try:
+                state = DeviceState.parse_obj(saved)
+            except pydantic.ValidationError:
+                continue  # the head pass will initialize it; nothing to backfill yet
+            if state.has_gap:
+                gapped.append((device, state))
+        # Least-recently-backfilled first keeps the import fair; devices never
+        # backfilled lead the queue.
+        epoch = datetime.min.replace(tzinfo=timezone.utc)
+        gapped.sort(key=lambda pair: pair[1].last_backfilled or epoch)
+
+        guards = RunGuards(run_started)
+        observations_extracted = 0
+        failed_devices = []
+        deferred_devices = []
+        serviced_devices = 0
+        gaps_closed = 0
+        for i, (device, state) in enumerate(gapped):
+            if reason := guards.should_stop():
+                deferred_devices = [d.nDeviceID for d, _ in gapped[i:]]
+                await _log_deferral(integration, "backfill_observations", reason, deferred_devices)
+                break
+            try:
+                sent, device_failed, gap_closed = await _backfill_device(
+                    device, state, integration, auth, pull_config, guards
+                )
+            except LotekUnauthorizedException:
+                raise
+            except Exception as e:
+                message = (
+                    f"Failed to backfill device {device.nDeviceID} for integration "
+                    f"{integration_id}: {describe_exception(e)}"
+                )
+                logger.exception(message)
+                await log_action_activity(
+                    integration_id=integration_id,
+                    action_id="backfill_observations",
+                    title=message,
+                    level=LogLevel.ERROR
+                )
+                failed_devices.append(device.nDeviceID)
+                guards.record(transport_failure=False)
+                continue
+            observations_extracted += sent
+            gaps_closed += int(gap_closed)
+            if device_failed:
+                failed_devices.append(device.nDeviceID)
+            else:
+                serviced_devices += 1
+
+        if gapped and serviced_devices == 0 and observations_extracted == 0:
+            # Same systemic-degradation contract as the head pass.
+            raise LotekException(
+                message=(
+                    f"No devices could be backfilled for integration {integration_id}: "
+                    f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
+                    f"{len(gapped)}. See the per-device errors in this action's activity log."
+                )
+            )
+
+        return {
+            'observations_extracted': observations_extracted,
+            'devices_failed': failed_devices,
+            'devices_deferred': deferred_devices,
+            'gaps_closed': gaps_closed,
+        }
+    finally:
+        await state_manager.delete_state(integration_id, "backfill_observations", BACKFILL_LEASE_SOURCE)
