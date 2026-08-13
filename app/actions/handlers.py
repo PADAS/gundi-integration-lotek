@@ -314,7 +314,13 @@ async def _pull_device_observations(device, integration, auth, action_config, pr
             f"Error delivering observations for device {device.nDeviceID}. Integration ID: "
             f"{integration.id} Exception: {describe_exception(e)}"
         )
-        logger.exception(message)
+        # needs_attention drives log-based alerting on delivery failures (template
+        # convention) — kept from the pre-isolation send-loop handler.
+        logger.exception(message, extra={
+            'needs_attention': True,
+            'integration_id': str(integration.id),
+            'action_id': "pull_observations"
+        })
         await log_action_activity(
             integration_id=str(integration.id),
             action_id="pull_observations",
