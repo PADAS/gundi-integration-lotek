@@ -214,7 +214,11 @@ async def test_backfill_retriggers_itself_when_gaps_remain(
         new=AsyncMock(side_effect=lambda *a, **k: calls.append("trigger")),
     )
     await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
-    trigger.assert_awaited_once_with(str(lotek_integration.id), "backfill_observations")
+    trigger.assert_awaited_once()
+    args, kwargs = trigger.await_args
+    assert args[:2] == (str(lotek_integration.id), "backfill_observations")
+    config = kwargs.get("config") or args[2]
+    assert config.dict() != {}, "an empty override 404s in execute_action before the handler runs"
     assert calls == ["release", "trigger"], "re-trigger must come after the lease release"
 
 

@@ -1078,7 +1078,13 @@ async def test_head_pass_triggers_backfill_when_gap_open_and_lease_free(
     _setup_pull_mocks(mocker, mock_redis, _devices("1"))
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
     await action_pull_observations(lotek_integration, pull_config)
-    trigger.assert_awaited_once_with(str(lotek_integration.id), "backfill_observations")
+    trigger.assert_awaited_once()
+    args, kwargs = trigger.await_args
+    assert args[:2] == (str(lotek_integration.id), "backfill_observations")
+    # A fieldless config would serialize to an empty dict — indistinguishable
+    # from "no override" and 404s in execute_action before the handler runs.
+    config = kwargs.get("config") or args[2]
+    assert config.dict() != {}
 
 
 @pytest.mark.asyncio

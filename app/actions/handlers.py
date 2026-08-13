@@ -306,7 +306,15 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 str(integration.id), "backfill_observations", BACKFILL_LEASE_SOURCE
             )
             if not lease:
-                await trigger_action(str(integration.id), "backfill_observations")
+                # backfill_observations is an InternalActionConfiguration with no
+                # persisted portal config, so this MUST carry a non-empty config
+                # override — a bare trigger_action(..., "backfill_observations")
+                # publishes an empty config_overrides, which execute_action reads
+                # as "no config at all" and 404s before the handler ever runs.
+                await trigger_action(
+                    str(integration.id), "backfill_observations",
+                    config=BackfillObservationsConfig(triggered_by="pull_observations")
+                )
         except Exception as e:
             # The head pass succeeded; a failed trigger must not fail the run.
             logger.warning(
@@ -717,7 +725,10 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         # continuously instead of waiting for the next head-pass tick. Runs
         # AFTER the lease release so the next run doesn't skip on our own lease.
         try:
-            await trigger_action(integration_id, "backfill_observations")
+            await trigger_action(
+                integration_id, "backfill_observations",
+                config=BackfillObservationsConfig(triggered_by="backfill_observations")
+            )
         except Exception as e:
             # The next head pass will re-trigger; losing one cascade step is fine.
             logger.warning(

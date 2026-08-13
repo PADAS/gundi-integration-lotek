@@ -24,8 +24,17 @@ def test_ui_order_lists_every_property_including_hidden_run_on_schedule():
     assert set(ui["ui:order"]) == set(PullObservationsConfig.schema()["properties"].keys())
 
 
-def test_backfill_config_is_internal_and_fieldless():
+def test_backfill_config_is_internal():
     # InternalActionConfiguration subclasses are skipped at registration —
     # backfill must never appear in the portal.
     assert issubclass(BackfillObservationsConfig, InternalActionConfiguration)
-    assert BackfillObservationsConfig.schema().get("properties", {}) == {}
+
+
+def test_backfill_config_has_a_default_so_trigger_overrides_are_never_empty():
+    # trigger_action() publishes config.dict() as the command's config_overrides.
+    # BackfillObservationsConfig has no persisted portal config (it's internal),
+    # so an empty dict here is indistinguishable from "no override at all" and
+    # trips execute_action's "configuration is missing" 404 before the handler
+    # ever runs (GUNDI-5602 review finding). A real default field keeps the
+    # override non-empty.
+    assert BackfillObservationsConfig().dict() != {}

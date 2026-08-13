@@ -73,5 +73,19 @@ class PullObservationsConfig(PullActionConfiguration, ExecutableActionMixin):
 
 
 class BackfillObservationsConfig(InternalActionConfiguration):
-    """Internal-only: triggered by pull_observations, never configured in the portal."""
-    pass
+    """Internal-only: triggered by pull_observations, never configured in the portal.
+
+    Needs at least one real field: an InternalActionConfiguration is never
+    portal-registered, so the action-runner has no persisted config to resolve
+    for it (config_manager.get_action_configuration returns None). A fieldless
+    model's .dict() is {}, which trigger_action publishes as an empty
+    config_overrides — indistinguishable from "no override at all", which
+    trips execute_action's "configuration is missing" 404 before the handler
+    ever runs. triggered_by gives the override a non-empty payload and doubles
+    as a diagnostic marker of what triggered this run.
+    """
+    triggered_by: str = pydantic.Field(
+        "pull_observations",
+        title="Triggered By",
+        description="Which action triggered this backfill run.",
+    )
