@@ -1068,3 +1068,60 @@ async def test_breaker_counter_resets_on_success(
     result = await action_pull_observations(lotek_integration, pull_config)
     assert result["devices_deferred"] == []
     assert result["devices_failed"] == ["1", "3", "5"]
+
+
+@pytest.mark.asyncio
+async def test_head_pass_triggers_backfill_when_gap_open_and_lease_free(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # First run on default config opens a gap → backfill must be triggered.
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    await action_pull_observations(lotek_integration, pull_config)
+    trigger.assert_awaited_once_with(str(lotek_integration.id), "backfill_observations")
+
+
+@pytest.mark.asyncio
+async def test_head_pass_does_not_trigger_backfill_when_lease_held(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    # per-device state reads return {}, but the lease key reads as held
+    mocker.patch(
+        "app.services.state.IntegrationStateManager.get_state",
+        new=AsyncMock(side_effect=lambda i, a, s="no-source": "1" if s == "lease" else {}),
+    )
+    await action_pull_observations(lotek_integration, pull_config)
+    trigger.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_head_pass_does_not_trigger_backfill_without_gaps(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"), saved_state={"high_water": recent})
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    await action_pull_observations(lotek_integration, pull_config)
+    trigger.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_trigger_failure_does_not_fail_the_head_pass(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    mocker.patch(
+        "app.actions.handlers.trigger_action", new=AsyncMock(side_effect=Exception("pubsub down"))
+    )
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_failed"] == []
+
+
+def test_backfill_action_is_discovered_but_internal():
+    from app.actions.core import discover_actions, InternalActionConfiguration
+    handlers = discover_actions(module_name="app.actions.handlers", prefix="action_")
+    assert "backfill_observations" in handlers
+    _, config_model, _ = handlers["backfill_observations"]
+    assert issubclass(config_model, InternalActionConfiguration)
