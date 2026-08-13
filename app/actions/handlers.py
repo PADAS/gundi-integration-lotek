@@ -689,7 +689,9 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 serviced_devices += 1
 
         if gapped and serviced_devices == 0 and observations_extracted == 0:
-            # Same systemic-degradation contract as the head pass.
+            # Same systemic-degradation contract as the head pass. The raise
+            # also breaks the self-retrigger cascade below — a wholly-failing
+            # backfill must not re-trigger itself forever.
             raise LotekException(
                 message=(
                     f"No devices could be backfilled for integration {integration_id}: "
@@ -698,7 +700,10 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 )
             )
 
-        return {
+        # _backfill_device mutates the states in place, so this reflects
+        # post-run gap status; deferred devices keep their gaps open.
+        gaps_remaining = any(state.has_gap for _, state in gapped)
+        result = {
             'observations_extracted': observations_extracted,
             'devices_failed': failed_devices,
             'devices_deferred': deferred_devices,
@@ -706,3 +711,16 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         }
     finally:
         await state_manager.delete_state(integration_id, "backfill_observations", BACKFILL_LEASE_SOURCE)
+
+    if gaps_remaining:
+        # Self-retrigger (movebank-connector pattern): keep draining the import
+        # continuously instead of waiting for the next head-pass tick. Runs
+        # AFTER the lease release so the next run doesn't skip on our own lease.
+        try:
+            await trigger_action(integration_id, "backfill_observations")
+        except Exception as e:
+            # The next head pass will re-trigger; losing one cascade step is fine.
+            logger.warning(
+                f"Could not re-trigger backfill for integration {integration_id}: {describe_exception(e)}"
+            )
+    return result

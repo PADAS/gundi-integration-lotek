@@ -197,6 +197,61 @@ async def test_backfill_skips_devices_without_gaps(
 
 
 @pytest.mark.asyncio
+async def test_backfill_retriggers_itself_when_gaps_remain(
+    mocker, lotek_integration, mock_redis
+):
+    # Movebank-pattern cascade: a run that leaves gaps open (window cap or
+    # deferral) re-triggers itself so the import drains continuously instead of
+    # waiting for the next head-pass tick. The re-trigger must fire AFTER the
+    # lease release, or the next run would see its own lease and skip.
+    calls = []
+    get_positions, _, _, release, _ = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {"1": _gap_state(days_back_start=21)}
+    )
+    release.side_effect = lambda *a, **k: calls.append("release")
+    trigger = mocker.patch(
+        "app.actions.handlers.trigger_action",
+        new=AsyncMock(side_effect=lambda *a, **k: calls.append("trigger")),
+    )
+    await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+    trigger.assert_awaited_once_with(str(lotek_integration.id), "backfill_observations")
+    assert calls == ["release", "trigger"], "re-trigger must come after the lease release"
+
+
+@pytest.mark.asyncio
+async def test_backfill_does_not_retrigger_when_all_gaps_closed(
+    mocker, lotek_integration, mock_redis
+):
+    _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {"1": _gap_state(days_back_start=5)}
+    )
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result["gaps_closed"] == 1
+    trigger.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_backfill_does_not_retrigger_on_zero_progress(
+    mocker, lotek_integration, mock_redis
+):
+    # Zero progress raises — the raise is the cascade's natural chain-breaker,
+    # otherwise a wholly-failing backfill would re-trigger itself forever.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    get_positions, _, _, _, _ = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {"1": _gap_state()}
+    )
+    get_positions.side_effect = httpx.ReadTimeout("")
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    with pytest.raises(LotekException):
+        await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+    trigger.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_backfill_zero_progress_raises(
     mocker, lotek_integration, mock_redis
 ):
