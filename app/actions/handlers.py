@@ -231,6 +231,10 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     failed_devices = []
     deferred_devices = []
     serviced_devices = 0
+    # Only reflects devices actually processed this run — a device deferred by
+    # the deadline/breaker before its gap status is checked doesn't trigger
+    # backfill this cycle. Self-correcting: the next run's head pass reaches it
+    # and triggers then, same as the worst-case import delay the design accepts.
     any_open_gap = False
     for i, device in enumerate(device_list):
         if reason := guards.should_stop():
@@ -598,6 +602,10 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
 
     if not device_failed:
         guards.record(transport_failure=False)
+    # Advances even on zero progress (device_failed on the first window):
+    # deliberate LRS-fairness trade-off so one permanently-broken device
+    # doesn't monopolize the front of the backfill queue. The zero-progress
+    # raise is the actual safety net when it's the only gapped device.
     state.last_backfilled = datetime.now(tz=timezone.utc)
     await state_manager.set_state(integration_id, "pull_observations", state.dict(), device.nDeviceID)
     return observations_sent, device_failed, not state.has_gap
