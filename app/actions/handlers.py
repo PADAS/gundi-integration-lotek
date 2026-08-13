@@ -58,9 +58,14 @@ def _deadline_exceeded(run_started_at):
     return elapsed > DEADLINE_FRACTION * app_settings.MAX_ACTION_EXECUTION_TIME
 
 
-def _retry_attempts(run_started_at):
-    # Past the soft deadline, don't spend the remaining budget on retries.
-    return 1 if _deadline_exceeded(run_started_at) else RETRY_ATTEMPTS
+def _fetch_retry_kwargs(run_started_at):
+    # Past the soft deadline, don't spend the remaining budget re-trying slow
+    # transport failures — but keep the token-expiry retry: it is a cheap
+    # re-auth, and dropping it breaks the "token expiry is retried and
+    # recovers within the run" contract (review finding).
+    if _deadline_exceeded(run_started_at):
+        return {"on": LotekTokenExpiredException, "attempts": RETRY_ATTEMPTS}
+    return {"on": RETRYABLE_ERRORS, "attempts": RETRY_ATTEMPTS}
 
 
 class RunGuards:
@@ -105,6 +110,24 @@ async def _log_deferral(integration, action_id, reason, deferred_ids):
         title=message,
         level=LogLevel.WARNING
     )
+
+
+async def _try_log_activity(integration_id, action_id, title, level):
+    """Best-effort activity-feed publish for per-device paths. A pubsub blip
+    must never escape a per-device handler: an escaping publish discards
+    already-delivered counts and resets the circuit-breaker streak with a
+    failure that says nothing about Lotek (review finding)."""
+    try:
+        await log_action_activity(
+            integration_id=integration_id,
+            action_id=action_id,
+            title=title,
+            level=level
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not publish activity log for integration {integration_id}: {describe_exception(e)}"
+        )
 
 
 def describe_exception(exc):
@@ -241,6 +264,22 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
     logger.info(f"Extracted {len(device_list)} devices from Lotek for inbound: {integration.id}")
     present_time = datetime.now(tz=timezone.utc)
+    # Least-fresh first (mirrors the backfill's LRS ordering): the deadline and
+    # breaker always cut the tail of this list, and Lotek returns devices in a
+    # stable order — without re-ordering, sustained slowness starved the same
+    # tail devices every run until bounded staleness dropped their data
+    # permanently (review finding). Sorting by high_water puts the devices
+    # most behind first, so deferral rotates naturally as serviced devices
+    # move to the back.
+    integration_id = str(integration.id)
+    device_states = []
+    for device in device_list:
+        state, is_new = await _load_device_state(
+            integration_id, device.nDeviceID, present_time, action_config
+        )
+        device_states.append((device, state, is_new))
+    device_states.sort(key=lambda entry: entry[1].high_water)
+
     guards = RunGuards(run_started)
     observations_extracted = 0
     failed_devices = []
@@ -251,14 +290,14 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     # backfill this cycle. Self-correcting: the next run's head pass reaches it
     # and triggers then, same as the worst-case import delay the design accepts.
     any_open_gap = False
-    for i, device in enumerate(device_list):
+    for i, (device, state, is_new) in enumerate(device_states):
         if reason := guards.should_stop():
-            deferred_devices = [d.nDeviceID for d in device_list[i:]]
+            deferred_devices = [d.nDeviceID for d, _, _ in device_states[i:]]
             await _log_deferral(integration, "pull_observations", reason, deferred_devices)
             break
         try:
-            sent, device_failed, transport_failure, state = await _head_pass_device(
-                device, integration, auth, action_config, present_time, guards
+            sent, device_failed, transport_failure = await _head_pass_device(
+                device, state, is_new, integration, auth, action_config, present_time, guards
             )
         except LotekUnauthorizedException:
             raise
@@ -364,15 +403,7 @@ async def _read_device_state(integration_id, device_id, action_id="pull_observat
             f"{integration_id} Error: {describe_exception(e)}"
         )
         logger.warning(message)
-        try:
-            await log_action_activity(
-                integration_id=integration_id,
-                action_id=action_id,
-                title=message,
-                level=LogLevel.WARNING
-            )
-        except Exception:
-            logger.warning(f"Could not publish state-reset warning for device {device_id}")
+        await _try_log_activity(integration_id, action_id, message, LogLevel.WARNING)
         return None
 
 
@@ -380,12 +411,22 @@ async def _load_device_state(integration_id, device_id, present_time, action_con
     """Returns (state, is_new). is_new means no usable saved state existed and
     the returned state is the first-run initialization (gap birth)."""
     state = await _read_device_state(integration_id, device_id)
+    head_start = present_time - timedelta(hours=action_config.max_data_age_hours)
     if state is not None:
+        if state.migrated_from_legacy and state.high_water < head_start and not state.has_gap:
+            # Upgrade path: a pre-5602 cursor lagging beyond the freshness
+            # floor still owes [cursor, floor] — the old walk would have
+            # caught it up in chunks. Carry it over as the device's gap
+            # (backfill drains it) instead of letting bounded staleness drop
+            # it; is_new=True so the head pass persists the full document.
+            state.gap_start = state.high_water
+            state.gap_end = head_start
+            state.high_water = head_start
+            return state, True
         return state, False
     # First run: the head pass starts at the freshness floor; everything older,
     # back to the configured lookback, becomes the device's one and only gap —
     # the deliberate historical import. It only ever shrinks from here.
-    head_start = present_time - timedelta(hours=action_config.max_data_age_hours)
     gap_start = present_time - timedelta(days=action_config.default_lookback_days)
     if gap_start < head_start:
         return DeviceState(high_water=head_start, gap_start=gap_start, gap_end=head_start), True
@@ -417,7 +458,7 @@ async def _fetch_window(device, integration, auth, config, lower_date, upper_dat
     """
     integration_id = str(integration.id)
     try:
-        async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=_retry_attempts(guards.run_started_at), wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
+        async for attempt in stamina.retry_context(**_fetch_retry_kwargs(guards.run_started_at), wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
             with attempt:
                 positions = await client.get_positions(device.nDeviceID, auth, integration, lower_date, upper_date, True)
         logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device.nDeviceID} between {lower_date} and {upper_date}.")
@@ -433,13 +474,25 @@ async def _fetch_window(device, integration, auth, config, lower_date, upper_dat
         # row mean Lotek-wide degradation, not a bad device.
         message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         logger.warning(message, exc_info=True)
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id=action_id,
-            title=message,
-            level=LogLevel.WARNING
-        )
+        await _try_log_activity(integration_id, action_id, message, LogLevel.WARNING)
         return None, True
+    except LotekException as e:
+        message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
+        if e.status_code >= 500 or e.status_code == 429:
+            # A Lotek-side 5xx/429 is outage/throttling, the same class of
+            # Lotek-wide degradation as a timeout: WARNING + breaker-feeding.
+            # Before this branch it fell into the generic handler below, which
+            # actively RESET the breaker streak — an HTTP-error outage could
+            # never trip the breaker (review finding).
+            logger.warning(message, exc_info=True)
+            await _try_log_activity(integration_id, action_id, message, LogLevel.WARNING)
+            return None, True
+        # Other 4xx (incl. a token-expiry 401 that survived its retry): a
+        # per-device/API-contract problem that won't self-heal — ERROR, and
+        # not breaker-feeding.
+        logger.exception(message)
+        await _try_log_activity(integration_id, action_id, message, LogLevel.ERROR)
+        return None, False
     except Exception as e:
         # Deliberately broad: malformed data from Lotek surfaces as KeyError or
         # pydantic.ValidationError out of the client's parsing, and those must
@@ -451,12 +504,7 @@ async def _fetch_window(device, integration, auth, config, lower_date, upper_dat
         # forever (review finding).
         message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         logger.exception(message)
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id=action_id,
-            title=message,
-            level=LogLevel.ERROR
-        )
+        await _try_log_activity(integration_id, action_id, message, LogLevel.ERROR)
         return None, False
 
 
@@ -491,20 +539,18 @@ async def _deliver(cdip_positions, device, integration, action_id):
             'integration_id': integration_id,
             'action_id': action_id
         })
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id=action_id,
-            title=message,
-            level=LogLevel.ERROR
-        )
+        # Guarded: an escaping publish here would discard observations_sent —
+        # batches that DID land — and could flip a partially-delivered run
+        # into the zero-progress ERROR raise (review finding).
+        await _try_log_activity(integration_id, action_id, message, LogLevel.ERROR)
         return observations_sent, True
     return observations_sent, False
 
 
-async def _head_pass_device(device, integration, auth, action_config, present_time, guards):
+async def _head_pass_device(device, state, is_new, integration, auth, action_config, present_time, guards):
     """Fetch, deliver and checkpoint one device's freshest window.
 
-    Returns (observations_sent, device_failed, transport_failure, state).
+    Returns (observations_sent, device_failed, transport_failure).
     Raises only for integration-wide problems; per-device problems are
     reported through the returned flags so the caller can keep going (and
     record transport_failure for the circuit breaker in one place).
@@ -514,57 +560,34 @@ async def _head_pass_device(device, integration, auth, action_config, present_ti
     """
     integration_id = str(integration.id)
     freshness_floor = present_time - timedelta(hours=action_config.max_data_age_hours)
-    state, is_new = await _load_device_state(integration_id, device.nDeviceID, present_time, action_config)
-
-    if state.high_water < freshness_floor:
-        # Bounded staleness (GUNDI-5602, deliberate): anything the cursor still
-        # owed beyond max_data_age_hours is dropped permanently — never added
-        # to the gap — so catch-up cost cannot compound.
-        message = (
-            f"Dropping stale range [{state.high_water.isoformat()}, {freshness_floor.isoformat()}] "
-            f"for device {device.nDeviceID}: older than max_data_age_hours="
-            f"{action_config.max_data_age_hours}. Integration ID: {integration_id}"
-        )
-        logger.warning(message)
-        try:
-            await log_action_activity(
-                integration_id=integration_id,
-                action_id="pull_observations",
-                title=message,
-                level=LogLevel.WARNING
-            )
-        except Exception as e:
-            # Informational: a pubsub blip must not keep a stale device from
-            # ever advancing its cursor (review finding).
-            logger.warning(f"Could not publish stale-drop warning for device {device.nDeviceID}: {describe_exception(e)}")
+    # Bounded staleness (GUNDI-5602, deliberate): anything the cursor still
+    # owes beyond max_data_age_hours is dropped permanently — never added to
+    # the gap — so catch-up cost cannot compound. The drop only becomes real
+    # when the cursor actually advances (successful save below), so the
+    # WARNING is deferred until then: announcing it before the fetch
+    # misreported still-recoverable data as dropped on every failed attempt
+    # (review finding).
+    stale_from = state.high_water if state.high_water < freshness_floor else None
 
     lower_date = max(state.high_water - HEAD_LATE_UPLOAD_OVERLAP, freshness_floor)
     cdip_positions, transport_failure = await _fetch_window(
         device, integration, auth, action_config, lower_date, present_time, guards, "pull_observations"
     )
     if cdip_positions is None:
-        return 0, True, transport_failure, state
+        return 0, True, transport_failure
 
     if not cdip_positions:
         # Purely informational; must never affect the device's outcome. A pubsub blip
         # here must not mark a healthy quiet device as failed or stall its cursor.
         message = f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}."
         logger.info(message)
-        try:
-            await log_action_activity(
-                integration_id=str(integration.id),
-                action_id="pull_observations",
-                title=message,
-                level=LogLevel.WARNING
-            )
-        except Exception as e:
-            logger.warning(f"Could not publish activity log for device {device.nDeviceID}: {describe_exception(e)}")
+        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.WARNING)
 
     observations_sent, delivery_failed = await _deliver(cdip_positions, device, integration, "pull_observations")
     if delivery_failed:
         # The breaker watches Lotek, not Gundi: a delivery failure is not
         # evidence of Lotek-wide degradation.
-        return observations_sent, True, False, state
+        return observations_sent, True, False
 
     # Advance the cursor to the queried upper bound (upload time), not recorded_at.
     # Queries are by upload date, so wall clock is the correct cursor, and it must
@@ -584,30 +607,38 @@ async def _head_pass_device(device, integration, auth, action_config, present_ti
             f"{integration.id} Exception: {describe_exception(e)}"
         )
         logger.exception(message)
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id="pull_observations",
-            title=message,
-            level=LogLevel.ERROR
-        )
-        return observations_sent, True, False, state
+        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.ERROR)
+        return observations_sent, True, False
 
-    return observations_sent, False, False, state
+    if stale_from is not None:
+        # Only now is the drop real: the cursor advanced past the owed range.
+        message = (
+            f"Dropped stale range [{stale_from.isoformat()}, {freshness_floor.isoformat()}] "
+            f"permanently for device {device.nDeviceID}: older than max_data_age_hours="
+            f"{action_config.max_data_age_hours}. Integration ID: {integration_id}"
+        )
+        logger.warning(message)
+        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.WARNING)
+
+    return observations_sent, False, False
 
 
 async def _backfill_device(device, state, integration, auth, pull_config, guards):
     """Close up to BACKFILL_MAX_WINDOWS_PER_DEVICE oldest windows of one
     device's gap.
 
-    Returns (observations_sent, device_failed, transport_failure, gap_closed).
-    gap_start advances only past windows that were actually delivered, so a
-    failure re-fetches the same window next trigger (re-sends are tolerated,
-    silent skips are not).
+    Returns (observations_sent, device_failed, transport_failure, gap_closed,
+    windows_advanced). gap_start advances only past windows that were actually
+    delivered, so a failure re-fetches the same window next trigger (re-sends
+    are tolerated, silent skips are not). windows_advanced counts those
+    actually-delivered windows: the caller only keeps the self-retrigger
+    cascade going while some gap is really shrinking.
     """
     integration_id = str(integration.id)
     observations_sent = 0
     device_failed = False
     transport_failure = False
+    windows_advanced = 0
     for _ in range(BACKFILL_MAX_WINDOWS_PER_DEVICE):
         if not state.has_gap:
             break
@@ -638,6 +669,7 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
             integration_id, device.nDeviceID,
             {"gap_start": state.gap_start, "gap_end": state.gap_end}
         )
+        windows_advanced += 1
 
     # Advances even on zero progress (device_failed on the first window):
     # deliberate LRS-fairness trade-off so one permanently-broken device
@@ -647,7 +679,7 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     await _save_device_state_fields(
         integration_id, device.nDeviceID, {"last_backfilled": state.last_backfilled}
     )
-    return observations_sent, device_failed, transport_failure, not state.has_gap
+    return observations_sent, device_failed, transport_failure, not state.has_gap, windows_advanced
 
 
 @action_title("Backfill Observations")
@@ -662,8 +694,19 @@ async def action_backfill_observations(integration, action_config: BackfillObser
     logger.info(f"Executing backfill_observations action for integration {integration.id}...")
     integration_id = str(integration.id)
     run_started = datetime.now(tz=timezone.utc)
-    auth = get_auth_config(integration)
-    pull_config = get_pull_config(integration)  # max_pdop applies to backfilled data too
+    try:
+        auth = get_auth_config(integration)
+        pull_config = get_pull_config(integration)  # max_pdop applies to backfilled data too
+    except ConfigurationNotFound as e:
+        # Skip quietly, mirroring the runner's skippable_pull behavior: backfill
+        # is machine-triggered, so raising here would route through the generic
+        # _handle_error — an ERROR event embedding the integration's full config
+        # (auth included) on every remaining cascade step (review finding). The
+        # scheduled head pass is where a missing config gets surfaced.
+        logger.warning(
+            f"Skipping backfill for integration {integration_id}: {describe_exception(e)}"
+        )
+        return {"skipped": True, "reason": "configuration_missing"}
 
     if not pull_config.run_on_schedule:
         # The operator's pause toggle must also stop the cascade: internal
@@ -673,13 +716,13 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         logger.info(f"Integration {integration_id} is paused (run_on_schedule=false); skipping backfill.")
         return {"skipped": True, "reason": "integration_paused"}
 
-    got_lease = await state_manager.set_if_absent(
+    lease_token = await state_manager.acquire_lease(
         integration_id,
         "backfill_observations",
         ttl_seconds=app_settings.MAX_ACTION_EXECUTION_TIME,
         source_id=BACKFILL_LEASE_SOURCE,
     )
-    if not got_lease:
+    if not lease_token:
         logger.info(f"Backfill lease already held for integration {integration_id}; skipping run.")
         return {"skipped": True, "reason": "lease_held"}
 
@@ -720,13 +763,14 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         deferred_devices = []
         serviced_devices = 0
         gaps_closed = 0
+        windows_advanced_total = 0
         for i, (device, state) in enumerate(gapped):
             if reason := guards.should_stop():
                 deferred_devices = [d.nDeviceID for d, _ in gapped[i:]]
                 await _log_deferral(integration, "backfill_observations", reason, deferred_devices)
                 break
             try:
-                sent, device_failed, transport_failure, gap_closed = await _backfill_device(
+                sent, device_failed, transport_failure, gap_closed, windows_advanced = await _backfill_device(
                     device, state, integration, auth, pull_config, guards
                 )
             except LotekUnauthorizedException:
@@ -750,6 +794,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             guards.record(transport_failure=transport_failure)
             observations_extracted += sent
             gaps_closed += int(gap_closed)
+            windows_advanced_total += windows_advanced
             if device_failed:
                 failed_devices.append(device.nDeviceID)
             else:
@@ -786,8 +831,17 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         # A hot breaker suppresses the self-retrigger: re-entering immediately
         # would defeat the pause the breaker exists to buy (review finding) —
         # the next scheduled head pass re-triggers ~cadence later instead.
+        # Same for a run that advanced no window at all: with a deterministic
+        # per-window failure (e.g. one observation Gundi always rejects),
+        # retriggering on has_gap alone spun an unthrottled tight loop that
+        # re-fetched and re-sent the same window forever (review finding) —
+        # no-progress runs now wait for the next head-pass cadence instead.
         breaker_hot = guards.consecutive_transport_failures >= BREAKER_THRESHOLD
-        gaps_remaining = any(state.has_gap for _, state in gapped) and not breaker_hot
+        gaps_remaining = (
+            any(state.has_gap for _, state in gapped)
+            and not breaker_hot
+            and windows_advanced_total > 0
+        )
         result = {
             'observations_extracted': observations_extracted,
             'devices_failed': failed_devices,
@@ -795,7 +849,21 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             'gaps_closed': gaps_closed,
         }
     finally:
-        await state_manager.delete_state(integration_id, "backfill_observations", BACKFILL_LEASE_SOURCE)
+        # Ownership-checked release: an unconditional DEL could outlive this
+        # run's TTL (e.g. retried through a Redis blip after a cancellation)
+        # and delete a successor's lease, allowing overlapping backfills
+        # (review finding). Compare-and-delete only removes our own token;
+        # if release fails, the TTL expires the lease anyway.
+        try:
+            await state_manager.release_lease(
+                integration_id, "backfill_observations", lease_token,
+                source_id=BACKFILL_LEASE_SOURCE,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Could not release backfill lease for integration {integration_id} "
+                f"(the TTL will expire it): {describe_exception(e)}"
+            )
 
     if gaps_remaining:
         # Self-retrigger (movebank-connector pattern): keep draining the import

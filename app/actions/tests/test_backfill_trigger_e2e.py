@@ -55,9 +55,9 @@ async def test_pull_observations_trigger_actually_runs_backfill_end_to_end(mocke
     mocker.patch("app.actions.client.get_positions", new=AsyncMock(return_value=[]))
     mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
-    mocker.patch("app.services.state.IntegrationStateManager.delete_state", new=AsyncMock(return_value=None))
+    mocker.patch("app.services.state.IntegrationStateManager.release_lease", new=AsyncMock(return_value=True))
     lease = mocker.patch(
-        "app.services.state.IntegrationStateManager.set_if_absent", new=AsyncMock(return_value=True)
+        "app.services.state.IntegrationStateManager.acquire_lease", new=AsyncMock(return_value="lease-token")
     )
 
     result = await action_pull_observations(lotek_integration, pull_config)

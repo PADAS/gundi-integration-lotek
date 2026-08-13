@@ -52,11 +52,11 @@ def _setup_backfill_mocks(mocker, mock_redis, devices, states_by_device):
         "app.services.state.IntegrationStateManager.set_state", new=AsyncMock()
     )
     lease = mocker.patch(
-        "app.services.state.IntegrationStateManager.set_if_absent",
-        new=AsyncMock(return_value=True),
+        "app.services.state.IntegrationStateManager.acquire_lease",
+        new=AsyncMock(return_value="lease-token"),
     )
     release = mocker.patch(
-        "app.services.state.IntegrationStateManager.delete_state", new=AsyncMock()
+        "app.services.state.IntegrationStateManager.release_lease", new=AsyncMock(return_value=True)
     )
     log = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
     return get_positions, set_state, lease, release, log
@@ -69,7 +69,7 @@ async def test_backfill_skips_whole_run_when_lease_is_held(
     get_positions, _, lease, release, _ = _setup_backfill_mocks(
         mocker, mock_redis, _devices("1"), {"1": _gap_state()}
     )
-    lease.return_value = False
+    lease.return_value = None  # acquire_lease: None = already held
     result = await action_backfill_observations(
         lotek_integration, BackfillObservationsConfig()
     )
@@ -355,3 +355,73 @@ async def test_backfill_zero_progress_raises(
     with pytest.raises(LotekException, match="No devices could be backfilled"):
         await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
     release.assert_awaited_once()
+
+
+# --- chrisdoehring review fix round ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_does_not_retrigger_when_no_window_advanced(
+    mocker, lotek_integration, lotek_position, mock_redis
+):
+    # Review finding: with a deterministic partial-delivery failure (batch 1
+    # lands, a later batch is always rejected), the run counts extracted
+    # observations — dodging the zero-progress raise — but never advances the
+    # gap, so retriggering on has_gap alone spun an unthrottled tight loop.
+    # No window advanced → no cascade; the next head pass retries ~cadence later.
+    from app.settings.integration import OBSERVATIONS_BATCH_SIZE
+    get_positions, _, _, _, _ = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {"1": _gap_state()}
+    )
+    get_positions.return_value = [lotek_position] * (OBSERVATIONS_BATCH_SIZE + 1)
+    mocker.patch(
+        "app.actions.handlers.gundi_tools.send_observations_to_gundi",
+        new=AsyncMock(side_effect=[None, Exception("422 rejected")]),
+    )
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result["observations_extracted"] == OBSERVATIONS_BATCH_SIZE  # batch 1 landed
+    assert result["devices_failed"] == ["1"]
+    trigger.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_backfill_still_retriggers_while_windows_are_advancing(
+    mocker, lotek_integration, mock_redis
+):
+    # Companion to the no-progress gate: a run that IS draining (window cap
+    # hit, gap still open) keeps the cascade going.
+    _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {"1": _gap_state(days_back_start=30)}
+    )
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+    trigger.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_quietly_when_config_is_missing(
+    mocker, lotek_integration, mock_redis
+):
+    # Review finding: an operator unconfiguring pull/auth mid-cascade made the
+    # backfill raise into the runner's generic _handle_error — an ERROR event
+    # embedding the full config (auth included) on every remaining cascade
+    # step. Missing config now skips; the head pass surfaces it.
+    from app.services.errors import ConfigurationNotFound
+    get_positions, _, lease, _, log = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {"1": _gap_state()}
+    )
+    mocker.patch(
+        "app.actions.handlers.get_pull_config",
+        side_effect=ConfigurationNotFound("pull config missing"),
+    )
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result == {"skipped": True, "reason": "configuration_missing"}
+    lease.assert_not_awaited()
+    get_positions.assert_not_awaited()
+    error_logs = [c for c in log.await_args_list if c.kwargs.get("level") == LogLevel.ERROR]
+    assert not error_logs

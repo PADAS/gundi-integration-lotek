@@ -29,6 +29,12 @@ class DeviceState(pydantic.BaseModel):
     gap_start: Optional[datetime] = None
     gap_end: Optional[datetime] = None
     last_backfilled: Optional[datetime] = None
+    # In-memory marker, never persisted (exclude=True): tells the loader this
+    # state was parsed from a pre-5602 cursor blob, so a cursor lagging beyond
+    # the freshness floor gets its owed range carried over as a gap instead of
+    # being dropped by bounded staleness (review finding: on upgrade day a
+    # stale legacy cursor lost the range the old code would have caught up).
+    migrated_from_legacy: bool = pydantic.Field(False, exclude=True)
 
     @pydantic.root_validator(pre=True)
     def _migrate_legacy_cursor(cls, values):
@@ -37,6 +43,7 @@ class DeviceState(pydantic.BaseModel):
         if values.get("high_water") is None and values.get("updated_at") is not None:
             values = dict(values)
             values["high_water"] = values["updated_at"]
+            values["migrated_from_legacy"] = True
         return values
 
     _tz = pydantic.validator(
