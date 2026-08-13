@@ -406,15 +406,17 @@ async def _head_pass_device(device, integration, auth, action_config, present_ti
         # pydantic.ValidationError out of the client's parsing, and those must
         # not take down the devices behind this one either. CancelledError is a
         # BaseException, so the action timeout still unwinds normally.
-        # WARNING, not ERROR: these recur daily while Lotek is slow, health
-        # keys on ERROR count alone, and devices_failed already tracks them.
+        # ERROR, not WARNING: unlike a transient timeout (httpx.TransportError,
+        # above), a data-shape break is permanent and won't self-heal on retry —
+        # it must stay visible to health/alerting or it can persist unnoticed
+        # forever (review finding).
         message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{present_time}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
-        logger.warning(message, exc_info=True)
+        logger.exception(message)
         await log_action_activity(
             integration_id=integration_id,
             action_id="pull_observations",
             title=message,
-            level=LogLevel.WARNING
+            level=LogLevel.ERROR
         )
         guards.record(transport_failure=False)
         return 0, True, state
@@ -542,17 +544,19 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
             device_failed = True
             break
         except Exception as e:
+            # ERROR, not WARNING: a data-shape break is permanent, unlike the
+            # transient timeout above — it must stay visible to alerting.
             message = (
                 f"Error fetching backfill positions from Lotek. Device: {device.nDeviceID}. "
                 f"Dates: [{window_start},{upper_date}]. Integration ID: {integration_id} "
                 f"Exception: {describe_exception(e)}"
             )
-            logger.warning(message, exc_info=True)
+            logger.exception(message)
             await log_action_activity(
                 integration_id=integration_id,
                 action_id="backfill_observations",
                 title=message,
-                level=LogLevel.WARNING
+                level=LogLevel.ERROR
             )
             guards.record(transport_failure=False)
             device_failed = True

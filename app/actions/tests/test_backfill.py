@@ -158,6 +158,22 @@ async def test_backfill_orders_devices_least_recently_backfilled_first(
 
 
 @pytest.mark.asyncio
+async def test_backfill_malformed_data_failure_logs_error_not_warning(
+    mocker, lotek_integration, mock_redis
+):
+    # Review finding: a data-shape break is permanent, unlike a transient
+    # timeout, and must stay ERROR so it can alert.
+    get_positions, _, _, _, log = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {"1": _gap_state()}
+    )
+    get_positions.return_value = None  # blows up in filter_and_transform_positions
+    with pytest.raises(LotekException):  # single device, zero progress
+        await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+    device_logs = [c for c in log.await_args_list if "Device: 1" in c.kwargs.get("title", "")]
+    assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
+
+
+@pytest.mark.asyncio
 async def test_backfill_does_not_advance_gap_when_send_fails(
     mocker, lotek_integration, lotek_position, mock_redis
 ):

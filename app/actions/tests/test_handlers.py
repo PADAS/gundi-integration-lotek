@@ -664,6 +664,27 @@ async def test_action_pull_observations_isolates_transform_failure_to_the_device
 
 
 @pytest.mark.asyncio
+async def test_malformed_data_failure_logs_error_not_warning(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: malformed/unparseable data is a permanent, code/data-shape
+    # problem — not Lotek being slow — and must stay ERROR so it can alert,
+    # unlike a transient timeout (WARNING, see
+    # test_transient_fetch_failure_logs_warning_not_error). The demotion to
+    # WARNING was only ever meant for transient fetch timeouts.
+    get_positions, _, _, log = _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
+
+    async def get_positions_side_effect(device_id, *args, **kwargs):
+        return None if device_id == "1" else []  # device 1: malformed; device 2: fine
+
+    get_positions.side_effect = get_positions_side_effect
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_failed"] == ["1"]
+    device_logs = [c for c in log.await_args_list if "Device: 1" in c.kwargs.get("title", "")]
+    assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
+
+
+@pytest.mark.asyncio
 async def test_action_pull_observations_emits_summary_before_all_failed_raise(
     mocker, lotek_integration, pull_config, mock_redis
 ):
