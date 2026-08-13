@@ -1028,3 +1028,43 @@ def test_deadline_fraction_of_budget():
     # 540s budget → soft deadline ~432s. Pin the fraction.
     from app.actions.handlers import DEADLINE_FRACTION
     assert DEADLINE_FRACTION == 0.8
+
+
+@pytest.mark.asyncio
+async def test_breaker_trips_after_three_consecutive_transport_failures(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # 3 consecutive timeouts = Lotek-wide degradation: stop early, defer the
+    # rest (WARNING), instead of grinding every device into the same wall.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    get_positions, _, _, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1", "2", "3", "4", "5")
+    )
+    # device 1 succeeds; 2,3,4 exhaust retries on timeouts; 5 must be deferred
+    get_positions.side_effect = [[]] + [httpx.ReadTimeout("")] * (3 * RETRY_ATTEMPTS)
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_failed"] == ["2", "3", "4"]
+    assert result["devices_deferred"] == ["5"]
+    breaker_logs = [
+        c for c in log.await_args_list
+        if c.kwargs["level"] == LogLevel.WARNING and "circuit breaker" in c.kwargs["title"].lower()
+    ]
+    assert len(breaker_logs) == 1
+
+
+@pytest.mark.asyncio
+async def test_breaker_counter_resets_on_success(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Failures interleaved with successes are per-device noise, not an outage.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    get_positions, _, _, _ = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1", "2", "3", "4", "5")
+    )
+    fail = [httpx.ReadTimeout("")] * RETRY_ATTEMPTS
+    get_positions.side_effect = fail + [[]] + fail + [[]] + fail  # F S F S F
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_deferred"] == []
+    assert result["devices_failed"] == ["1", "3", "5"]

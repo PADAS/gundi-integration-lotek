@@ -66,6 +66,8 @@ class RunGuards:
     def should_stop(self):
         if _deadline_exceeded(self.run_started_at):
             return "deadline"
+        if self.consecutive_transport_failures >= BREAKER_THRESHOLD:
+            return "circuit breaker"
         return None
 
     def record(self, transport_failure: bool):
@@ -378,6 +380,19 @@ async def _head_pass_device(device, integration, auth, action_config, present_ti
         # Credentials are an integration-wide problem: every remaining device
         # would fail the same way, so fail fast instead of N identical errors.
         raise
+    except httpx.TransportError as e:
+        # Timeouts/transport failures feed the circuit breaker: enough of them
+        # in a row means Lotek-wide degradation, not a bad device.
+        message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{present_time}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
+        logger.warning(message, exc_info=True)
+        await log_action_activity(
+            integration_id=integration_id,
+            action_id="pull_observations",
+            title=message,
+            level=LogLevel.WARNING
+        )
+        guards.record(transport_failure=True)
+        return 0, True, state
     except Exception as e:
         # Deliberately broad: malformed data from Lotek surfaces as KeyError or
         # pydantic.ValidationError out of the client's parsing, and those must
@@ -393,6 +408,7 @@ async def _head_pass_device(device, integration, auth, action_config, present_ti
             title=message,
             level=LogLevel.WARNING
         )
+        guards.record(transport_failure=False)
         return 0, True, state
 
     if not cdip_positions:
@@ -441,6 +457,9 @@ async def _head_pass_device(device, integration, auth, action_config, present_ti
             title=message,
             level=LogLevel.ERROR
         )
+        # The breaker watches Lotek, not Gundi: a delivery failure is not
+        # evidence of Lotek-wide degradation.
+        guards.record(transport_failure=False)
         return observations_sent, True, state
 
     # Advance the cursor to the queried upper bound (upload time), not recorded_at.
@@ -468,6 +487,8 @@ async def _head_pass_device(device, integration, auth, action_config, present_ti
             title=message,
             level=LogLevel.ERROR
         )
+        guards.record(transport_failure=False)
         return observations_sent, True, state
 
+    guards.record(transport_failure=False)
     return observations_sent, False, state
