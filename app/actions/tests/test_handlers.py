@@ -790,3 +790,24 @@ async def test_action_pull_observations_retries_token_expiry_and_recovers(
 
     assert len(attempts) == 2, "token expiry was not retried"
     assert result == {"observations_extracted": 1, "devices_failed": []}
+
+
+@pytest.mark.asyncio
+async def test_get_devices_failure_logs_exception_type_when_message_is_empty(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # httpx timeouts stringify to "" — the activity log must name the type,
+    # not render a bare "Exception: ".
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch(
+        "app.actions.client.get_devices",
+        new=AsyncMock(side_effect=httpx.ReadTimeout("")),
+    )
+    mock_log = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+    with pytest.raises(httpx.ReadTimeout):
+        await action_pull_observations(lotek_integration, pull_config)
+    title = mock_log.call_args.kwargs["title"]
+    assert "ReadTimeout" in title

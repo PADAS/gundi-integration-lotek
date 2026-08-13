@@ -154,7 +154,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             with attempt:
                 device_list = await client.get_devices(integration, auth)
     except Exception as e:
-        message = f"Error fetching devices from Lotek. Integration ID: {integration.id} Exception: {e}"
+        message = f"Error fetching devices from Lotek. Integration ID: {integration.id} Exception: {describe_exception(e)}"
         logger.exception(message)
         await log_action_activity(
             integration_id=str(integration.id),
