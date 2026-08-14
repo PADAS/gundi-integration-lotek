@@ -13,13 +13,18 @@ def _emulate_atomic_state_merge(monkeypatch):
     # inspecting set_state's merged documents.
     from app.actions.handlers import state_manager
 
-    async def fake_merge(integration_id, action_id, updates, source_id="no-source"):
+    async def fake_merge(integration_id, action_id, updates, source_id="no-source", init_only=None):
         # go through the instance so both mock styles work (class-attr
         # AsyncMocks and plain functions taking self)
         current = await state_manager.get_state(integration_id, action_id, source_id)
-        await state_manager.set_state(
-            integration_id, action_id, {**(current or {}), **updates}, source_id
-        )
+        merged = {**(current or {}), **updates}
+        # init_only mirrors the Lua script's key-presence check: a key stored
+        # as JSON null decodes to cjson.null (not Lua nil), so it counts as
+        # PRESENT and is not overwritten — only a missing key accepts the value.
+        for key, value in (init_only or {}).items():
+            if key not in merged:
+                merged[key] = value
+        await state_manager.set_state(integration_id, action_id, merged, source_id)
 
     monkeypatch.setattr(IntegrationStateManager, "merge_state_fields", staticmethod(fake_merge))
 

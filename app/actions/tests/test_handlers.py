@@ -1251,6 +1251,63 @@ async def test_head_pass_save_does_not_clobber_concurrently_closed_gap(
     assert abs(datetime.now(timezone.utc) - saved["high_water"]) < timedelta(minutes=1)
 
 
+@pytest.mark.asyncio
+async def test_stale_first_run_save_does_not_resurrect_a_gap_closed_meanwhile(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: two overlapping head runs both load is_new=True; the
+    # faster one births the document and its triggered backfill closes the
+    # gap (gap keys stored as null — present). The slower run's save must not
+    # resurrect the gap from its stale snapshot: gap birth is create-only,
+    # and a key present as null counts as present.
+    now = datetime.now(timezone.utc)
+    gap_closed_doc = {
+        "version": 1,
+        "high_water": (now - timedelta(minutes=5)).isoformat(),
+        "gap_start": None,
+        "gap_end": None,
+        "last_backfilled": now.isoformat(),
+    }
+    _, get_state, set_state, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    # 1st read = this run loading state (absent → is_new, gap birthed in memory);
+    # 2nd read = the merge-save re-read (the faster run + backfill already ran).
+    get_state.side_effect = [{}, gap_closed_doc]
+    await action_pull_observations(lotek_integration, pull_config)
+    saved = set_state.call_args.args[2]
+    assert saved.get("gap_start") is None and saved.get("gap_end") is None, (
+        "a stale is_new save resurrected a gap a backfill had already closed"
+    )
+    assert abs(datetime.now(timezone.utc) - saved["high_water"]) < timedelta(minutes=1), (
+        "high_water must still be overwritten by the head save"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_first_run_save_does_not_rewind_an_advanced_gap(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Same race, gap still open: the faster run's backfill advanced gap_start
+    # past some drained windows. The slower run's create-only gap birth must
+    # leave the advanced value alone instead of rewinding to the full lookback.
+    now = datetime.now(timezone.utc)
+    advanced_start = (now - timedelta(days=3)).isoformat()
+    gap_end = (now - timedelta(hours=12)).isoformat()
+    gap_advanced_doc = {
+        "version": 1,
+        "high_water": (now - timedelta(minutes=5)).isoformat(),
+        "gap_start": advanced_start,
+        "gap_end": gap_end,
+    }
+    _, get_state, set_state, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    get_state.side_effect = [{}, gap_advanced_doc]
+    await action_pull_observations(lotek_integration, pull_config)
+    saved = set_state.call_args.args[2]
+    assert saved["gap_start"] == advanced_start, (
+        "a stale is_new save rewound gap_start to its full-lookback snapshot"
+    )
+    assert saved["gap_end"] == gap_end
+
+
 # --- chrisdoehring review fix round ------------------------------------------
 
 

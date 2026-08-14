@@ -21,11 +21,19 @@ _RELEASE_LEASE_SCRIPT = (
 # runs scripts atomically, so two writers updating disjoint fields can never
 # lose each other's update — unlike a client-side read-merge-write, which
 # always leaves a window between the read and the SET.
+# ARGV[2] fields are create-only: applied only when the key is absent from
+# the stored document. Presence is key-presence, not truthiness — a stored
+# JSON null decodes to cjson.null (not Lua nil), so a field another writer
+# set to null (e.g. a closed gap) still counts as PRESENT and is NOT
+# overwritten, while a document missing the key entirely accepts the value.
 _MERGE_STATE_SCRIPT = """
 local doc = {}
 local current = redis.call('GET', KEYS[1])
 if current then doc = cjson.decode(current) end
 for k, v in pairs(cjson.decode(ARGV[1])) do doc[k] = v end
+for k, v in pairs(cjson.decode(ARGV[2])) do
+  if doc[k] == nil then doc[k] = v end
+end
 redis.call('SET', KEYS[1], cjson.encode(doc))
 return 1
 """
@@ -75,19 +83,26 @@ class IntegrationStateManager:
         return bool(was_set)
 
     async def merge_state_fields(
-        self, integration_id: str, action_id: str, updates: dict, source_id: str = "no-source"
+        self, integration_id: str, action_id: str, updates: dict, source_id: str = "no-source",
+        init_only: Optional[dict] = None,
     ):
         """Atomically merge `updates` into the JSON state blob at the key,
         overwriting only those fields (server-side Lua, so concurrent writers
         owning disjoint fields cannot lose each other's update). Creates the
-        document when the key is absent. The stored format stays a plain JSON
-        blob, fully compatible with get_state/set_state.
+        document when the key is absent. `init_only` fields are create-only:
+        written only when the stored document lacks the key entirely — a key
+        present with a null value counts as present and is left alone, so a
+        stale writer cannot resurrect a field another writer already nulled.
+        The stored format stays a plain JSON blob, fully compatible with
+        get_state/set_state.
         """
         key = f"integration_state.{integration_id}.{action_id}.{source_id}"
         for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
                 await self.db_client.eval(
-                    _MERGE_STATE_SCRIPT, 1, key, json.dumps(updates, default=str)
+                    _MERGE_STATE_SCRIPT, 1, key,
+                    json.dumps(updates, default=str),
+                    json.dumps(init_only or {}, default=str),
                 )
 
     async def acquire_lease(

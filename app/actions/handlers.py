@@ -433,7 +433,7 @@ async def _load_device_state(integration_id, device_id, present_time, action_con
     return DeviceState(high_water=head_start), True
 
 
-async def _save_device_state_fields(integration_id, device_id, updates):
+async def _save_device_state_fields(integration_id, device_id, updates, init_only=None):
     """Merge-save: atomically overwrite only the fields this writer owns
     (head pass: high_water; backfill: gap_*/last_backfilled).
 
@@ -443,8 +443,15 @@ async def _save_device_state_fields(integration_id, device_id, updates):
     lost-update race). The merge runs server-side in a Lua script, so there
     is no read-to-write window at all (review finding: the previous
     client-side read-merge-write only narrowed the race).
+
+    `init_only` is the create-only channel for gap birth: those fields are
+    written only when the stored document lacks the key entirely, so a stale
+    first-run/migration snapshot cannot overwrite gap progress a backfill
+    already made (a closed gap stores the key as null — still present).
     """
-    await state_manager.merge_state_fields(integration_id, "pull_observations", updates, device_id)
+    await state_manager.merge_state_fields(
+        integration_id, "pull_observations", updates, device_id, init_only=init_only
+    )
 
 
 async def _fetch_window(device, integration, auth, config, lower_date, upper_date, guards, action_id):
@@ -594,12 +601,20 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
     # untouched so the head window is re-fetched next run (re-sends are tolerated,
     # silent skips are not).
     state.high_water = present_time
-    # The head pass owns only high_water; a first run also births the full
-    # document (the gap). Everything else belongs to the backfill (merge-save,
-    # see _save_device_state_fields).
-    updates = state.dict() if is_new else {"high_water": state.high_water}
+    # The head pass owns only high_water; a first run / legacy migration also
+    # births the gap, but create-only — two head runs can overlap, and if the
+    # faster one already birthed the document and a backfill advanced or
+    # closed the gap, this run's stale snapshot must not resurrect it (review
+    # finding). Everything else belongs to the backfill (merge-save, see
+    # _save_device_state_fields); last_backfilled is deliberately never
+    # written here.
+    updates = {"high_water": state.high_water}
+    init_only = None
+    if is_new:
+        updates["version"] = state.version
+        init_only = {"gap_start": state.gap_start, "gap_end": state.gap_end}
     try:
-        await _save_device_state_fields(integration_id, device.nDeviceID, updates)
+        await _save_device_state_fields(integration_id, device.nDeviceID, updates, init_only=init_only)
     except Exception as e:
         message = (
             f"Error saving cursor for device {device.nDeviceID}. Integration ID: "
