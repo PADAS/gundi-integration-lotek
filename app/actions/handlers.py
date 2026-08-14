@@ -434,18 +434,17 @@ async def _load_device_state(integration_id, device_id, present_time, action_con
 
 
 async def _save_device_state_fields(integration_id, device_id, updates):
-    """Merge-save: re-read the current blob and overwrite only the fields this
-    writer owns (head pass: high_water; backfill: gap_*/last_backfilled).
+    """Merge-save: atomically overwrite only the fields this writer owns
+    (head pass: high_water; backfill: gap_*/last_backfilled).
 
     The two actions can interleave — the Redis lease only serializes backfill
     against backfill — and whole-blob writes from a stale snapshot were
     resurrecting closed gaps and rewinding the head cursor (review finding:
-    lost-update race). The re-read shrinks the race window from the whole
-    action duration to milliseconds; re-sends cover whatever remains.
+    lost-update race). The merge runs server-side in a Lua script, so there
+    is no read-to-write window at all (review finding: the previous
+    client-side read-merge-write only narrowed the race).
     """
-    current = await state_manager.get_state(integration_id, "pull_observations", device_id)
-    merged = {**(current or {}), **updates}
-    await state_manager.set_state(integration_id, "pull_observations", merged, device_id)
+    await state_manager.merge_state_fields(integration_id, "pull_observations", updates, device_id)
 
 
 async def _fetch_window(device, integration, auth, config, lower_date, upper_date, guards, action_id):

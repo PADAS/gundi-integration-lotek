@@ -1,5 +1,28 @@
 import pytest
 
+from app.services.state import IntegrationStateManager
+
+
+@pytest.fixture(autouse=True)
+def _emulate_atomic_state_merge(monkeypatch):
+    # merge_state_fields is a server-side Lua script in production; tests mock
+    # the class-level get_state/set_state, so emulate the script's
+    # read-merge-write through them. Resolved at call time, so each test's own
+    # get_state/set_state patches (including side_effect sequences that model
+    # concurrent writers) are what the merge sees — and assertions keep
+    # inspecting set_state's merged documents.
+    from app.actions.handlers import state_manager
+
+    async def fake_merge(integration_id, action_id, updates, source_id="no-source"):
+        # go through the instance so both mock styles work (class-attr
+        # AsyncMocks and plain functions taking self)
+        current = await state_manager.get_state(integration_id, action_id, source_id)
+        await state_manager.set_state(
+            integration_id, action_id, {**(current or {}), **updates}, source_id
+        )
+
+    monkeypatch.setattr(IntegrationStateManager, "merge_state_fields", staticmethod(fake_merge))
+
 
 @pytest.fixture(autouse=True)
 def _zero_retry_waits(monkeypatch):

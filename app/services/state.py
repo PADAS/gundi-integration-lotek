@@ -16,6 +16,20 @@ _RELEASE_LEASE_SCRIPT = (
     "return redis.call('del', KEYS[1]) else return 0 end"
 )
 
+# Atomic field merge into a JSON-blob state key: decode the current document
+# (or start empty), overwrite only the fields in ARGV[1], re-encode. Redis
+# runs scripts atomically, so two writers updating disjoint fields can never
+# lose each other's update — unlike a client-side read-merge-write, which
+# always leaves a window between the read and the SET.
+_MERGE_STATE_SCRIPT = """
+local doc = {}
+local current = redis.call('GET', KEYS[1])
+if current then doc = cjson.decode(current) end
+for k, v in pairs(cjson.decode(ARGV[1])) do doc[k] = v end
+redis.call('SET', KEYS[1], cjson.encode(doc))
+return 1
+"""
+
 
 class IntegrationStateManager:
 
@@ -59,6 +73,22 @@ class IntegrationStateManager:
                     nx=True,
                 )
         return bool(was_set)
+
+    async def merge_state_fields(
+        self, integration_id: str, action_id: str, updates: dict, source_id: str = "no-source"
+    ):
+        """Atomically merge `updates` into the JSON state blob at the key,
+        overwriting only those fields (server-side Lua, so concurrent writers
+        owning disjoint fields cannot lose each other's update). Creates the
+        document when the key is absent. The stored format stays a plain JSON
+        blob, fully compatible with get_state/set_state.
+        """
+        key = f"integration_state.{integration_id}.{action_id}.{source_id}"
+        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
+            with attempt:
+                await self.db_client.eval(
+                    _MERGE_STATE_SCRIPT, 1, key, json.dumps(updates, default=str)
+                )
 
     async def acquire_lease(
         self, integration_id: str, action_id: str, *, ttl_seconds: int, source_id: str = "no-source"
