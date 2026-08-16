@@ -771,7 +771,8 @@ async def test_get_devices_failure_logs_exception_type_when_message_is_empty(
     mocker, lotek_integration, pull_config, mock_redis
 ):
     # httpx timeouts stringify to "" — the activity log must name the type,
-    # not render a bare "Exception: ".
+    # not render a bare ": ". (Transport failures classify WARNING and return
+    # cleanly since the 2026-08-16 congestion fix, so no raise here.)
     mocker.patch("app.services.state.redis", mock_redis)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
@@ -781,8 +782,8 @@ async def test_get_devices_failure_logs_exception_type_when_message_is_empty(
         new=AsyncMock(side_effect=httpx.ReadTimeout("")),
     )
     mock_log = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
-    with pytest.raises(httpx.ReadTimeout):
-        await action_pull_observations(lotek_integration, pull_config)
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["reason"] == "lotek_unreachable"
     title = mock_log.call_args.kwargs["title"]
     assert "ReadTimeout" in title
 

@@ -31,16 +31,21 @@ from app import settings
 logger = logging.getLogger(__name__)
 
 
-# Publish events for other services or system components
+# Publish events for other services or system components.
+# Retry budget: an action runs under MAX_ACTION_EXECUTION_TIME (540s) and may
+# publish several activity events; the previous budget (5 attempts x 20s
+# timeout + waits up to 60s) let a single publish burn 100-250s of that under
+# PubSub egress congestion — enough to kill whole runs (GUNDI-5602 prod
+# finding on 2026-08-16). Worst case now is ~36s per publish.
 @stamina.retry(
     on=(aiohttp.ClientError, asyncio.TimeoutError),
-    attempts=5,
-    wait_initial=4.0,
-    wait_max=60,
-    wait_jitter=5.0
+    attempts=3,
+    wait_initial=1.0,
+    wait_max=8.0,
+    wait_jitter=2.0
 )
 async def publish_event(event: SystemEventBaseModel, topic_name: str):
-    timeout_settings = aiohttp.ClientTimeout(total=20.0)
+    timeout_settings = aiohttp.ClientTimeout(total=10.0)
     async with aiohttp.ClientSession(
         raise_for_status=True, timeout=timeout_settings
     ) as session:
@@ -64,6 +69,29 @@ async def publish_event(event: SystemEventBaseModel, topic_name: str):
             return response
 
 
+async def _publish_activity_event(event: SystemEventBaseModel, topic_name: str):
+    """Best-effort publish for activity/telemetry events.
+
+    Activity logs are observability: failing to publish one must never fail
+    the action being logged. Before this existed, PubSub egress congestion
+    made publish_event exhaust its retries and re-raise asyncio.TimeoutError,
+    which escaped through the activity_logger decorator into execute_action's
+    `except asyncio.TimeoutError` — every run died in ~90s mislabeled as
+    "Action timed out" (GUNDI-5602 prod finding). Command publishes
+    (action_scheduler.trigger_action) keep using publish_event directly,
+    which still raises: a lost command means the action never runs, and the
+    caller must know.
+    """
+    try:
+        return await publish_event(event=event, topic_name=topic_name)
+    except Exception as e:
+        logger.error(
+            f"Dropping activity event {type(event).__name__} for topic {topic_name} "
+            f"after retries: {type(e).__name__}: {e}"
+        )
+        return None
+
+
 async def log_activity(integration_id: str, action_id: str, title: str, level="INFO", config_data: dict = None, data: dict = None):
     # Show a deprecation warning in favor of using either log_action_activity or log_webhook_activity
     logger.warning("log_activity is deprecated. Please use log_action_activity or log_webhook_activity instead.")
@@ -81,7 +109,7 @@ async def log_action_activity(integration_id: str, action_id: str, title: str, l
         :return: None
         """
     logger.debug(f"Logging custom activity: {title}. Integration: {integration_id}. Action: {action_id}.")
-    await publish_event(
+    await _publish_activity_event(
         event=IntegrationActionCustomLog(
             payload=CustomActivityLog(
                 integration_id=integration_id,
@@ -109,7 +137,7 @@ async def log_webhook_activity(
         :return: None
         """
     logger.debug(f"Logging custom activity: {title}. Integration: {integration_id}. Webhook: {webhook_id}.")
-    await publish_event(
+    await _publish_activity_event(
         event=IntegrationWebhookCustomLog(
             payload=CustomWebhookLog(
                 integration_id=integration_id,
@@ -134,7 +162,7 @@ def activity_logger(on_start=True, on_completion=True, on_error=True):
             action_config = kwargs.get("action_config")
             config_data = action_config.dict() if action_config else {} or {}
             if on_start:
-                await publish_event(
+                await _publish_activity_event(
                     event=IntegrationActionStarted(
                         payload=ActionExecutionStarted(
                             integration_id=integration_id,
@@ -148,7 +176,7 @@ def activity_logger(on_start=True, on_completion=True, on_error=True):
                 result = await func(*args, **kwargs)
             except Exception as e:
                 if on_error:
-                    await publish_event(
+                    await _publish_activity_event(
                         event=IntegrationActionFailed(
                             payload=ActionExecutionFailed(
                                 integration_id=integration_id,
@@ -162,7 +190,7 @@ def activity_logger(on_start=True, on_completion=True, on_error=True):
                 raise e
             else:
                 if on_completion:
-                    await publish_event(
+                    await _publish_activity_event(
                         event=IntegrationActionComplete(
                             payload=ActionExecutionComplete(
                                 integration_id=integration_id,
@@ -188,7 +216,7 @@ def webhook_activity_logger(on_start=True, on_completion=True, on_error=True):
             config_data = webhook_config.dict() if webhook_config else {} or {}
             webhook_id = str(integration.webhook_configuration.webhook.value) if integration and integration.webhook_configuration else "webhook"
             if on_start:
-                await publish_event(
+                await _publish_activity_event(
                     event=IntegrationWebhookStarted(
                         payload=WebhookExecutionStarted(
                             integration_id=integration_id,
@@ -202,7 +230,7 @@ def webhook_activity_logger(on_start=True, on_completion=True, on_error=True):
                 result = await func(*args, **kwargs)
             except Exception as e:
                 if on_error:
-                    await publish_event(
+                    await _publish_activity_event(
                         event=IntegrationWebhookFailed(
                             payload=WebhookExecutionFailed(
                                 integration_id=integration_id,
@@ -216,7 +244,7 @@ def webhook_activity_logger(on_start=True, on_completion=True, on_error=True):
                 raise e
             else:
                 if on_completion:
-                    await publish_event(
+                    await _publish_activity_event(
                         event=IntegrationWebhookComplete(
                             payload=WebhookExecutionComplete(
                                 integration_id=integration_id,

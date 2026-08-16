@@ -251,6 +251,30 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
             with attempt:
                 device_list = await client.get_devices(integration, auth)
+    except httpx.TransportError as e:
+        # Transport failures reaching Lotek are the same class the per-device
+        # breaker treats as WARNING; classifying them ERROR here marked every
+        # connection unhealthy during fleet-wide Lotek congestion even though
+        # the next tick usually succeeds (GUNDI-5602 prod finding 2026-08-16).
+        # Clean return: the run made no progress but the schedule retries it.
+        message = (
+            f"Lotek API unreachable while listing devices for integration {integration.id}: "
+            f"{describe_exception(e)}. The run will be retried on the next schedule."
+        )
+        logger.warning(message)
+        await log_action_activity(
+            integration_id=str(integration.id),
+            action_id="pull_observations",
+            title=message,
+            level=LogLevel.WARNING
+        )
+        return {
+            "observations_extracted": 0,
+            "devices_failed": [],
+            "devices_deferred": [],
+            "skipped": True,
+            "reason": "lotek_unreachable",
+        }
     except Exception as e:
         message = f"Error fetching devices from Lotek. Integration ID: {integration.id} Exception: {describe_exception(e)}"
         logger.exception(message)
@@ -745,6 +769,24 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
                 with attempt:
                     device_list = await client.get_devices(integration, auth)
+        except httpx.TransportError as e:
+            # Same WARNING classification as the head pass: an unreachable
+            # Lotek must not mark the connection unhealthy. The early return
+            # releases the lease via the finally below, and skipping the
+            # self-retrigger throttles the cascade to the head-pass cadence —
+            # the open gaps re-trigger backfill on the next scheduled run.
+            message = (
+                f"Lotek API unreachable while listing devices for backfill on integration "
+                f"{integration_id}: {describe_exception(e)}. Open gaps are retried on the next trigger."
+            )
+            logger.warning(message)
+            await log_action_activity(
+                integration_id=integration_id,
+                action_id="backfill_observations",
+                title=message,
+                level=LogLevel.WARNING
+            )
+            return {"skipped": True, "reason": "lotek_unreachable"}
         except Exception as e:
             message = (
                 f"Error fetching devices from Lotek for backfill. Integration ID: "
