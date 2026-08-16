@@ -88,26 +88,6 @@ def _to_utc(val: datetime) -> datetime:
     return val.astimezone(timezone.utc)
 
 
-def default_updated_at():
-    '''
-    Default for a new configuration is to pretend the last run was 7 days ago
-    '''
-    return datetime.now(tz=timezone.utc) - timedelta(days=7)
-
-
-class IntegrationState(pydantic.BaseModel):
-    updated_at: datetime = pydantic.Field(default_factory=default_updated_at, alias='updated_at')
-    error: str = None
-
-    @pydantic.validator("updated_at")
-    def clean_updated_at(cls, v):
-        if v is None:
-            return default_updated_at()
-        if not v.tzinfo:
-            return v.replace(tzinfo=timezone.utc)
-        return v
-
-
 async def get_token(integration, auth):
     saved_token = await state_manager.get_state(
         str(integration.id),

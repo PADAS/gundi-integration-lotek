@@ -99,7 +99,7 @@ async def test_invalid_position_filtered_and_logs_warning_when_no_valid_observat
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
     result = await action_pull_observations(lotek_integration, pull_config)
-    assert result == {'observations_extracted': 0, 'devices_failed': []}
+    assert result == {'observations_extracted': 0, 'devices_failed': [], 'devices_deferred': []}
     mock_log_action_activity.assert_any_call(
         integration_id=str(lotek_integration.id),
         action_id="pull_observations",
@@ -108,22 +108,23 @@ async def test_invalid_position_filtered_and_logs_warning_when_no_valid_observat
     )
 
 @pytest.mark.asyncio
-async def test_lookback_days_config_sets_first_run_window(mocker, lotek_integration, pull_config, mock_redis):
+async def test_lookback_days_config_sets_first_run_gap_depth(mocker, lotek_integration, pull_config, mock_redis):
+    # default_lookback_days now controls only the first-run import depth: the
+    # head pass makes ONE fresh call and the rest becomes the device's gap.
     mocker.patch("app.services.state.redis", mock_redis)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
     mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=[LotekDevice(nDeviceID="1", strSpecialID="special", dtCreated=datetime.now(), strSatellite="satellite")]))
     mock_get_positions = mocker.patch("app.actions.client.get_positions", new=AsyncMock(return_value=[]))
     mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
-    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mock_set_state = mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
+    mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
     pull_config.default_lookback_days = 30
     await action_pull_observations(lotek_integration, pull_config)
-    # first chunk starts ~30 days back
-    first_call_start = mock_get_positions.call_args_list[0].args[3]
-    age_days = (datetime.now(timezone.utc) - first_call_start).days
-    assert age_days == 30
-    # window walked in 7-day chunks up to now
-    assert len(mock_get_positions.call_args_list) == 5
+    assert len(mock_get_positions.call_args_list) == 1
+    saved = mock_set_state.call_args.args[2]
+    gap_age_days = (datetime.now(timezone.utc) - saved["gap_start"]).days
+    assert gap_age_days == 30
 
 @pytest.mark.asyncio
 async def test_action_pull_observations_success(mocker, lotek_integration, pull_config, mock_redis):
@@ -135,7 +136,7 @@ async def test_action_pull_observations_success(mocker, lotek_integration, pull_
     mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
     result = await action_pull_observations(lotek_integration, pull_config)
-    assert result == {'observations_extracted': 0, 'devices_failed': []}
+    assert result == {'observations_extracted': 0, 'devices_failed': [], 'devices_deferred': []}
 
 def _devices(*device_ids):
     return [
@@ -175,7 +176,7 @@ async def test_action_pull_observations_continues_after_one_device_fails(
     assert queried[0] == "1"
     assert queried[-1] == "3"
     assert queried.count("2") == RETRY_ATTEMPTS
-    assert result == {"observations_extracted": 2, "devices_failed": ["2"]}
+    assert result == {"observations_extracted": 2, "devices_failed": ["2"], "devices_deferred": []}
     assert mock_send.call_count == 2
 
 
@@ -205,7 +206,7 @@ async def test_action_pull_observations_continues_after_lotek_error_status(
     result = await action_pull_observations(lotek_integration, pull_config)
 
     assert queried == ["1", "2", "3"]
-    assert result == {"observations_extracted": 2, "devices_failed": ["2"]}
+    assert result == {"observations_extracted": 2, "devices_failed": ["2"], "devices_deferred": []}
 
 
 @pytest.mark.asyncio
@@ -237,7 +238,7 @@ async def test_action_pull_observations_continues_after_malformed_device_data(
     result = await action_pull_observations(lotek_integration, pull_config)
 
     assert queried[-1] == "3"
-    assert result == {"observations_extracted": 2, "devices_failed": ["2"]}
+    assert result == {"observations_extracted": 2, "devices_failed": ["2"], "devices_deferred": []}
 
 
 @pytest.mark.asyncio
@@ -330,7 +331,7 @@ async def test_action_pull_observations_counts_data_delivered_before_downstream_
 
     result = await action_pull_observations(lotek_integration, pull_config)
 
-    assert result == {"observations_extracted": 1, "devices_failed": ["1"]}
+    assert result == {"observations_extracted": 1, "devices_failed": ["1"], "devices_deferred": []}
 
 
 @pytest.mark.asyncio
@@ -411,49 +412,6 @@ async def test_action_pull_observations_fails_when_every_device_fails(
 
     with pytest.raises(LotekException):
         await action_pull_observations(lotek_integration, pull_config)
-
-
-@pytest.mark.asyncio
-async def test_action_pull_observations_keeps_successful_chunks_when_later_chunk_fails(
-    mocker, lotek_integration, pull_config, mock_redis, lotek_position
-):
-    # With a lookback wider than one chunk, data already fetched should be delivered and
-    # checkpointed up to the last good window instead of being thrown away every run.
-    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
-    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
-    mocker.patch("app.services.state.redis", mock_redis)
-    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
-    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
-    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1")))
-    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
-    mock_set_state = mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
-    mock_send = mocker.patch("app.services.gundi.send_observations_to_gundi", new=AsyncMock())
-    pull_config.default_lookback_days = 30
-
-    windows = []
-
-    async def get_positions(device_id, auth, integration, lower, upper, geo_only):
-        if lower not in windows:
-            windows.append(lower)
-        # the third window fails every time, so retries are exhausted on it
-        if windows.index(lower) == 2:
-            raise httpx.ReadTimeout("")
-        return [lotek_position]
-
-    mocker.patch("app.actions.client.get_positions", new=get_positions)
-
-    result = await action_pull_observations(lotek_integration, pull_config)
-
-    assert mock_send.call_count >= 1, "successful chunks were discarded"
-    assert result["devices_failed"] == ["1"]
-    # The cursor must land exactly on the end of the second (last successful) 7-day
-    # window — i.e. ~16 days ago with a 30-day lookback — NOT at present_time, which
-    # would silently skip the failed window forever.
-    checkpoint = datetime.fromisoformat(mock_set_state.call_args_list[0].args[2]["updated_at"])
-    expected = datetime.now(timezone.utc) - timedelta(days=30) + timedelta(days=14)
-    assert abs((checkpoint - expected).total_seconds()) < 300, (
-        f"cursor at {checkpoint}, expected the last successful window's end ~{expected}"
-    )
 
 
 @pytest.mark.asyncio
@@ -539,7 +497,7 @@ async def test_action_pull_observations_retries_transient_timeout(
     result = await action_pull_observations(lotek_integration, pull_config)
 
     assert len(attempts) == 2, "the transient timeout should have been retried"
-    assert result == {"observations_extracted": 1, "devices_failed": []}
+    assert result == {"observations_extracted": 1, "devices_failed": [], "devices_deferred": []}
 
 
 @pytest.mark.asyncio
@@ -677,28 +635,23 @@ async def test_action_pull_observations_quiet_device_unaffected_by_logging_failu
 
 
 @pytest.mark.asyncio
-async def test_action_pull_observations_delivers_partial_chunks_when_transform_fails(
+async def test_action_pull_observations_isolates_transform_failure_to_the_device(
     mocker, lotek_integration, pull_config, mock_redis, lotek_position
 ):
-    # A transform failure on a later chunk is a per-device failure like any other:
-    # chunks already fetched must still be delivered and checkpointed.
+    # A malformed payload (transform blows up) is a per-device, fetch-class
+    # failure: the device is marked failed and the devices behind it still run.
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     mocker.patch("app.services.state.redis", mock_redis)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
-    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1")))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2")))
     mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
     mock_send = mocker.patch("app.services.gundi.send_observations_to_gundi", new=AsyncMock())
-    pull_config.default_lookback_days = 30
-
-    windows = []
 
     async def get_positions(device_id, auth, integration, lower, upper, geo_only):
-        if lower not in windows:
-            windows.append(lower)
-        if windows.index(lower) == 2:
+        if device_id == "1":
             return None  # malformed response: filter_and_transform will blow up iterating
         return [lotek_position]
 
@@ -707,7 +660,28 @@ async def test_action_pull_observations_delivers_partial_chunks_when_transform_f
     result = await action_pull_observations(lotek_integration, pull_config)
 
     assert result["devices_failed"] == ["1"]
-    assert mock_send.call_count >= 1, "chunks fetched before the transform failure were discarded"
+    assert mock_send.call_count == 1, "the device behind the malformed one was not delivered"
+
+
+@pytest.mark.asyncio
+async def test_malformed_data_failure_logs_error_not_warning(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: malformed/unparseable data is a permanent, code/data-shape
+    # problem — not Lotek being slow — and must stay ERROR so it can alert,
+    # unlike a transient timeout (WARNING, see
+    # test_transient_fetch_failure_logs_warning_not_error). The demotion to
+    # WARNING was only ever meant for transient fetch timeouts.
+    get_positions, _, _, log = _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
+
+    async def get_positions_side_effect(device_id, *args, **kwargs):
+        return None if device_id == "1" else []  # device 1: malformed; device 2: fine
+
+    get_positions.side_effect = get_positions_side_effect
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_failed"] == ["1"]
+    device_logs = [c for c in log.await_args_list if "Device: 1" in c.kwargs.get("title", "")]
+    assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
 
 
 @pytest.mark.asyncio
@@ -789,4 +763,686 @@ async def test_action_pull_observations_retries_token_expiry_and_recovers(
     result = await action_pull_observations(lotek_integration, pull_config)
 
     assert len(attempts) == 2, "token expiry was not retried"
-    assert result == {"observations_extracted": 1, "devices_failed": []}
+    assert result == {"observations_extracted": 1, "devices_failed": [], "devices_deferred": []}
+
+
+@pytest.mark.asyncio
+async def test_get_devices_failure_logs_exception_type_when_message_is_empty(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # httpx timeouts stringify to "" — the activity log must name the type,
+    # not render a bare "Exception: ".
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch(
+        "app.actions.client.get_devices",
+        new=AsyncMock(side_effect=httpx.ReadTimeout("")),
+    )
+    mock_log = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+    with pytest.raises(httpx.ReadTimeout):
+        await action_pull_observations(lotek_integration, pull_config)
+    title = mock_log.call_args.kwargs["title"]
+    assert "ReadTimeout" in title
+
+
+def test_retry_attempts_is_two():
+    # 3 attempts × 9 windows amplified Lotek's slowness into our own 9-min
+    # timeouts (GUNDI-5602). One retry still recovers token expiry.
+    assert RETRY_ATTEMPTS == 2
+
+
+# --- GUNDI-5602 head-pass tests -------------------------------------------
+
+
+def _setup_pull_mocks(mocker, mock_redis, devices, positions=None, saved_state=None):
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=devices))
+    get_positions = mocker.patch(
+        "app.actions.client.get_positions", new=AsyncMock(return_value=positions or [])
+    )
+    get_state = mocker.patch(
+        "app.services.state.IntegrationStateManager.get_state",
+        new=AsyncMock(return_value=saved_state or {}),
+    )
+    set_state = mocker.patch(
+        "app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None)
+    )
+    mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    log = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+    return get_positions, get_state, set_state, log
+
+
+@pytest.mark.asyncio
+async def test_head_pass_fetches_single_max_age_window_on_first_run(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # First run: ONE request per device covering [now - max_data_age_hours, now]
+    # — not a chunked walk over the whole lookback.
+    get_positions, _, _, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    await action_pull_observations(lotek_integration, pull_config)
+    assert get_positions.await_count == 1
+    start, end = get_positions.call_args.args[3], get_positions.call_args.args[4]
+    assert abs((end - start) - timedelta(hours=pull_config.max_data_age_hours)) < timedelta(minutes=1)
+
+
+@pytest.mark.asyncio
+async def test_first_run_opens_gap_from_lookback_to_freshness_floor(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    _, _, set_state, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    await action_pull_observations(lotek_integration, pull_config)
+    saved = set_state.call_args.args[2]
+    gap_span = saved["gap_end"] - saved["gap_start"]
+    expected = timedelta(days=pull_config.default_lookback_days) - timedelta(
+        hours=pull_config.max_data_age_hours
+    )
+    assert abs(gap_span - expected) < timedelta(minutes=1)
+
+
+@pytest.mark.asyncio
+async def test_no_gap_opened_when_lookback_fits_inside_max_age(mocker):
+    # Portal bounds (lookback >= 1 day > max_age <= 12h) make this unreachable
+    # via valid config, but the guard in _load_device_state must hold anyway —
+    # pin it at the unit level with construct() to bypass validation.
+    from app.actions.handlers import _load_device_state
+    from app.actions.configurations import PullObservationsConfig
+    mocker.patch(
+        "app.services.state.IntegrationStateManager.get_state",
+        new=AsyncMock(return_value={}),
+    )
+    config = PullObservationsConfig.construct(
+        default_lookback_days=1, max_data_age_hours=48, max_pdop=None
+    )
+    state, is_new = await _load_device_state(
+        "some-integration-id", "1", datetime.now(timezone.utc), config
+    )
+    assert is_new
+    assert not state.has_gap
+    assert state.gap_start is None and state.gap_end is None
+
+
+@pytest.mark.asyncio
+async def test_steady_state_advances_high_water_and_keeps_gap_closed(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # A device whose cursor is fresh (within max_age) head-fetches from its
+    # cursor (minus the late-upload overlap) and neither opens a gap nor
+    # drops anything.
+    recent = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    get_positions, _, set_state, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1"), saved_state={"high_water": recent}
+    )
+    result = await action_pull_observations(lotek_integration, pull_config)
+    start = get_positions.call_args.args[3]
+    from app.actions.handlers import HEAD_LATE_UPLOAD_OVERLAP
+    assert abs(
+        (datetime.now(timezone.utc) - start) - (timedelta(hours=2) + HEAD_LATE_UPLOAD_OVERLAP)
+    ) < timedelta(minutes=1)
+    saved = set_state.call_args.args[2]
+    assert saved.get("gap_start") is None
+    assert abs(datetime.now(timezone.utc) - saved["high_water"]) < timedelta(minutes=1), (
+        "high_water was not advanced to the queried upper bound"
+    )
+    assert result["devices_deferred"] == []
+    warning_titles = [
+        c.kwargs["title"] for c in log.await_args_list if c.kwargs["level"] == LogLevel.WARNING
+    ]
+    assert not any("stale" in t.lower() for t in warning_titles)
+
+
+@pytest.mark.asyncio
+async def test_stale_span_is_dropped_with_warning_and_not_added_to_gap(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Bounded staleness (agreed design decision): a cursor further back than max_age
+    # means that span is dropped permanently — WARNING with the range, gap unchanged.
+    # The WARNING is published only after the cursor actually advances (review
+    # finding: announcing it before the fetch misreported still-recoverable
+    # data as dropped).
+    stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    get_positions, _, set_state, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1"), saved_state={"high_water": stale}
+    )
+    await action_pull_observations(lotek_integration, pull_config)
+    start = get_positions.call_args.args[3]
+    assert abs(
+        (datetime.now(timezone.utc) - start) - timedelta(hours=pull_config.max_data_age_hours)
+    ) < timedelta(minutes=1)
+    saved = set_state.call_args.args[2]
+    assert saved.get("gap_start") is None  # NOT added to the gap
+    drop_warnings = [
+        c for c in log.await_args_list
+        if c.kwargs["level"] == LogLevel.WARNING and "Dropped stale range" in c.kwargs["title"]
+    ]
+    assert len(drop_warnings) == 1
+    assert "device 1" in drop_warnings[0].kwargs["title"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_updated_at_state_migrates_to_high_water(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    recent = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    get_positions, _, set_state, _ = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1"), saved_state={"updated_at": recent}
+    )
+    await action_pull_observations(lotek_integration, pull_config)
+    start = get_positions.call_args.args[3]
+    from app.actions.handlers import HEAD_LATE_UPLOAD_OVERLAP
+    assert abs(
+        (datetime.now(timezone.utc) - start) - (timedelta(hours=3) + HEAD_LATE_UPLOAD_OVERLAP)
+    ) < timedelta(minutes=1)
+    saved = set_state.call_args.args[2]
+    assert "high_water" in saved and saved.get("gap_start") is None
+
+
+@pytest.mark.asyncio
+async def test_transient_fetch_failure_logs_warning_not_error(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Health/alerting keys on ERROR count; recurring per-device timeouts must
+    # not mark the connection unhealthy. devices_failed already tracks them.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    get_positions, _, set_state, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1", "2")
+    )
+    get_positions.side_effect = [httpx.ReadTimeout("")] * RETRY_ATTEMPTS + [[]]
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_failed"] == ["1"]
+    device_1_logs = [
+        c for c in log.await_args_list if "Device: 1" in c.kwargs.get("title", "")
+    ]
+    assert device_1_logs and all(c.kwargs["level"] == LogLevel.WARNING for c in device_1_logs)
+
+
+@pytest.mark.asyncio
+async def test_failed_head_fetch_does_not_advance_high_water(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    recent = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    get_positions, _, set_state, _ = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1"), saved_state={"high_water": recent}
+    )
+    get_positions.side_effect = httpx.ReadTimeout("")
+    with pytest.raises(LotekException):
+        # single device, nothing serviced → the run-level failure raise
+        await action_pull_observations(lotek_integration, pull_config)
+    set_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delivery_failure_stays_error_and_does_not_advance_high_water(
+    mocker, lotek_integration, lotek_position, pull_config, mock_redis
+):
+    get_positions, _, set_state, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1", "2"), positions=[lotek_position]
+    )
+    mocker.patch(
+        "app.actions.handlers.gundi_tools.send_observations_to_gundi",
+        new=AsyncMock(side_effect=[Exception("boom"), None]),
+    )
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_failed"] == ["1"]
+    error_logs = [
+        c for c in log.await_args_list
+        if c.kwargs["level"] == LogLevel.ERROR and "delivering" in c.kwargs["title"].lower()
+    ]
+    assert len(error_logs) == 1
+    # only device 2's checkpoint was written
+    saved_devices = [c.args[3] for c in set_state.await_args_list]
+    assert saved_devices == ["2"]
+
+
+@pytest.mark.asyncio
+async def test_all_failed_run_raises_zero_progress(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # A run that services nothing and delivers nothing is systemic degradation —
+    # it must alert (raise/ERROR), not publish action_complete.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    get_positions, _, _, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
+    get_positions.side_effect = httpx.ReadTimeout("")
+    with pytest.raises(LotekException, match="No devices could be serviced"):
+        await action_pull_observations(lotek_integration, pull_config)
+
+
+@pytest.mark.asyncio
+async def test_zero_progress_run_raises_even_when_devices_were_only_deferred(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # A run that services nothing is systemic degradation — it must alert
+    # (ERROR/raise), not warn forever. Deferring every device counts.
+    _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
+    mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
+    with pytest.raises(LotekException, match="No devices could be serviced"):
+        await action_pull_observations(lotek_integration, pull_config)
+
+
+@pytest.mark.asyncio
+async def test_deadline_defers_remaining_devices_with_warning(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Past ~80% of the action budget we stop STARTING device work and exit in
+    # control — never via the asyncio.wait_for guillotine. Call order per
+    # device: should_stop() then _fetch_retry_kwargs(), hence the side_effect
+    # sequence [False(stop d1), False(retry d1), True(stop d2)].
+    _, _, _, log = _setup_pull_mocks(mocker, mock_redis, _devices("1", "2", "3"))
+    mocker.patch(
+        "app.actions.handlers._deadline_exceeded", side_effect=[False, False, True]
+    )
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_deferred"] == ["2", "3"]
+    assert result["devices_failed"] == []
+    deferral_logs = [
+        c for c in log.await_args_list
+        if c.kwargs["level"] == LogLevel.WARNING and "deadline" in c.kwargs["title"].lower()
+    ]
+    assert len(deferral_logs) == 1
+
+
+def test_retry_narrows_to_token_expiry_past_deadline(mocker):
+    # Past the soft deadline transport retries stop (no budget for slow
+    # backoff), but token expiry keeps its retry: the retry is a cheap
+    # re-auth, and dropping it broke the "token expiry recovers within the
+    # run" contract (review finding).
+    from app.actions.handlers import _fetch_retry_kwargs, RETRYABLE_ERRORS
+    from app.actions.client import LotekTokenExpiredException
+    mocker.patch("app.actions.handlers._deadline_exceeded", return_value=False)
+    assert _fetch_retry_kwargs(datetime.now(timezone.utc)) == {
+        "on": RETRYABLE_ERRORS, "attempts": RETRY_ATTEMPTS
+    }
+    mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
+    assert _fetch_retry_kwargs(datetime.now(timezone.utc)) == {
+        "on": LotekTokenExpiredException, "attempts": RETRY_ATTEMPTS
+    }
+
+
+def test_deadline_fraction_of_budget():
+    # 540s budget → soft deadline ~432s. Pin the fraction.
+    from app.actions.handlers import DEADLINE_FRACTION
+    assert DEADLINE_FRACTION == 0.8
+
+
+@pytest.mark.asyncio
+async def test_breaker_trips_after_three_consecutive_transport_failures(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # 3 consecutive timeouts = Lotek-wide degradation: stop early, defer the
+    # rest (WARNING), instead of grinding every device into the same wall.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    get_positions, _, _, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1", "2", "3", "4", "5")
+    )
+    # device 1 succeeds; 2,3,4 exhaust retries on timeouts; 5 must be deferred
+    get_positions.side_effect = [[]] + [httpx.ReadTimeout("")] * (3 * RETRY_ATTEMPTS)
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_failed"] == ["2", "3", "4"]
+    assert result["devices_deferred"] == ["5"]
+    breaker_logs = [
+        c for c in log.await_args_list
+        if c.kwargs["level"] == LogLevel.WARNING and "circuit breaker" in c.kwargs["title"].lower()
+    ]
+    assert len(breaker_logs) == 1
+
+
+@pytest.mark.asyncio
+async def test_breaker_counter_resets_on_success(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Failures interleaved with successes are per-device noise, not an outage.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    get_positions, _, _, _ = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1", "2", "3", "4", "5")
+    )
+    fail = [httpx.ReadTimeout("")] * RETRY_ATTEMPTS
+    get_positions.side_effect = fail + [[]] + fail + [[]] + fail  # F S F S F
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_deferred"] == []
+    assert result["devices_failed"] == ["1", "3", "5"]
+
+
+@pytest.mark.asyncio
+async def test_head_pass_triggers_backfill_when_gap_open_and_lease_free(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # First run on default config opens a gap → backfill must be triggered.
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    await action_pull_observations(lotek_integration, pull_config)
+    trigger.assert_awaited_once()
+    args, kwargs = trigger.await_args
+    assert args[:2] == (str(lotek_integration.id), "backfill_observations")
+    # A fieldless config would serialize to an empty dict — indistinguishable
+    # from "no override" and 404s in execute_action before the handler runs.
+    config = kwargs.get("config") or args[2]
+    assert config.dict() != {}
+
+
+@pytest.mark.asyncio
+async def test_head_pass_does_not_trigger_backfill_when_lease_held(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    # per-device state reads return {}, but the lease key reads as held
+    mocker.patch(
+        "app.services.state.IntegrationStateManager.get_state",
+        new=AsyncMock(side_effect=lambda i, a, s="no-source": "1" if s == "lease" else {}),
+    )
+    await action_pull_observations(lotek_integration, pull_config)
+    trigger.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_head_pass_does_not_trigger_backfill_without_gaps(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"), saved_state={"high_water": recent})
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    await action_pull_observations(lotek_integration, pull_config)
+    trigger.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_trigger_failure_does_not_fail_the_head_pass(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    mocker.patch(
+        "app.actions.handlers.trigger_action", new=AsyncMock(side_effect=Exception("pubsub down"))
+    )
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_failed"] == []
+
+
+def test_backfill_action_is_discovered_but_internal():
+    from app.actions.core import discover_actions, InternalActionConfiguration
+    handlers = discover_actions(module_name="app.actions.handlers", prefix="action_")
+    assert "backfill_observations" in handlers
+    _, config_model, _ = handlers["backfill_observations"]
+    assert issubclass(config_model, InternalActionConfiguration)
+
+
+# --- Fable-5 review fix round -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stale_drop_publish_failure_does_not_stall_the_device(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: the stale-drop WARNING publish was the only activity
+    # publish on the fetch path without a guard — a degraded pubsub must not
+    # keep a stale device from ever advancing its cursor.
+    stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    get_positions, _, set_state, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1"), saved_state={"high_water": stale}
+    )
+
+    async def flaky_publish(**kwargs):
+        if "Dropped stale range" in kwargs.get("title", ""):
+            raise Exception("pubsub down")
+
+    log.side_effect = flaky_publish
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_failed"] == []
+    saved = set_state.call_args.args[2]
+    assert abs(datetime.now(timezone.utc) - saved["high_water"]) < timedelta(minutes=1)
+
+
+@pytest.mark.asyncio
+async def test_unparseable_state_reset_is_surfaced_at_warning(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: discarding a cursor and re-importing the whole lookback
+    # was announced only at DEBUG. It must be visible in the activity log.
+    get_positions, _, _, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1"), saved_state={"high_water": "not-a-date"}
+    )
+    await action_pull_observations(lotek_integration, pull_config)
+    reset_warnings = [
+        c for c in log.await_args_list
+        if c.kwargs["level"] == LogLevel.WARNING and "unparseable" in c.kwargs["title"].lower()
+    ]
+    assert len(reset_warnings) == 1
+    assert "device 1" in reset_warnings[0].kwargs["title"]
+
+
+@pytest.mark.asyncio
+async def test_head_pass_save_does_not_clobber_concurrently_closed_gap(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding (lost-update race): the head pass must persist only the
+    # fields it owns (high_water). If a concurrent backfill closed the gap
+    # between our load and our save, the closed gap must survive our write.
+    now = datetime.now(timezone.utc)
+    open_gap_state = {
+        "high_water": (now - timedelta(hours=2)).isoformat(),
+        "gap_start": (now - timedelta(days=7)).isoformat(),
+        "gap_end": (now - timedelta(hours=12)).isoformat(),
+    }
+    gap_closed_state = {
+        "high_water": (now - timedelta(hours=2)).isoformat(),
+        "gap_start": None,
+        "gap_end": None,
+        "last_backfilled": now.isoformat(),
+    }
+    get_positions, get_state, set_state, _ = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1")
+    )
+    # 1st read = the head pass loading its snapshot (gap open);
+    # 2nd read = the merge-save re-read (backfill closed the gap meanwhile).
+    get_state.side_effect = [open_gap_state, gap_closed_state]
+    await action_pull_observations(lotek_integration, pull_config)
+    saved = set_state.call_args.args[2]
+    assert saved.get("gap_start") is None and saved.get("gap_end") is None, (
+        "the head pass resurrected a gap a concurrent backfill had closed"
+    )
+    assert abs(datetime.now(timezone.utc) - saved["high_water"]) < timedelta(minutes=1)
+
+
+@pytest.mark.asyncio
+async def test_stale_first_run_save_does_not_resurrect_a_gap_closed_meanwhile(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: two overlapping head runs both load is_new=True; the
+    # faster one births the document and its triggered backfill closes the
+    # gap (gap keys stored as null — present). The slower run's save must not
+    # resurrect the gap from its stale snapshot: gap birth is create-only,
+    # and a key present as null counts as present.
+    now = datetime.now(timezone.utc)
+    gap_closed_doc = {
+        "version": 1,
+        "high_water": (now - timedelta(minutes=5)).isoformat(),
+        "gap_start": None,
+        "gap_end": None,
+        "last_backfilled": now.isoformat(),
+    }
+    _, get_state, set_state, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    # 1st read = this run loading state (absent → is_new, gap birthed in memory);
+    # 2nd read = the merge-save re-read (the faster run + backfill already ran).
+    get_state.side_effect = [{}, gap_closed_doc]
+    await action_pull_observations(lotek_integration, pull_config)
+    saved = set_state.call_args.args[2]
+    assert saved.get("gap_start") is None and saved.get("gap_end") is None, (
+        "a stale is_new save resurrected a gap a backfill had already closed"
+    )
+    assert abs(datetime.now(timezone.utc) - saved["high_water"]) < timedelta(minutes=1), (
+        "high_water must still be overwritten by the head save"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_first_run_save_does_not_rewind_an_advanced_gap(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Same race, gap still open: the faster run's backfill advanced gap_start
+    # past some drained windows. The slower run's create-only gap birth must
+    # leave the advanced value alone instead of rewinding to the full lookback.
+    now = datetime.now(timezone.utc)
+    advanced_start = (now - timedelta(days=3)).isoformat()
+    gap_end = (now - timedelta(hours=12)).isoformat()
+    gap_advanced_doc = {
+        "version": 1,
+        "high_water": (now - timedelta(minutes=5)).isoformat(),
+        "gap_start": advanced_start,
+        "gap_end": gap_end,
+    }
+    _, get_state, set_state, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    get_state.side_effect = [{}, gap_advanced_doc]
+    await action_pull_observations(lotek_integration, pull_config)
+    saved = set_state.call_args.args[2]
+    assert saved["gap_start"] == advanced_start, (
+        "a stale is_new save rewound gap_start to its full-lookback snapshot"
+    )
+    assert saved["gap_end"] == gap_end
+
+
+# --- chrisdoehring review fix round ------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lotek_5xx_failures_feed_the_circuit_breaker(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: LotekException (e.g. a 503 during a Lotek-wide outage)
+    # fell into the generic handler, which RESET the breaker streak — an
+    # HTTP-error outage could never trip the breaker and the run ground
+    # through every device. 5xx/429 must arm the breaker like timeouts.
+    from app.actions.handlers import BREAKER_THRESHOLD
+    get_positions, _, _, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1", "2", "3", "4", "5")
+    )
+    get_positions.side_effect = LotekException(message="down", status_code=503)
+    with pytest.raises(LotekException, match="No devices could be serviced"):
+        await action_pull_observations(lotek_integration, pull_config)
+    # breaker trips after 3 consecutive 503s; devices 4 and 5 are deferred
+    deferral_logs = [
+        c for c in log.await_args_list
+        if "circuit breaker" in c.kwargs.get("title", "").lower()
+    ]
+    assert len(deferral_logs) == 1
+    assert get_positions.await_count == BREAKER_THRESHOLD
+    # outage failures are WARNINGs (transient), not ERRORs
+    device_logs = [c for c in log.await_args_list if "Device:" in c.kwargs.get("title", "")]
+    assert device_logs and all(c.kwargs["level"] == LogLevel.WARNING for c in device_logs)
+
+
+@pytest.mark.asyncio
+async def test_lotek_4xx_failure_stays_error_and_does_not_feed_breaker(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # The 4xx side of the same finding: a per-device API-contract problem is
+    # permanent — ERROR, and it must break (not feed) the breaker streak.
+    get_positions, _, _, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1", "2", "3", "4")
+    )
+    get_positions.side_effect = LotekException(message="bad request", status_code=404)
+    with pytest.raises(LotekException, match="No devices could be serviced"):
+        await action_pull_observations(lotek_integration, pull_config)
+    assert get_positions.await_count == 4, "4xx failures must not trip the breaker"
+    device_logs = [c for c in log.await_args_list if "Device:" in c.kwargs.get("title", "")]
+    assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
+
+
+@pytest.mark.asyncio
+async def test_head_pass_services_least_fresh_devices_first(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: deferral always cut the same stable-ordered tail, so
+    # under sustained slowness the tail devices starved until bounded
+    # staleness dropped their data permanently. The head pass now orders
+    # least-fresh first (mirroring the backfill's LRS fairness).
+    now = datetime.now(timezone.utc)
+    states = {
+        "fresh": {"high_water": (now - timedelta(minutes=10)).isoformat()},
+        "stale": {"high_water": (now - timedelta(hours=10)).isoformat()},
+        "middle": {"high_water": (now - timedelta(hours=5)).isoformat()},
+    }
+    get_positions, get_state, _, _ = _setup_pull_mocks(
+        mocker, mock_redis, _devices("fresh", "stale", "middle")
+    )
+    get_state.side_effect = lambda i, a, d: states.get(d, {})
+    await action_pull_observations(lotek_integration, pull_config)
+    order = [c.args[0] for c in get_positions.await_args_list]
+    assert order == ["stale", "middle", "fresh"]
+
+
+@pytest.mark.asyncio
+async def test_stale_legacy_cursor_migrates_into_gap_not_permanent_drop(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: on upgrade day a legacy cursor more than
+    # max_data_age_hours behind got no gap — the owed range was dropped
+    # permanently, though the pre-5602 walk would have recovered it. A stale
+    # legacy cursor now carries its owed range over as the device's gap.
+    behind = datetime.now(timezone.utc) - timedelta(days=3)
+    get_positions, _, set_state, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1"), saved_state={"updated_at": behind.isoformat()}
+    )
+    result = await action_pull_observations(lotek_integration, pull_config)
+    saved = set_state.call_args.args[2]
+    assert abs(saved["gap_start"] - behind) < timedelta(seconds=1), (
+        "the owed range's start must be the legacy cursor"
+    )
+    floor = datetime.now(timezone.utc) - timedelta(hours=pull_config.max_data_age_hours)
+    assert abs(saved["gap_end"] - floor) < timedelta(minutes=1)
+    assert abs(saved["high_water"] - datetime.now(timezone.utc)) < timedelta(minutes=1)
+    # nothing was dropped, so no drop warning
+    assert not any(
+        "stale range" in c.kwargs.get("title", "").lower() for c in log.await_args_list
+    )
+    assert result["observations_extracted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_no_stale_drop_warning_when_the_fetch_fails(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: the drop WARNING was published before the fetch, so a
+    # failing device produced contradictory "permanently dropped" reports for
+    # data that was still recoverable. No cursor advance → no drop warning.
+    stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    get_positions, _, set_state, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1"), saved_state={"high_water": stale}
+    )
+    get_positions.side_effect = httpx.ReadTimeout("")
+    with pytest.raises(LotekException, match="No devices could be serviced"):
+        await action_pull_observations(lotek_integration, pull_config)
+    set_state.assert_not_awaited()
+    assert not any(
+        "stale range" in c.kwargs.get("title", "").lower() for c in log.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_error_publish_failure_stays_contained_to_the_device(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Review finding: the activity publish inside _fetch_window's error
+    # handlers was unguarded — a pubsub blip escaped the per-device isolation
+    # and reset the breaker streak with a failure that says nothing about
+    # Lotek. It must be best-effort like the other per-device publishes.
+    get_positions, _, _, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1", "2")
+    )
+    get_positions.side_effect = [httpx.ReadTimeout(""), httpx.ReadTimeout(""), []]
+
+    async def flaky_publish(**kwargs):
+        if "Error fetching positions" in kwargs.get("title", ""):
+            raise Exception("pubsub down")
+
+    log.side_effect = flaky_publish
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["devices_failed"] == ["1"]
+    assert get_positions.await_count == 3, "device 2 was never serviced"

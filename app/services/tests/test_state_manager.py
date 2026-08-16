@@ -3,7 +3,7 @@ import json
 
 import pytest
 from app.conftest import async_return
-from app.services.state import IntegrationStateManager
+from app.services.state import IntegrationStateManager, _MERGE_STATE_SCRIPT
 
 
 @pytest.mark.asyncio
@@ -113,6 +113,56 @@ async def test_set_if_absent(mocker, mock_redis, integration_v2):
         ttl_seconds=3600,
     )
     assert was_set is False
+
+
+@pytest.mark.asyncio
+async def test_merge_state_fields_executes_atomic_lua(mocker, mock_redis, integration_v2):
+    mocker.patch("app.services.state.redis", mock_redis)
+    mock_redis.Redis.return_value.eval.return_value = async_return(1)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+    updates = {"high_water": "2026-08-14T01:02:03+00:00", "gap_start": None}
+
+    await state_manager.merge_state_fields(
+        integration_id=integration_id,
+        action_id="pull_observations",
+        source_id="device-123",
+        updates=updates,
+    )
+
+    mock_redis.Redis.return_value.eval.assert_called_once_with(
+        _MERGE_STATE_SCRIPT,
+        1,
+        f"integration_state.{integration_id}.pull_observations.device-123",
+        json.dumps(updates, default=str),
+        json.dumps({}, default=str),
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_state_fields_passes_init_only_fields(mocker, mock_redis, integration_v2):
+    mocker.patch("app.services.state.redis", mock_redis)
+    mock_redis.Redis.return_value.eval.return_value = async_return(1)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+    updates = {"high_water": "2026-08-14T01:02:03+00:00"}
+    init_only = {"gap_start": "2026-08-01T00:00:00+00:00", "gap_end": "2026-08-10T00:00:00+00:00"}
+
+    await state_manager.merge_state_fields(
+        integration_id=integration_id,
+        action_id="pull_observations",
+        source_id="device-123",
+        updates=updates,
+        init_only=init_only,
+    )
+
+    mock_redis.Redis.return_value.eval.assert_called_once_with(
+        _MERGE_STATE_SCRIPT,
+        1,
+        f"integration_state.{integration_id}.pull_observations.device-123",
+        json.dumps(updates, default=str),
+        json.dumps(init_only, default=str),
+    )
 
 
 @pytest.mark.asyncio
