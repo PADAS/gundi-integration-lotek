@@ -30,6 +30,19 @@ def _emulate_atomic_state_merge(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _reset_shared_http_client():
+    # client.py caches one shared httpx.AsyncClient in a module global. Reset
+    # it around every test so (a) a test's `mocker.patch(...httpx.AsyncClient)`
+    # mock is never cached and leaked into later tests, and (b) no real client
+    # outlives the pytest-asyncio event loop it was created on.
+    import app.actions.client as lotek_client
+
+    lotek_client._client = None
+    yield
+    lotek_client._client = None
+
+
+@pytest.fixture(autouse=True)
 def _zero_retry_waits(monkeypatch):
     # Retry-path tests otherwise sleep through real stamina backoff (minutes
     # over the suite, enough to blow a CI step timeout — review finding).

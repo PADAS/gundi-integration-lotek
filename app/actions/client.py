@@ -18,6 +18,37 @@ CREDENTIAL_REJECTION_STATUSES = frozenset({400, 401, 403})
 logger = logging.getLogger(__name__)
 state_manager = IntegrationStateManager()
 
+# One shared client for all Lotek requests, instead of a fresh AsyncClient per
+# call. get_positions runs once per device per window (hundreds of devices on
+# the big integrations), and building a client per call meant a fresh
+# DNS + TCP + TLS handshake every time — the dominant source of outbound
+# connection-acquisition failures in prod (GUNDI-5620). Same lazy
+# getter/closer pattern as webhooks._get_diagnostic_client; closed from the
+# FastAPI lifespan.
+# Cookie note: the client is shared across integrations (different Lotek
+# accounts). Lotek auth is header-only (Bearer); the API sets only Azure
+# load-balancer affinity cookies (ARRAffinity*), which carry no account or
+# session identity (verified 2026-08-17). Re-verify if Lotek ever moves to
+# cookie sessions.
+_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=30.0, write=15.0, pool=5.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _client
+
+
+async def close_client() -> None:
+    global _client
+    if _client is not None:
+        await _client.aclose()
+        _client = None
+
 
 class LotekException(Exception):
     def __init__(self, message: str, error: Optional[Exception] = None, status_code: int = 500):
@@ -113,25 +144,25 @@ async def get_token_from_api(integration, auth):
         "username": auth.username,
         "password": auth.password.get_secret_value()
     }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=30.0, write=15.0, pool=5.0)) as session:
-        try:
-            base_url = integration.base_url or 'https://webservice.lotek.com/API'
-            response = await session.post(base_url + "/user/login", data=params)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as ex:
-            msg = f'Lotek login failed for user {auth.username}. Caught exception: {ex}'
-            status_code = ex.response.status_code
-            if status_code in CREDENTIAL_REJECTION_STATUSES:
-                # A rejected login is an integration-wide credentials problem, not a
-                # per-device blip, and callers abort the whole run on it. Lotek answers
-                # a bad login with 400. Server errors and rate limits are NOT credential
-                # problems — reporting them as such would tell operators their password
-                # is wrong when Lotek is merely down.
-                raise LotekUnauthorizedException(message=msg, error=ex, status_code=status_code)
-            raise LotekException(message=msg, error=ex, status_code=status_code)
-        else:
-            data = response.json()
-            return data.get('access_token', None)
+    session = _get_client()
+    try:
+        base_url = integration.base_url or 'https://webservice.lotek.com/API'
+        response = await session.post(base_url + "/user/login", data=params)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as ex:
+        msg = f'Lotek login failed for user {auth.username}. Caught exception: {ex}'
+        status_code = ex.response.status_code
+        if status_code in CREDENTIAL_REJECTION_STATUSES:
+            # A rejected login is an integration-wide credentials problem, not a
+            # per-device blip, and callers abort the whole run on it. Lotek answers
+            # a bad login with 400. Server errors and rate limits are NOT credential
+            # problems — reporting them as such would tell operators their password
+            # is wrong when Lotek is merely down.
+            raise LotekUnauthorizedException(message=msg, error=ex, status_code=status_code)
+        raise LotekException(message=msg, error=ex, status_code=status_code)
+    else:
+        data = response.json()
+        return data.get('access_token', None)
 
 async def get_devices(integration, auth):
     try:
@@ -141,10 +172,10 @@ async def get_devices(integration, auth):
             'Accept': 'application/json',
             'Content-Type': 'application/json'
         }
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=30.0, write=15.0, pool=5.0)) as session:
-            base_url = integration.base_url or 'https://webservice.lotek.com/API'
-            response = await session.get(base_url + "/devices", headers=headers)
-            response.raise_for_status()
+        session = _get_client()
+        base_url = integration.base_url or 'https://webservice.lotek.com/API'
+        response = await session.get(base_url + "/devices", headers=headers)
+        response.raise_for_status()
     except httpx.HTTPStatusError as ex:
         if ex.response.status_code == 401:
             msg = "Received status code 401 - Token expired, fetching a new one..."
@@ -181,38 +212,38 @@ async def get_positions(device_id, auth, integration, start_datetime=None, end_d
         'to': _to_utc(end_datetime).strftime('%Y-%m-%dT%H:%M:%S+0000')
     }
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=30.0, write=15.0, pool=5.0)) as session:
-        try:
-            logger.debug('Getting positions for user: %s, params: %s', auth.username, params)
-            base_url = integration.base_url or 'https://webservice.lotek.com/API'
-            response = await session.get(base_url + "/positions/findByUploadDate", params=params, headers=headers)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as ex:
-            if ex.response.status_code == 400:
-                logger.info("Received status code 400 - Lotek throws this when there are no data")
-                return []
-            if ex.response.status_code == 401:
-                msg = "Received status code 401 - Token expired, fetching a new one..."
-                logger.info(msg)
-                await state_manager.delete_state(
-                    str(integration.id),
-                    "pull_observations",
-                    "token"
-                )
-                raise LotekTokenExpiredException(message=f"401 Response from Lotek API", error=ex)
-
-            msg = f'Lotek get_positions failed for user {auth.username}. Caught exception: {ex}'
-            logger.exception(
-                msg,
-                extra={
-                    "attention_needed": True,
-                    "device_id": str(device_id),
-                    "integration_type": "lotek"
-                }
+    session = _get_client()
+    try:
+        logger.debug('Getting positions for user: %s, params: %s', auth.username, params)
+        base_url = integration.base_url or 'https://webservice.lotek.com/API'
+        response = await session.get(base_url + "/positions/findByUploadDate", params=params, headers=headers)
+        response.raise_for_status()
+    except httpx.HTTPStatusError as ex:
+        if ex.response.status_code == 400:
+            logger.info("Received status code 400 - Lotek throws this when there are no data")
+            return []
+        if ex.response.status_code == 401:
+            msg = "Received status code 401 - Token expired, fetching a new one..."
+            logger.info(msg)
+            await state_manager.delete_state(
+                str(integration.id),
+                "pull_observations",
+                "token"
             )
-            raise LotekException(status_code=ex.response.status_code, error=ex, message=msg)
-        else:
-            positions = response.json()
-            logger.debug('Got %d positions using params=%s', len(positions), params)
-            results = [LotekPosition(**position) for position in positions if not (geo_only and (position['Latitude'] == 0 or position['Longitude'] == 0))]
-            return results
+            raise LotekTokenExpiredException(message=f"401 Response from Lotek API", error=ex)
+
+        msg = f'Lotek get_positions failed for user {auth.username}. Caught exception: {ex}'
+        logger.exception(
+            msg,
+            extra={
+                "attention_needed": True,
+                "device_id": str(device_id),
+                "integration_type": "lotek"
+            }
+        )
+        raise LotekException(status_code=ex.response.status_code, error=ex, message=msg)
+    else:
+        positions = response.json()
+        logger.debug('Got %d positions using params=%s', len(positions), params)
+        results = [LotekPosition(**position) for position in positions if not (geo_only and (position['Latitude'] == 0 or position['Longitude'] == 0))]
+        return results

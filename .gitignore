@@ -138,3 +138,4 @@ dmypy.json
 sample-docs
 local/docker-compose.override.yml
 local/.env
+local/.env.prod-peninsula

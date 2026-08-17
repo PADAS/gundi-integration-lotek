@@ -17,13 +17,12 @@ from app.actions.client import (
 
 def _make_mock_client(response=None, raise_exc=None, method="post"):
     """
-    Helper that returns an AsyncMock usable as `httpx.AsyncClient` context manager.
-    If `raise_exc` is provided, the given method will raise it; otherwise it will
-    return `response`.
+    Helper that returns an AsyncMock standing in for the shared httpx.AsyncClient
+    (client.py uses a plain module-level client via _get_client(), not a context
+    manager). If `raise_exc` is provided, the given method will raise it;
+    otherwise it will return `response`.
     """
     mock_client = AsyncMock()
-    mock_client.__aenter__.return_value = mock_client
-    mock_client.__aexit__.return_value = None
     if raise_exc is not None:
         getattr(mock_client, method).side_effect = raise_exc
     else:
@@ -174,3 +173,39 @@ async def test_get_token_from_api_server_failure_is_not_unauthorized(mocker, lot
     with pytest.raises(LotekException) as excinfo:
         await get_token_from_api(lotek_integration, auth_config)
     assert not isinstance(excinfo.value, LotekUnauthorizedException)
+
+
+@pytest.mark.asyncio
+async def test_shared_client_is_constructed_once_and_reused(mocker, lotek_integration, auth_config):
+    # The whole point of GUNDI-5620: hundreds of get_positions calls per run
+    # must share ONE client (one connection pool, one set of TLS handshakes),
+    # not build one each. Construction count is the observable contract.
+    from app.actions import client as lotek_client
+
+    resp_devices = httpx.Response(200, json=[], request=httpx.Request("GET", lotek_integration.base_url))
+    resp_positions = httpx.Response(200, json=[], request=httpx.Request("GET", lotek_integration.base_url))
+    mock_client = AsyncMock()
+    mock_client.get.side_effect = [resp_devices, resp_positions, resp_positions]
+    constructor = mocker.patch("app.actions.client.httpx.AsyncClient", return_value=mock_client)
+    mocker.patch.object(lotek_client.state_manager, "get_state", AsyncMock(return_value={"token": "abc123"}))
+
+    await get_devices(lotek_integration, auth_config)
+    await get_positions(1, auth_config, lotek_integration)
+    await get_positions(2, auth_config, lotek_integration)
+
+    assert constructor.call_count == 1
+    assert mock_client.get.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_close_client_closes_and_clears_the_singleton(mocker):
+    from app.actions import client as lotek_client
+
+    mock_client = AsyncMock()
+    mocker.patch("app.actions.client.httpx.AsyncClient", return_value=mock_client)
+
+    assert lotek_client._get_client() is mock_client
+    await lotek_client.close_client()
+
+    mock_client.aclose.assert_awaited_once()
+    assert lotek_client._client is None
