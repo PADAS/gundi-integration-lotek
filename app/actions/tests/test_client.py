@@ -17,13 +17,12 @@ from app.actions.client import (
 
 def _make_mock_client(response=None, raise_exc=None, method="post"):
     """
-    Helper that returns an AsyncMock usable as `httpx.AsyncClient` context manager.
-    If `raise_exc` is provided, the given method will raise it; otherwise it will
-    return `response`.
+    Helper that returns an AsyncMock standing in for the shared httpx.AsyncClient
+    (client.py uses a plain module-level client via _get_client(), not a context
+    manager). If `raise_exc` is provided, the given method will raise it;
+    otherwise it will return `response`.
     """
     mock_client = AsyncMock()
-    mock_client.__aenter__.return_value = mock_client
-    mock_client.__aexit__.return_value = None
     if raise_exc is not None:
         getattr(mock_client, method).side_effect = raise_exc
     else:
