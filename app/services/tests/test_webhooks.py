@@ -151,7 +151,7 @@ async def test_get_integration_handles_config_manager_exception(
     mock_config_manager.get_integration_details = AsyncMock(side_effect=Exception("Config manager error"))
     
     # Mock the publish_event function
-    mocker.patch("app.services.webhooks.publish_event", mock_publish_event)
+    mocker.patch("app.services.webhooks._publish_activity_event", mock_publish_event)
     
     from app.services.webhooks import get_integration
     from fastapi import Request
@@ -363,7 +363,7 @@ async def test_process_webhook_handles_gundi_api_failure_gracefully(
     mocker.patch("app.services.webhooks.config_manager", config_manager)
     
     # Mock publish_event to capture the error event
-    mocker.patch("app.services.webhooks.publish_event", mock_publish_event)
+    mocker.patch("app.services.webhooks._publish_activity_event", mock_publish_event)
     
     from app.services.webhooks import get_integration
     from fastapi import Request

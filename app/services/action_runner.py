@@ -21,7 +21,7 @@ from app.actions.core import PullActionConfiguration
 from .config_manager import IntegrationConfigurationManager
 from .state import IntegrationStateManager
 from .utils import find_config_for_action
-from .activity_logger import publish_event, log_action_activity
+from .activity_logger import _publish_activity_event, log_action_activity
 
 _portal = GundiClient()
 config_manager = IntegrationConfigurationManager()
@@ -88,8 +88,12 @@ async def _handle_error(
             "server_response_body": str(getattr(response, "text", getattr(response, "content", None)) or "")
         })
 
-    # Publish the error event
-    await publish_event(
+    # Publish the error event. Best-effort: under the exact congestion this
+    # handler reports on, a raising publish here would escape execute_action,
+    # 500 the route, and (on the pubsub-push path) redeliver → re-run the
+    # action during congestion. The JSONResponse below still carries the full
+    # error_details either way (review finding).
+    await _publish_activity_event(
         event=IntegrationActionFailed(
             payload=ActionExecutionFailed(**error_details)
         ),

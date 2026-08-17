@@ -919,12 +919,19 @@ async def test_stale_span_is_dropped_with_warning_and_not_added_to_gap(
     ) < timedelta(minutes=1)
     saved = set_state.call_args.args[2]
     assert saved.get("gap_start") is None  # NOT added to the gap
-    # Local-log only (publish-volume fix): migration days fire this for
-    # hundreds of devices in one run.
+    # Per-device detail is local-log only (publish-volume fix), but permanent
+    # loss stays portal-visible as ONE aggregated end-of-run summary.
     drop_warnings = [r.message for r in caplog.records if "Dropped stale range" in r.message]
     assert len(drop_warnings) == 1
     assert "device 1" in drop_warnings[0]
     assert not any("Dropped stale range" in c.kwargs.get("title", "") for c in log.await_args_list)
+    summaries = [
+        c for c in log.await_args_list
+        if "Dropped data older than" in c.kwargs.get("title", "")
+    ]
+    assert len(summaries) == 1
+    assert summaries[0].kwargs["level"] == LogLevel.WARNING
+    assert "1" in summaries[0].kwargs["title"]
 
 
 @pytest.mark.asyncio

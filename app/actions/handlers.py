@@ -314,6 +314,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     # backfill this cycle. Self-correcting: the next run's head pass reaches it
     # and triggers then, same as the worst-case import delay the design accepts.
     any_open_gap = False
+    stale_drops = []
     for i, (device, state, is_new) in enumerate(device_states):
         if reason := guards.should_stop():
             deferred_devices = [d.nDeviceID for d, _, _ in device_states[i:]]
@@ -321,7 +322,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             break
         try:
             sent, device_failed, transport_failure = await _head_pass_device(
-                device, state, is_new, integration, auth, action_config, present_time, guards
+                device, state, is_new, integration, auth, action_config, present_time, guards,
+                stale_drops=stale_drops
             )
         except LotekUnauthorizedException:
             raise
@@ -358,6 +360,24 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             f"Pulled observations with {len(failed_devices)} of {len(device_list)} device(s) "
             f"failing for integration {integration.id}: {_summarize_ids(failed_devices)}. "
             f"They will be retried on the next run."
+        )
+        logger.warning(message)
+        await log_action_activity(
+            integration_id=str(integration.id),
+            action_id="pull_observations",
+            title=message,
+            level=LogLevel.WARNING
+        )
+
+    if stale_drops:
+        # Permanent data loss must stay visible in the portal: one aggregated
+        # WARNING per run instead of the old per-device publish (review
+        # finding on the publish-volume fix). Per-device ranges are in the
+        # local log.
+        message = (
+            f"Dropped data older than max_data_age_hours={action_config.max_data_age_hours} "
+            f"permanently for {len(stale_drops)} device(s) on integration {integration.id}: "
+            f"{_summarize_ids(stale_drops)}. See the application log for per-device ranges."
         )
         logger.warning(message)
         await log_action_activity(
@@ -579,7 +599,7 @@ async def _deliver(cdip_positions, device, integration, action_id):
     return observations_sent, False
 
 
-async def _head_pass_device(device, state, is_new, integration, auth, action_config, present_time, guards):
+async def _head_pass_device(device, state, is_new, integration, auth, action_config, present_time, guards, stale_drops=None):
     """Fetch, deliver and checkpoint one device's freshest window.
 
     Returns (observations_sent, device_failed, transport_failure).
@@ -652,13 +672,17 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
 
     if stale_from is not None:
         # Only now is the drop real: the cursor advanced past the owed range.
-        # Local log only: on migration/catch-up days this fires for hundreds
-        # of devices in one run — same publish-volume rationale as above.
+        # Per-device detail is local-log only (migration/catch-up days fire
+        # this for hundreds of devices in one run), but a permanent drop must
+        # not vanish from the portal — the caller aggregates stale_drops into
+        # one end-of-run summary publish (review finding).
         logger.warning(
             f"Dropped stale range [{stale_from.isoformat()}, {freshness_floor.isoformat()}] "
             f"permanently for device {device.nDeviceID}: older than max_data_age_hours="
             f"{action_config.max_data_age_hours}. Integration ID: {integration_id}"
         )
+        if stale_drops is not None:
+            stale_drops.append(device.nDeviceID)
 
     return observations_sent, False, False
 

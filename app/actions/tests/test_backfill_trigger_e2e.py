@@ -40,7 +40,7 @@ async def test_pull_observations_trigger_actually_runs_backfill_end_to_end(mocke
     )
     mocker.patch("app.services.action_scheduler.settings.TRIGGER_ACTIONS_ALWAYS_SYNC", True)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
-    mocker.patch("app.services.action_runner.publish_event", new=AsyncMock())
+    mocker.patch("app.services.action_runner._publish_activity_event", new=AsyncMock())
     mock_config_manager = mocker.patch("app.services.action_runner.config_manager")
     mock_config_manager.get_integration_details = AsyncMock(return_value=lotek_integration)
     # No stored config for the internal action — this is the actual production

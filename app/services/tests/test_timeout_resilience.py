@@ -126,7 +126,7 @@ async def test_internal_asyncio_timeout_is_not_labeled_as_action_deadline(
     )
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
 
     await execute_action(
         integration_id=str(integration_v2.id), action_id="pull_observations"
@@ -154,7 +154,7 @@ async def test_wait_for_ceiling_is_still_reported_as_timeout(
     )
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
     mocker.patch("app.services.action_runner.settings.MAX_ACTION_EXECUTION_TIME", 0.2)
 
     await execute_action(
@@ -164,3 +164,25 @@ async def test_wait_for_ceiling_is_still_reported_as_timeout(
     failed = _failed_events(mock_publish_event)
     assert failed
     assert "Action 'pull_observations' timed out" in failed[-1].payload.error
+
+
+@pytest.mark.asyncio
+async def test_handle_error_survives_publish_failure(
+    mocker, mock_config_manager, integration_v2
+):
+    # Review finding: _handle_error's own IntegrationActionFailed publish went
+    # through raising publish_event — under the exact congestion it reports
+    # on, the publish timeout escaped execute_action, 500'd the route and
+    # caused pubsub redelivery. It must be best-effort like other activity
+    # events (the JSONResponse still carries error_details).
+    from app.services import action_runner
+    mocker.patch.object(action_runner, "config_manager", mock_config_manager)
+    mocker.patch(
+        "app.services.activity_logger.publish_event",
+        AsyncMock(side_effect=asyncio.TimeoutError()),
+    )
+    response = await action_runner._handle_error(
+        ValueError("boom"), integration_id=str(integration_v2.id), action_id="pull_observations"
+    )
+    assert response.status_code == 500
+    assert b"boom" in response.body
