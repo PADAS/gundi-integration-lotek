@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 from gundi_core.schemas.v2 import LogLevel
 from app.actions.handlers import (
+    FETCH_CONCURRENCY,
     RETRY_ATTEMPTS,
     action_auth,
     action_pull_observations,
@@ -173,9 +174,11 @@ async def test_action_pull_observations_continues_after_one_device_fails(
 
     result = await action_pull_observations(lotek_integration, pull_config)
 
-    # Device 2 exhausts its retries and is given up on, but device 3 is still reached.
-    assert queried[0] == "1"
-    assert queried[-1] == "3"
+    # Device 2 exhausts its retries and is given up on, but devices 1 and 3 are
+    # still serviced. Devices fetch concurrently within a chunk, so only the
+    # per-device call counts are deterministic, not the interleaving.
+    assert queried.count("1") == 1
+    assert queried.count("3") == 1
     assert queried.count("2") == RETRY_ATTEMPTS
     assert result == {"observations_extracted": 2, "devices_failed": ["2"], "devices_deferred": []}
     assert mock_send.call_count == 2
@@ -248,12 +251,16 @@ async def test_action_pull_observations_aborts_when_login_is_rejected(
 ):
     # A rejected login is integration-wide. It reaches the handler from inside
     # get_positions (cached token expires mid-run), and must not be retried once per
-    # device against a rejecting endpoint.
+    # device against a rejecting endpoint. Devices fetch concurrently in chunks of
+    # FETCH_CONCURRENCY, so the tightest stop the loop can offer is the chunk
+    # boundary: at most one chunk's worth of devices may attempt a login before
+    # the abort — later chunks must never dispatch.
+    from app.actions.handlers import FETCH_CONCURRENCY
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     mocker.patch("app.services.state.redis", mock_redis)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
-    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2", "3")))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2", "3", "4", "5", "6", "7", "8")))
     mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
 
@@ -273,7 +280,11 @@ async def test_action_pull_observations_aborts_when_login_is_rejected(
     with pytest.raises(LotekUnauthorizedException):
         await action_pull_observations(lotek_integration, pull_config)
 
-    assert len(logins) <= RETRY_ATTEMPTS, f"login retried per device: {len(logins)} attempts"
+    # The rejection memo in get_token means concurrent waiters re-raise the
+    # cached refusal instead of each attempting a real login (lockout risk).
+    assert len(logins) == 1, (
+        f"a refused login must be attempted exactly once per run: {len(logins)} attempts"
+    )
 
 
 @pytest.mark.asyncio
@@ -509,13 +520,16 @@ async def test_action_pull_observations_aborts_on_auth_failure(
     mocker, lotek_integration, pull_config, mock_redis
 ):
     # Bad credentials affect every device, so the run must stop instead of
-    # repeating the same failure once per device.
+    # repeating the same failure once per device. Devices fetch concurrently in
+    # chunks of FETCH_CONCURRENCY, so the whole first chunk is already in flight
+    # when the rejection surfaces — the guarantee is that no later chunk
+    # dispatches.
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     mocker.patch("app.services.state.redis", mock_redis)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
-    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2", "3")))
+    mocker.patch("app.actions.client.get_devices", new=AsyncMock(return_value=_devices("1", "2", "3", "4", "5", "6", "7", "8")))
     mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
 
@@ -530,7 +544,10 @@ async def test_action_pull_observations_aborts_on_auth_failure(
     with pytest.raises(LotekUnauthorizedException):
         await action_pull_observations(lotek_integration, pull_config)
 
-    assert set(queried) == {"1"}, "should not have moved on to other devices"
+    first_chunk = {str(i) for i in range(1, FETCH_CONCURRENCY + 1)}
+    assert set(queried) == first_chunk, (
+        "should not have dispatched any chunk beyond the aborting one"
+    )
 
 
 @pytest.mark.asyncio
@@ -584,7 +601,7 @@ async def test_action_pull_observations_isolates_persistent_401_on_one_device(
 
     result = await action_pull_observations(lotek_integration, pull_config)
 
-    assert queried[-1] == "3", "devices after the 401 device were never queried"
+    assert "3" in queried, "devices after the 401 device were never queried"
     assert result["devices_failed"] == ["2"]
 
 
@@ -963,7 +980,15 @@ async def test_transient_fetch_failure_logs_warning_not_error(
     get_positions, _, set_state, log = _setup_pull_mocks(
         mocker, mock_redis, _devices("1", "2")
     )
-    get_positions.side_effect = [httpx.ReadTimeout("")] * RETRY_ATTEMPTS + [[]]
+
+    # Per-device behavior: chunked-concurrent fetching makes the call order
+    # nondeterministic, so an ordered side_effect list would misfire.
+    async def get_positions_side_effect(device_id, *args, **kwargs):
+        if device_id == "1":
+            raise httpx.ReadTimeout("")
+        return []
+
+    get_positions.side_effect = get_positions_side_effect
     result = await action_pull_observations(lotek_integration, pull_config)
     assert result["devices_failed"] == ["1"]
     # Transport failures are local-log only; the end-of-run summary is the
@@ -1050,15 +1075,22 @@ async def test_deadline_defers_remaining_devices_with_warning(
     mocker, lotek_integration, pull_config, mock_redis
 ):
     # Past ~80% of the action budget we stop STARTING device work and exit in
-    # control — never via the asyncio.wait_for guillotine. Call order per
-    # device: should_stop() then _fetch_retry_kwargs(), hence the side_effect
-    # sequence [False(stop d1), False(retry d1), True(stop d2)].
-    _, _, _, log = _setup_pull_mocks(mocker, mock_redis, _devices("1", "2", "3"))
+    # control — never via the asyncio.wait_for guillotine. The deadline is
+    # checked at chunk boundaries (devices fetch concurrently in chunks of
+    # FETCH_CONCURRENCY=5), so with 8 devices the calls are: should_stop()
+    # before chunk 1, then _fetch_retry_kwargs() once per device in the chunk
+    # (5), then should_stop() before chunk 2 — where the deadline hits and
+    # devices 6-8 are deferred.
+    import itertools
+    _, _, _, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1", "2", "3", "4", "5", "6", "7", "8")
+    )
     mocker.patch(
-        "app.actions.handlers._deadline_exceeded", side_effect=[False, False, True]
+        "app.actions.handlers._deadline_exceeded",
+        side_effect=itertools.chain([False] * 6, itertools.repeat(True)),
     )
     result = await action_pull_observations(lotek_integration, pull_config)
-    assert result["devices_deferred"] == ["2", "3"]
+    assert result["devices_deferred"] == ["6", "7", "8"]
     assert result["devices_failed"] == []
     deferral_logs = [
         c for c in log.await_args_list
@@ -1094,18 +1126,29 @@ def test_deadline_fraction_of_budget():
 async def test_breaker_trips_after_three_consecutive_transport_failures(
     mocker, lotek_integration, pull_config, mock_redis
 ):
-    # 3 consecutive timeouts = Lotek-wide degradation: stop early, defer the
+    # 3+ consecutive timeouts = Lotek-wide degradation: stop early, defer the
     # rest (WARNING), instead of grinding every device into the same wall.
+    # The breaker is checked at chunk boundaries (devices fetch concurrently in
+    # chunks of FETCH_CONCURRENCY=5), so the whole first chunk runs — the
+    # streak overshoots the threshold within the chunk — and deferral starts
+    # at the next chunk: devices 6-8 are never dispatched.
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     get_positions, _, _, log = _setup_pull_mocks(
-        mocker, mock_redis, _devices("1", "2", "3", "4", "5")
+        mocker, mock_redis, _devices("1", "2", "3", "4", "5", "6", "7", "8")
     )
-    # device 1 succeeds; 2,3,4 exhaust retries on timeouts; 5 must be deferred
-    get_positions.side_effect = [[]] + [httpx.ReadTimeout("")] * (3 * RETRY_ATTEMPTS)
+
+    # device 1 succeeds; 2-5 exhaust retries on timeouts (streak 4 >= 3 at the
+    # chunk boundary); 6-8 must be deferred
+    async def get_positions_side_effect(device_id, *args, **kwargs):
+        if device_id == "1":
+            return []
+        raise httpx.ReadTimeout("")
+
+    get_positions.side_effect = get_positions_side_effect
     result = await action_pull_observations(lotek_integration, pull_config)
-    assert result["devices_failed"] == ["2", "3", "4"]
-    assert result["devices_deferred"] == ["5"]
+    assert result["devices_failed"] == ["2", "3", "4", "5"]
+    assert result["devices_deferred"] == ["6", "7", "8"]
     breaker_logs = [
         c for c in log.await_args_list
         if c.kwargs["level"] == LogLevel.WARNING and "circuit breaker" in c.kwargs["title"].lower()
@@ -1118,13 +1161,21 @@ async def test_breaker_counter_resets_on_success(
     mocker, lotek_integration, pull_config, mock_redis
 ):
     # Failures interleaved with successes are per-device noise, not an outage.
+    # Chunk results are recorded in list order, so chunk 1 (devices 1-5) plays
+    # F S F S F: three failures but a max streak of 1 — without the reset the
+    # streak would be 3 at the chunk boundary and device 6 would be deferred.
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     get_positions, _, _, _ = _setup_pull_mocks(
-        mocker, mock_redis, _devices("1", "2", "3", "4", "5")
+        mocker, mock_redis, _devices("1", "2", "3", "4", "5", "6")
     )
-    fail = [httpx.ReadTimeout("")] * RETRY_ATTEMPTS
-    get_positions.side_effect = fail + [[]] + fail + [[]] + fail  # F S F S F
+
+    async def get_positions_side_effect(device_id, *args, **kwargs):
+        if device_id in ("1", "3", "5"):
+            raise httpx.ReadTimeout("")
+        return []
+
+    get_positions.side_effect = get_positions_side_effect
     result = await action_pull_observations(lotek_integration, pull_config)
     assert result["devices_deferred"] == []
     assert result["devices_failed"] == ["1", "3", "5"]
@@ -1338,20 +1389,21 @@ async def test_lotek_5xx_failures_feed_the_circuit_breaker(
     # fell into the generic handler, which RESET the breaker streak — an
     # HTTP-error outage could never trip the breaker and the run ground
     # through every device. 5xx/429 must arm the breaker like timeouts.
-    from app.actions.handlers import BREAKER_THRESHOLD
+    from app.actions.handlers import FETCH_CONCURRENCY
     get_positions, _, _, log = _setup_pull_mocks(
-        mocker, mock_redis, _devices("1", "2", "3", "4", "5")
+        mocker, mock_redis, _devices("1", "2", "3", "4", "5", "6", "7", "8")
     )
     get_positions.side_effect = LotekException(message="down", status_code=503)
     with pytest.raises(LotekException, match="No devices could be serviced"):
         await action_pull_observations(lotek_integration, pull_config)
-    # breaker trips after 3 consecutive 503s; devices 4 and 5 are deferred
+    # the first chunk's 5 consecutive 503s trip the breaker at the chunk
+    # boundary; devices 6-8 (chunk 2) are deferred and never dispatched
     deferral_logs = [
         c for c in log.await_args_list
         if "circuit breaker" in c.kwargs.get("title", "").lower()
     ]
     assert len(deferral_logs) == 1
-    assert get_positions.await_count == BREAKER_THRESHOLD
+    assert get_positions.await_count == FETCH_CONCURRENCY
     # Outage (5xx/429) failures are local-log only (publish-volume fix): no
     # per-device portal publishes, and in particular no ERRORs.
     device_logs = [c for c in log.await_args_list if "Device:" in c.kwargs.get("title", "")]
@@ -1453,10 +1505,20 @@ async def test_fetch_error_publish_failure_stays_contained_to_the_device(
     # handlers was unguarded — a pubsub blip escaped the per-device isolation
     # and reset the breaker streak with a failure that says nothing about
     # Lotek. It must be best-effort like the other per-device publishes.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     get_positions, _, _, log = _setup_pull_mocks(
         mocker, mock_redis, _devices("1", "2")
     )
-    get_positions.side_effect = [httpx.ReadTimeout(""), httpx.ReadTimeout(""), []]
+
+    # Per-device behavior: chunked-concurrent fetching makes the call order
+    # nondeterministic. Device 1 times out through both retry attempts.
+    async def get_positions_side_effect(device_id, *args, **kwargs):
+        if device_id == "1":
+            raise httpx.ReadTimeout("")
+        return []
+
+    get_positions.side_effect = get_positions_side_effect
 
     async def flaky_publish(**kwargs):
         if "Error fetching positions" in kwargs.get("title", ""):

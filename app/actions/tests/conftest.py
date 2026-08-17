@@ -35,11 +35,19 @@ def _reset_shared_http_client():
     # it around every test so (a) a test's `mocker.patch(...httpx.AsyncClient)`
     # mock is never cached and leaked into later tests, and (b) no real client
     # outlives the pytest-asyncio event loop it was created on.
+    # Locks and login-rejection memos are also reset: a Lock binds to the
+    # event loop of the first test that CONTENDS it, and pytest-asyncio runs
+    # a fresh loop per test; a cached rejection would leak a fake auth
+    # failure into unrelated tests.
     import app.actions.client as lotek_client
 
     lotek_client._client = None
+    lotek_client._token_locks.clear()
+    lotek_client._login_rejections.clear()
     yield
     lotek_client._client = None
+    lotek_client._token_locks.clear()
+    lotek_client._login_rejections.clear()
 
 
 @pytest.fixture(autouse=True)
