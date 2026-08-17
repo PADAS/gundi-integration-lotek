@@ -41,7 +41,7 @@ async def test_execute_pull_action_from_pubsub(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
 
     response = api_client.post(
         "/",
@@ -71,7 +71,7 @@ async def test_execute_push_action_from_pubsub(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
 
     response = api_client.post(
         "/push-data",
@@ -111,7 +111,7 @@ async def test_execute_action_from_api(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
     integration_id = str(integration_v2.id)
     action_id = "pull_observations"
 
@@ -140,7 +140,7 @@ async def test_execute_action_from_api_with_config_overrides(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
 
     config_overrides = {"lookback_days": 3}
     response = api_client.post(
@@ -171,7 +171,7 @@ async def test_execute_action_from_pubsub_with_config_overrides(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
 
     response = api_client.post(
         "/",
@@ -203,7 +203,7 @@ async def test_manual_pull_action_with_invalid_config_still_errors(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
 
     response = api_client.post(
         "/v1/actions/execute/",
@@ -231,7 +231,7 @@ async def test_triggered_by_marker_is_case_insensitive(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
     bad_config = mocker.MagicMock()
     bad_config.data = {"lookback_days": "two"}  # should be an integer
     mock_config_manager.get_action_configuration.return_value = async_return(bad_config)
@@ -267,7 +267,7 @@ async def test_scheduled_pull_action_with_invalid_config_is_skipped(
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.action_runner.state_manager", mock_state_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
     mock_state_manager.set_if_absent.return_value = async_return(True)  # window open
     bad_config = mocker.MagicMock()
     bad_config.data = {"lookback_days": "two"}  # should be an integer
@@ -301,7 +301,7 @@ async def test_scheduled_pull_action_invalid_config_warning_is_throttled(
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.action_runner.state_manager", mock_state_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
     mock_state_manager.set_if_absent.return_value = async_return(False)  # window closed
     bad_config = mocker.MagicMock()
     bad_config.data = {"lookback_days": "two"}
@@ -332,7 +332,7 @@ async def test_scheduled_pull_action_invalid_config_skip_survives_throttle_failu
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.action_runner.state_manager", mock_state_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
     mock_state_manager.set_if_absent.side_effect = Exception("redis unavailable")
     bad_config = mocker.MagicMock()
     bad_config.data = {"lookback_days": "two"}
@@ -364,7 +364,7 @@ async def test_scheduled_pull_action_with_missing_config_is_skipped(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
     mock_config_manager.get_action_configuration.return_value = async_return(None)
 
     response = api_client.post(
@@ -389,7 +389,7 @@ async def test_scheduled_pull_action_skipped_when_run_on_schedule_disabled(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
     paused_config = mocker.MagicMock()
     paused_config.data = {"lookback_days": 10, "run_on_schedule": False}
     mock_config_manager.get_action_configuration.return_value = async_return(paused_config)
@@ -415,7 +415,7 @@ async def test_manual_pull_action_runs_even_when_run_on_schedule_disabled(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
     paused_config = mocker.MagicMock()
     paused_config.data = {"lookback_days": 10, "run_on_schedule": False}
     mock_config_manager.get_action_configuration.return_value = async_return(paused_config)
@@ -444,7 +444,7 @@ async def test_non_pull_action_still_errors_on_invalid_config(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
     bad_config = mocker.MagicMock()
     bad_config.data = {"start_datetime": "not-a-datetime", "end_datetime": "also-bad"}
     mock_config_manager.get_action_configuration.return_value = async_return(bad_config)
@@ -473,7 +473,7 @@ async def test_trigger_subaction(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
     integration_id = str(integration_v2.id)
     action_id = "pull_observations_by_date"
@@ -512,7 +512,7 @@ async def test_trigger_subaction_sync(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
     mocker.patch("app.services.action_scheduler.publish_event", mock_publish_event)
     integration_id = str(integration_v2.id)
     action_id = "pull_observations_by_date"
@@ -547,7 +547,7 @@ async def test_execute_action_with_handler_error(
     mocker.patch("app.services.action_runner._portal", mock_gundi_client_v2)
     mocker.patch("app.services.action_runner.config_manager", mock_config_manager)
     mocker.patch("app.services.activity_logger.publish_event", mock_publish_event)
-    mocker.patch("app.services.action_runner.publish_event", mock_publish_event)
+    mocker.patch("app.services.action_runner._publish_activity_event", mock_publish_event)
 
     response = api_client.post(
         "/v1/actions/execute/",

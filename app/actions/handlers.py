@@ -251,6 +251,30 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
             with attempt:
                 device_list = await client.get_devices(integration, auth)
+    except httpx.TransportError as e:
+        # Transport failures reaching Lotek are the same class the per-device
+        # breaker treats as WARNING; classifying them ERROR here marked every
+        # connection unhealthy during fleet-wide Lotek congestion even though
+        # the next tick usually succeeds (GUNDI-5602 prod finding 2026-08-16).
+        # Clean return: the run made no progress but the schedule retries it.
+        message = (
+            f"Lotek API unreachable while listing devices for integration {integration.id}: "
+            f"{describe_exception(e)}. The run will be retried on the next schedule."
+        )
+        logger.warning(message)
+        await log_action_activity(
+            integration_id=str(integration.id),
+            action_id="pull_observations",
+            title=message,
+            level=LogLevel.WARNING
+        )
+        return {
+            "observations_extracted": 0,
+            "devices_failed": [],
+            "devices_deferred": [],
+            "skipped": True,
+            "reason": "lotek_unreachable",
+        }
     except Exception as e:
         message = f"Error fetching devices from Lotek. Integration ID: {integration.id} Exception: {describe_exception(e)}"
         logger.exception(message)
@@ -290,6 +314,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     # backfill this cycle. Self-correcting: the next run's head pass reaches it
     # and triggers then, same as the worst-case import delay the design accepts.
     any_open_gap = False
+    stale_drops = []
     for i, (device, state, is_new) in enumerate(device_states):
         if reason := guards.should_stop():
             deferred_devices = [d.nDeviceID for d, _, _ in device_states[i:]]
@@ -297,7 +322,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             break
         try:
             sent, device_failed, transport_failure = await _head_pass_device(
-                device, state, is_new, integration, auth, action_config, present_time, guards
+                device, state, is_new, integration, auth, action_config, present_time, guards,
+                stale_drops=stale_drops
             )
         except LotekUnauthorizedException:
             raise
@@ -334,6 +360,24 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             f"Pulled observations with {len(failed_devices)} of {len(device_list)} device(s) "
             f"failing for integration {integration.id}: {_summarize_ids(failed_devices)}. "
             f"They will be retried on the next run."
+        )
+        logger.warning(message)
+        await log_action_activity(
+            integration_id=str(integration.id),
+            action_id="pull_observations",
+            title=message,
+            level=LogLevel.WARNING
+        )
+
+    if stale_drops:
+        # Permanent data loss must stay visible in the portal: one aggregated
+        # WARNING per run instead of the old per-device publish (review
+        # finding on the publish-volume fix). Per-device ranges are in the
+        # local log.
+        message = (
+            f"Dropped data older than max_data_age_hours={action_config.max_data_age_hours} "
+            f"permanently for {len(stale_drops)} device(s) on integration {integration.id}: "
+            f"{_summarize_ids(stale_drops)}. See the application log for per-device ranges."
         )
         logger.warning(message)
         await log_action_activity(
@@ -478,9 +522,11 @@ async def _fetch_window(device, integration, auth, config, lower_date, upper_dat
     except httpx.TransportError as e:
         # WARNING + breaker-feeding: enough timeouts/transport failures in a
         # row mean Lotek-wide degradation, not a bad device.
+        # Local log only: failed devices are aggregated into one end-of-run
+        # summary publish. Per-device publishes multiplied exactly when Lotek
+        # (or the instance) was already drowning — a congestion feedback loop.
         message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         logger.warning(message, exc_info=True)
-        await _try_log_activity(integration_id, action_id, message, LogLevel.WARNING)
         return None, True
     except LotekException as e:
         message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
@@ -489,9 +535,9 @@ async def _fetch_window(device, integration, auth, config, lower_date, upper_dat
             # Lotek-wide degradation as a timeout: WARNING + breaker-feeding.
             # Before this branch it fell into the generic handler below, which
             # actively RESET the breaker streak — an HTTP-error outage could
-            # never trip the breaker (review finding).
+            # never trip the breaker (review finding). Local log only — same
+            # aggregation rationale as the transport branch above.
             logger.warning(message, exc_info=True)
-            await _try_log_activity(integration_id, action_id, message, LogLevel.WARNING)
             return None, True
         # Other 4xx (incl. a token-expiry 401 that survived its retry): a
         # per-device/API-contract problem that won't self-heal — ERROR, and
@@ -553,7 +599,7 @@ async def _deliver(cdip_positions, device, integration, action_id):
     return observations_sent, False
 
 
-async def _head_pass_device(device, state, is_new, integration, auth, action_config, present_time, guards):
+async def _head_pass_device(device, state, is_new, integration, auth, action_config, present_time, guards, stale_drops=None):
     """Fetch, deliver and checkpoint one device's freshest window.
 
     Returns (observations_sent, device_failed, transport_failure).
@@ -583,11 +629,11 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
         return 0, True, transport_failure
 
     if not cdip_positions:
-        # Purely informational; must never affect the device's outcome. A pubsub blip
-        # here must not mark a healthy quiet device as failed or stall its cursor.
-        message = f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}."
-        logger.info(message)
-        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.WARNING)
+        # Local log only. This used to publish a portal WARNING per quiet
+        # device — on a mostly-dormant 400-device integration that was
+        # hundreds of pubsub publishes per tick, the single largest
+        # contributor to the publish congestion behind GUNDI-5602.
+        logger.info(f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}.")
 
     observations_sent, delivery_failed = await _deliver(cdip_positions, device, integration, "pull_observations")
     if delivery_failed:
@@ -626,13 +672,17 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
 
     if stale_from is not None:
         # Only now is the drop real: the cursor advanced past the owed range.
-        message = (
+        # Per-device detail is local-log only (migration/catch-up days fire
+        # this for hundreds of devices in one run), but a permanent drop must
+        # not vanish from the portal — the caller aggregates stale_drops into
+        # one end-of-run summary publish (review finding).
+        logger.warning(
             f"Dropped stale range [{stale_from.isoformat()}, {freshness_floor.isoformat()}] "
             f"permanently for device {device.nDeviceID}: older than max_data_age_hours="
             f"{action_config.max_data_age_hours}. Integration ID: {integration_id}"
         )
-        logger.warning(message)
-        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.WARNING)
+        if stale_drops is not None:
+            stale_drops.append(device.nDeviceID)
 
     return observations_sent, False, False
 
@@ -745,6 +795,24 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
                 with attempt:
                     device_list = await client.get_devices(integration, auth)
+        except httpx.TransportError as e:
+            # Same WARNING classification as the head pass: an unreachable
+            # Lotek must not mark the connection unhealthy. The early return
+            # releases the lease via the finally below, and skipping the
+            # self-retrigger throttles the cascade to the head-pass cadence —
+            # the open gaps re-trigger backfill on the next scheduled run.
+            message = (
+                f"Lotek API unreachable while listing devices for backfill on integration "
+                f"{integration_id}: {describe_exception(e)}. Open gaps are retried on the next trigger."
+            )
+            logger.warning(message)
+            await log_action_activity(
+                integration_id=integration_id,
+                action_id="backfill_observations",
+                title=message,
+                level=LogLevel.WARNING
+            )
+            return {"skipped": True, "reason": "lotek_unreachable"}
         except Exception as e:
             message = (
                 f"Error fetching devices from Lotek for backfill. Integration ID: "

@@ -21,7 +21,7 @@ from app.actions.core import PullActionConfiguration
 from .config_manager import IntegrationConfigurationManager
 from .state import IntegrationStateManager
 from .utils import find_config_for_action
-from .activity_logger import publish_event, log_action_activity
+from .activity_logger import _publish_activity_event, log_action_activity
 
 _portal = GundiClient()
 config_manager = IntegrationConfigurationManager()
@@ -88,8 +88,12 @@ async def _handle_error(
             "server_response_body": str(getattr(response, "text", getattr(response, "content", None)) or "")
         })
 
-    # Publish the error event
-    await publish_event(
+    # Publish the error event. Best-effort: under the exact congestion this
+    # handler reports on, a raising publish here would escape execute_action,
+    # 500 the route, and (on the pubsub-push path) redeliver → re-run the
+    # action during congestion. The JSONResponse below still carries the full
+    # error_details either way (review finding).
+    await _publish_activity_event(
         event=IntegrationActionFailed(
             payload=ActionExecutionFailed(**error_details)
         ),
@@ -269,12 +273,30 @@ async def execute_action(
             handler(**handler_kwargs),
             timeout=settings.MAX_ACTION_EXECUTION_TIME
         )
-    except asyncio.TimeoutError:
+    except asyncio.TimeoutError as e:
+        # Two very different failures land here: the wait_for ceiling above,
+        # and an asyncio.TimeoutError raised INSIDE the handler by a
+        # dependency (aiohttp/redis/pubsub). Conflating them mislabeled
+        # ~90-second dependency failures as "Action timed out" and hid the
+        # real cause during the 2026-08-16 PubSub congestion (GUNDI-5602).
+        # Elapsed time tells them apart (with 1s of scheduling slack).
+        elapsed = time.monotonic() - start_time
+        if elapsed >= settings.MAX_ACTION_EXECUTION_TIME - 1:
+            return await _handle_error(
+                asyncio.TimeoutError(f"Action '{action_id}' timed out"),
+                integration_id, action_id,
+                config_data={"configurations": [c.dict() for c in integration.configurations]},
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT
+            )
         return await _handle_error(
-            asyncio.TimeoutError(f"Action '{action_id}' timed out"),
+            asyncio.TimeoutError(
+                f"A dependency call raised asyncio.TimeoutError after {elapsed:.0f}s "
+                f"while executing action '{action_id}' (the "
+                f"{settings.MAX_ACTION_EXECUTION_TIME}s action deadline was not reached)"
+            ),
             integration_id, action_id,
             config_data={"configurations": [c.dict() for c in integration.configurations]},
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
     except Exception as e:
         return await _handle_error(e, integration_id, action_id,

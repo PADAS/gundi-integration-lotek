@@ -160,10 +160,12 @@ async def test_backfill_releases_lease_even_when_the_run_raises(
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     _, _, _, release, _ = _setup_backfill_mocks(mocker, mock_redis, [], {})
+    # A non-transport failure: transport errors return cleanly (WARNING) since
+    # the 2026-08-16 congestion fix, so they no longer exercise the raise path.
     mocker.patch(
-        "app.actions.client.get_devices", new=AsyncMock(side_effect=httpx.ReadTimeout(""))
+        "app.actions.client.get_devices", new=AsyncMock(side_effect=ValueError("boom"))
     )
-    with pytest.raises(httpx.ReadTimeout):
+    with pytest.raises(ValueError):
         await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
     release.assert_awaited_once()
 

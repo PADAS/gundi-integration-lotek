@@ -100,12 +100,13 @@ async def test_invalid_position_filtered_and_logs_warning_when_no_valid_observat
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
     result = await action_pull_observations(lotek_integration, pull_config)
     assert result == {'observations_extracted': 0, 'devices_failed': [], 'devices_deferred': []}
-    mock_log_action_activity.assert_any_call(
-        integration_id=str(lotek_integration.id),
-        action_id="pull_observations",
-        level=LogLevel.WARNING,
-        title=f"No positions fetched for device {lotek_position.DeviceID} integration ID: {lotek_integration.id}."
-    )
+    # Publish-volume fix: quiet devices are local-log only — one portal WARNING
+    # per dormant device was the largest pubsub-congestion contributor.
+    quiet_publishes = [
+        c for c in mock_log_action_activity.call_args_list
+        if "No positions fetched" in c.kwargs.get("title", "")
+    ]
+    assert quiet_publishes == []
 
 @pytest.mark.asyncio
 async def test_lookback_days_config_sets_first_run_gap_depth(mocker, lotek_integration, pull_config, mock_redis):
@@ -445,7 +446,7 @@ async def test_action_pull_observations_does_not_advance_state_for_failed_device
 
 @pytest.mark.asyncio
 async def test_action_pull_observations_logs_exception_type_when_message_is_empty(
-    mocker, lotek_integration, pull_config, mock_redis
+    mocker, lotek_integration, pull_config, mock_redis, caplog
 ):
     # httpx timeouts stringify to "", which produced logs ending in a bare "Exception: ".
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
@@ -463,10 +464,13 @@ async def test_action_pull_observations_logs_exception_type_when_message_is_empt
     with pytest.raises(LotekException):
         await action_pull_observations(lotek_integration, pull_config)
 
-    titles = [call.kwargs["title"] for call in mock_log_action_activity.call_args_list]
-    error_titles = [t for t in titles if "Error fetching positions" in t]
-    assert error_titles, "expected a per-device error to be logged"
-    assert "ReadTimeout" in error_titles[0]
+    # Transport failures are local-log only (publish-volume fix); the
+    # exception type must still be named in the local warning.
+    fetch_logs = [r.message for r in caplog.records if "Error fetching positions" in r.message]
+    assert fetch_logs, "expected a per-device fetch failure to be logged locally"
+    assert "ReadTimeout" in fetch_logs[0]
+    published = [c.kwargs.get("title", "") for c in mock_log_action_activity.call_args_list]
+    assert not any("Error fetching positions" in t for t in published)
 
 
 @pytest.mark.asyncio
@@ -771,7 +775,8 @@ async def test_get_devices_failure_logs_exception_type_when_message_is_empty(
     mocker, lotek_integration, pull_config, mock_redis
 ):
     # httpx timeouts stringify to "" — the activity log must name the type,
-    # not render a bare "Exception: ".
+    # not render a bare ": ". (Transport failures classify WARNING and return
+    # cleanly since the 2026-08-16 congestion fix, so no raise here.)
     mocker.patch("app.services.state.redis", mock_redis)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
@@ -781,8 +786,8 @@ async def test_get_devices_failure_logs_exception_type_when_message_is_empty(
         new=AsyncMock(side_effect=httpx.ReadTimeout("")),
     )
     mock_log = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
-    with pytest.raises(httpx.ReadTimeout):
-        await action_pull_observations(lotek_integration, pull_config)
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["reason"] == "lotek_unreachable"
     title = mock_log.call_args.kwargs["title"]
     assert "ReadTimeout" in title
 
@@ -896,7 +901,7 @@ async def test_steady_state_advances_high_water_and_keeps_gap_closed(
 
 @pytest.mark.asyncio
 async def test_stale_span_is_dropped_with_warning_and_not_added_to_gap(
-    mocker, lotek_integration, pull_config, mock_redis
+    mocker, lotek_integration, pull_config, mock_redis, caplog
 ):
     # Bounded staleness (agreed design decision): a cursor further back than max_age
     # means that span is dropped permanently — WARNING with the range, gap unchanged.
@@ -914,12 +919,19 @@ async def test_stale_span_is_dropped_with_warning_and_not_added_to_gap(
     ) < timedelta(minutes=1)
     saved = set_state.call_args.args[2]
     assert saved.get("gap_start") is None  # NOT added to the gap
-    drop_warnings = [
-        c for c in log.await_args_list
-        if c.kwargs["level"] == LogLevel.WARNING and "Dropped stale range" in c.kwargs["title"]
-    ]
+    # Per-device detail is local-log only (publish-volume fix), but permanent
+    # loss stays portal-visible as ONE aggregated end-of-run summary.
+    drop_warnings = [r.message for r in caplog.records if "Dropped stale range" in r.message]
     assert len(drop_warnings) == 1
-    assert "device 1" in drop_warnings[0].kwargs["title"]
+    assert "device 1" in drop_warnings[0]
+    assert not any("Dropped stale range" in c.kwargs.get("title", "") for c in log.await_args_list)
+    summaries = [
+        c for c in log.await_args_list
+        if "Dropped data older than" in c.kwargs.get("title", "")
+    ]
+    assert len(summaries) == 1
+    assert summaries[0].kwargs["level"] == LogLevel.WARNING
+    assert "1" in summaries[0].kwargs["title"]
 
 
 @pytest.mark.asyncio
@@ -954,10 +966,17 @@ async def test_transient_fetch_failure_logs_warning_not_error(
     get_positions.side_effect = [httpx.ReadTimeout("")] * RETRY_ATTEMPTS + [[]]
     result = await action_pull_observations(lotek_integration, pull_config)
     assert result["devices_failed"] == ["1"]
-    device_1_logs = [
+    # Transport failures are local-log only; the end-of-run summary is the
+    # single portal publish and it is a WARNING, not an ERROR.
+    device_1_publishes = [
         c for c in log.await_args_list if "Device: 1" in c.kwargs.get("title", "")
     ]
-    assert device_1_logs and all(c.kwargs["level"] == LogLevel.WARNING for c in device_1_logs)
+    assert device_1_publishes == []
+    summaries = [
+        c for c in log.await_args_list
+        if "failing for integration" in c.kwargs.get("title", "")
+    ]
+    assert summaries and all(c.kwargs["level"] == LogLevel.WARNING for c in summaries)
 
 
 @pytest.mark.asyncio
@@ -1333,9 +1352,10 @@ async def test_lotek_5xx_failures_feed_the_circuit_breaker(
     ]
     assert len(deferral_logs) == 1
     assert get_positions.await_count == BREAKER_THRESHOLD
-    # outage failures are WARNINGs (transient), not ERRORs
+    # Outage (5xx/429) failures are local-log only (publish-volume fix): no
+    # per-device portal publishes, and in particular no ERRORs.
     device_logs = [c for c in log.await_args_list if "Device:" in c.kwargs.get("title", "")]
-    assert device_logs and all(c.kwargs["level"] == LogLevel.WARNING for c in device_logs)
+    assert device_logs == []
 
 
 @pytest.mark.asyncio
