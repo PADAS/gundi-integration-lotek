@@ -502,9 +502,11 @@ async def _fetch_window(device, integration, auth, config, lower_date, upper_dat
     except httpx.TransportError as e:
         # WARNING + breaker-feeding: enough timeouts/transport failures in a
         # row mean Lotek-wide degradation, not a bad device.
+        # Local log only: failed devices are aggregated into one end-of-run
+        # summary publish. Per-device publishes multiplied exactly when Lotek
+        # (or the instance) was already drowning — a congestion feedback loop.
         message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         logger.warning(message, exc_info=True)
-        await _try_log_activity(integration_id, action_id, message, LogLevel.WARNING)
         return None, True
     except LotekException as e:
         message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
@@ -513,9 +515,9 @@ async def _fetch_window(device, integration, auth, config, lower_date, upper_dat
             # Lotek-wide degradation as a timeout: WARNING + breaker-feeding.
             # Before this branch it fell into the generic handler below, which
             # actively RESET the breaker streak — an HTTP-error outage could
-            # never trip the breaker (review finding).
+            # never trip the breaker (review finding). Local log only — same
+            # aggregation rationale as the transport branch above.
             logger.warning(message, exc_info=True)
-            await _try_log_activity(integration_id, action_id, message, LogLevel.WARNING)
             return None, True
         # Other 4xx (incl. a token-expiry 401 that survived its retry): a
         # per-device/API-contract problem that won't self-heal — ERROR, and
@@ -607,11 +609,11 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
         return 0, True, transport_failure
 
     if not cdip_positions:
-        # Purely informational; must never affect the device's outcome. A pubsub blip
-        # here must not mark a healthy quiet device as failed or stall its cursor.
-        message = f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}."
-        logger.info(message)
-        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.WARNING)
+        # Local log only. This used to publish a portal WARNING per quiet
+        # device — on a mostly-dormant 400-device integration that was
+        # hundreds of pubsub publishes per tick, the single largest
+        # contributor to the publish congestion behind GUNDI-5602.
+        logger.info(f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}.")
 
     observations_sent, delivery_failed = await _deliver(cdip_positions, device, integration, "pull_observations")
     if delivery_failed:
@@ -650,13 +652,13 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
 
     if stale_from is not None:
         # Only now is the drop real: the cursor advanced past the owed range.
-        message = (
+        # Local log only: on migration/catch-up days this fires for hundreds
+        # of devices in one run — same publish-volume rationale as above.
+        logger.warning(
             f"Dropped stale range [{stale_from.isoformat()}, {freshness_floor.isoformat()}] "
             f"permanently for device {device.nDeviceID}: older than max_data_age_hours="
             f"{action_config.max_data_age_hours}. Integration ID: {integration_id}"
         )
-        logger.warning(message)
-        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.WARNING)
 
     return observations_sent, False, False
 
