@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 import logging
 import pydantic
@@ -119,22 +120,32 @@ def _to_utc(val: datetime) -> datetime:
     return val.astimezone(timezone.utc)
 
 
+# Serializes the read-login-store sequence below. Device fetches run with
+# bounded concurrency (handlers.FETCH_CONCURRENCY), so after a 401 clears the
+# cached token, several coroutines can find it missing at once — without the
+# lock each would log in separately, and Lotek logins invalidate the account's
+# previous token, so concurrent logins invalidate each other in a loop. The
+# lock makes one coroutine log in while the rest then read its cached result.
+_token_lock = asyncio.Lock()
+
+
 async def get_token(integration, auth):
-    saved_token = await state_manager.get_state(
-        str(integration.id),
-        "pull_observations",
-        "token"
-    )
-    if not saved_token:
-        token = await get_token_from_api(integration, auth)
-        await state_manager.set_state(
+    async with _token_lock:
+        saved_token = await state_manager.get_state(
             str(integration.id),
             "pull_observations",
-            {"token": token},
             "token"
         )
-    else:
-        token = saved_token.get("token")
+        if not saved_token:
+            token = await get_token_from_api(integration, auth)
+            await state_manager.set_state(
+                str(integration.id),
+                "pull_observations",
+                {"token": token},
+                "token"
+            )
+        else:
+            token = saved_token.get("token")
 
     return token
 

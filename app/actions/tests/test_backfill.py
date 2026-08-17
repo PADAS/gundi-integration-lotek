@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock
 from gundi_core.schemas.v2 import LogLevel
 from app.actions.handlers import (
     BACKFILL_MAX_WINDOWS_PER_DEVICE,
-    RETRY_ATTEMPTS,
     action_backfill_observations,
 )
 from app.actions.client import LotekDevice, LotekException
@@ -110,19 +109,28 @@ async def test_backfill_does_not_retrigger_while_breaker_is_hot(
     # one that should re-trigger, ~cadence later.
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
-    states = {d: _gap_state(days_back_start=5) for d in ("1", "2", "3", "4", "5")}
+    device_ids = ("1", "2", "3", "4", "5", "6", "7", "8")
+    states = {d: _gap_state(days_back_start=5) for d in device_ids}
     get_positions, _, _, _, _ = _setup_backfill_mocks(
-        mocker, mock_redis, _devices("1", "2", "3", "4", "5"), states
+        mocker, mock_redis, _devices(*device_ids), states
     )
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
-    # device 1 succeeds (its 4-day gap closes in one window); 2, 3, 4 exhaust
-    # retries on timeouts and trip the breaker; 5 is deferred with its gap open
-    fail = [httpx.ReadTimeout("")] * RETRY_ATTEMPTS
-    get_positions.side_effect = [[]] + fail * 3
+
+    # Device 1 succeeds (its 4-day gap closes in one window); 2-5 exhaust
+    # retries on timeouts, so the breaker is hot (streak 4 >= 3) at the chunk
+    # boundary and devices 6-8 (chunk 2) are deferred with their gaps open.
+    # Per-device behavior: chunked-concurrent fetching makes the call order
+    # nondeterministic, so an ordered side_effect list would misfire.
+    async def get_positions_side_effect(device_id, *args, **kwargs):
+        if device_id == "1":
+            return []
+        raise httpx.ReadTimeout("")
+
+    get_positions.side_effect = get_positions_side_effect
     result = await action_backfill_observations(
         lotek_integration, BackfillObservationsConfig()
     )
-    assert result["devices_deferred"] == ["5"]
+    assert result["devices_deferred"] == ["6", "7", "8"]
     trigger.assert_not_awaited()
 
 

@@ -1,3 +1,4 @@
+import asyncio
 import httpx
 import logging
 import stamina
@@ -44,6 +45,15 @@ BREAKER_THRESHOLD = 3
 BACKFILL_MAX_WINDOWS_PER_DEVICE = 2
 BACKFILL_WINDOW = timedelta(days=7)
 BACKFILL_LEASE_SOURCE = "lease"
+# Devices are fetched in bounded-concurrency chunks over the shared HTTP
+# client (GUNDI-5620). Sequential fetching put 400-600 Lotek round trips on
+# the action budget one at a time, which is what pushed the big integrations
+# into the MAX_ACTION_EXECUTION_TIME ceiling. Guards (deadline + breaker) are
+# checked between chunks, so their granularity coarsens from 1 device to
+# FETCH_CONCURRENCY devices — with the breaker threshold at 3, a fully-bad
+# chunk overshoots by at most 2 requests. Chunk results are recorded in list
+# order, preserving the sequential consecutive-failure semantics.
+FETCH_CONCURRENCY = 5
 # Head fetches re-cover this much of the cursor's trailing edge: rows whose
 # server-assigned UploadTimeStamp falls inside a window we already queried can
 # become queryable only after our request completed (write latency / clock
@@ -315,45 +325,58 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     # and triggers then, same as the worst-case import delay the design accepts.
     any_open_gap = False
     stale_drops = []
-    for i, (device, state, is_new) in enumerate(device_states):
+    for chunk_start in range(0, len(device_states), FETCH_CONCURRENCY):
         if reason := guards.should_stop():
-            deferred_devices = [d.nDeviceID for d, _, _ in device_states[i:]]
+            deferred_devices = [d.nDeviceID for d, _, _ in device_states[chunk_start:]]
             await _log_deferral(integration, "pull_observations", reason, deferred_devices)
             break
-        try:
-            sent, device_failed, transport_failure = await _head_pass_device(
-                device, state, is_new, integration, auth, action_config, present_time, guards,
-                stale_drops=stale_drops
-            )
-        except LotekUnauthorizedException:
-            raise
-        except Exception as e:
-            # Sending to Gundi and checkpointing can fail too, and a device that fetched
-            # fine but failed downstream must not take the rest of the batch with it.
-            message = (
-                f"Failed to process device {device.nDeviceID} for integration "
-                f"{integration.id}: {describe_exception(e)}"
-            )
-            logger.exception(message)
-            await log_action_activity(
-                integration_id=str(integration.id),
-                action_id="pull_observations",
-                title=message,
-                level=LogLevel.ERROR
-            )
-            failed_devices.append(device.nDeviceID)
-            guards.record(transport_failure=False)
-            continue
-        # Single recording site: transport failures arm the breaker, anything
-        # else (success included) breaks the consecutive streak.
-        guards.record(transport_failure=transport_failure)
-        observations_extracted += sent
-        if state.has_gap:
-            any_open_gap = True
-        if device_failed:
-            failed_devices.append(device.nDeviceID)
-        else:
-            serviced_devices += 1
+        chunk = device_states[chunk_start:chunk_start + FETCH_CONCURRENCY]
+        results = await asyncio.gather(
+            *(
+                _head_pass_device(
+                    device, state, is_new, integration, auth, action_config,
+                    present_time, guards, stale_drops=stale_drops
+                )
+                for device, state, is_new in chunk
+            ),
+            # Collect every task's outcome rather than aborting the chunk on
+            # the first exception: per-device failures must stay per-device.
+            return_exceptions=True,
+        )
+        # Credentials refused is integration-wide and fatal; re-raise it over
+        # any per-device outcomes in the same chunk.
+        for res in results:
+            if isinstance(res, LotekUnauthorizedException):
+                raise res
+        for (device, state, is_new), res in zip(chunk, results):
+            if isinstance(res, BaseException):
+                # Sending to Gundi and checkpointing can fail too, and a device that fetched
+                # fine but failed downstream must not take the rest of the batch with it.
+                message = (
+                    f"Failed to process device {device.nDeviceID} for integration "
+                    f"{integration.id}: {describe_exception(res)}"
+                )
+                logger.error(message, exc_info=res)
+                await log_action_activity(
+                    integration_id=str(integration.id),
+                    action_id="pull_observations",
+                    title=message,
+                    level=LogLevel.ERROR
+                )
+                failed_devices.append(device.nDeviceID)
+                guards.record(transport_failure=False)
+                continue
+            sent, device_failed, transport_failure = res
+            # Single recording site: transport failures arm the breaker, anything
+            # else (success included) breaks the consecutive streak.
+            guards.record(transport_failure=transport_failure)
+            observations_extracted += sent
+            if state.has_gap:
+                any_open_gap = True
+            if device_failed:
+                failed_devices.append(device.nDeviceID)
+            else:
+                serviced_devices += 1
 
     if failed_devices:
         message = (
@@ -846,41 +869,52 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         serviced_devices = 0
         gaps_closed = 0
         windows_advanced_total = 0
-        for i, (device, state) in enumerate(gapped):
+        for chunk_start in range(0, len(gapped), FETCH_CONCURRENCY):
             if reason := guards.should_stop():
-                deferred_devices = [d.nDeviceID for d, _ in gapped[i:]]
+                deferred_devices = [d.nDeviceID for d, _ in gapped[chunk_start:]]
                 await _log_deferral(integration, "backfill_observations", reason, deferred_devices)
                 break
-            try:
-                sent, device_failed, transport_failure, gap_closed, windows_advanced = await _backfill_device(
-                    device, state, integration, auth, pull_config, guards
-                )
-            except LotekUnauthorizedException:
-                raise
-            except Exception as e:
-                message = (
-                    f"Failed to backfill device {device.nDeviceID} for integration "
-                    f"{integration_id}: {describe_exception(e)}"
-                )
-                logger.exception(message)
-                await log_action_activity(
-                    integration_id=integration_id,
-                    action_id="backfill_observations",
-                    title=message,
-                    level=LogLevel.ERROR
-                )
-                failed_devices.append(device.nDeviceID)
-                guards.record(transport_failure=False)
-                continue
-            # Single recording site, mirroring the head-pass loop.
-            guards.record(transport_failure=transport_failure)
-            observations_extracted += sent
-            gaps_closed += int(gap_closed)
-            windows_advanced_total += windows_advanced
-            if device_failed:
-                failed_devices.append(device.nDeviceID)
-            else:
-                serviced_devices += 1
+            chunk = gapped[chunk_start:chunk_start + FETCH_CONCURRENCY]
+            results = await asyncio.gather(
+                *(
+                    _backfill_device(device, state, integration, auth, pull_config, guards)
+                    for device, state in chunk
+                ),
+                # Collect every task's outcome rather than aborting the chunk
+                # on the first exception: per-device failures stay per-device.
+                return_exceptions=True,
+            )
+            # Credentials refused is integration-wide and fatal; re-raise it
+            # over any per-device outcomes in the same chunk.
+            for res in results:
+                if isinstance(res, LotekUnauthorizedException):
+                    raise res
+            for (device, state), res in zip(chunk, results):
+                if isinstance(res, BaseException):
+                    message = (
+                        f"Failed to backfill device {device.nDeviceID} for integration "
+                        f"{integration_id}: {describe_exception(res)}"
+                    )
+                    logger.error(message, exc_info=res)
+                    await log_action_activity(
+                        integration_id=integration_id,
+                        action_id="backfill_observations",
+                        title=message,
+                        level=LogLevel.ERROR
+                    )
+                    failed_devices.append(device.nDeviceID)
+                    guards.record(transport_failure=False)
+                    continue
+                sent, device_failed, transport_failure, gap_closed, windows_advanced = res
+                # Single recording site, mirroring the head-pass loop.
+                guards.record(transport_failure=transport_failure)
+                observations_extracted += sent
+                gaps_closed += int(gap_closed)
+                windows_advanced_total += windows_advanced
+                if device_failed:
+                    failed_devices.append(device.nDeviceID)
+                else:
+                    serviced_devices += 1
 
         if failed_devices:
             message = (
