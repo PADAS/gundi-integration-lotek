@@ -133,6 +133,10 @@ def _to_utc(val: datetime) -> datetime:
 # each other in a loop. Per-integration (not global) because a login is slow
 # network I/O (connect 10s + read 30s worst case): one integration's re-auth
 # must not stall every other integration's fetches on the worker.
+# Growth bound: keys are integration ids served by THIS connector's worker —
+# a config-bound set (~15 for Lotek), not unbounded user input. Locks are a
+# few hundred bytes each; no eviction needed. Rejection memos are pruned on
+# expiry in get_token.
 _token_locks: dict = {}
 # A refused login is cached briefly and re-raised to concurrent waiters:
 # without this, every task in an in-flight chunk performs its own real login

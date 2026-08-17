@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock
 
 from gundi_core.schemas.v2 import LogLevel
 from app.actions.handlers import (
+    FETCH_CONCURRENCY,
     RETRY_ATTEMPTS,
     action_auth,
     action_pull_observations,
@@ -543,7 +544,8 @@ async def test_action_pull_observations_aborts_on_auth_failure(
     with pytest.raises(LotekUnauthorizedException):
         await action_pull_observations(lotek_integration, pull_config)
 
-    assert set(queried) == {"1", "2", "3", "4", "5"}, (
+    first_chunk = {str(i) for i in range(1, FETCH_CONCURRENCY + 1)}
+    assert set(queried) == first_chunk, (
         "should not have dispatched any chunk beyond the aborting one"
     )
 

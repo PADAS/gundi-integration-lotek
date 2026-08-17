@@ -344,9 +344,12 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             return_exceptions=True,
         )
         # Credentials refused is integration-wide and fatal; re-raise it over
-        # any per-device outcomes in the same chunk.
+        # any per-device outcomes in the same chunk. Cancellation must also
+        # propagate: with return_exceptions=True a task's CancelledError comes
+        # back as a result, and treating it as a device failure would swallow
+        # shutdown/timeout cancellation and keep the run going.
         for res in results:
-            if isinstance(res, LotekUnauthorizedException):
+            if isinstance(res, (LotekUnauthorizedException, asyncio.CancelledError)):
                 raise res
         for (device, state, is_new), res in zip(chunk, results):
             if isinstance(res, BaseException):
@@ -885,9 +888,10 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 return_exceptions=True,
             )
             # Credentials refused is integration-wide and fatal; re-raise it
-            # over any per-device outcomes in the same chunk.
+            # over any per-device outcomes in the same chunk. Cancellation
+            # must also propagate (see the head-pass loop).
             for res in results:
-                if isinstance(res, LotekUnauthorizedException):
+                if isinstance(res, (LotekUnauthorizedException, asyncio.CancelledError)):
                     raise res
             for (device, state), res in zip(chunk, results):
                 if isinstance(res, BaseException):
