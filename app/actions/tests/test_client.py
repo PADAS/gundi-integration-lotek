@@ -85,6 +85,9 @@ async def test_get_devices_unauthorized_raises(mocker, lotek_integration, auth_c
     exc = httpx.HTTPStatusError("401", request=resp.request, response=resp)
     mock_client = _make_mock_client(raise_exc=exc, method="get")
     mocker.patch("app.actions.client.get_token", return_value="token")
+    # invalidate_token compare-and-deletes: it reads the cached token first and
+    # only deletes when it still matches the one that got the 401.
+    mocker.patch("app.actions.client.state_manager.get_state", return_value={"token": "token"})
     mocker.patch("app.actions.client.state_manager.delete_state", return_value=None)
     mocker.patch("app.actions.client.httpx.AsyncClient", return_value=mock_client)
 
@@ -126,6 +129,9 @@ async def test_get_positions_unauthorized_raises(mocker, lotek_integration, auth
     exc = httpx.HTTPStatusError("401", request=resp.request, response=resp)
     mock_client = _make_mock_client(raise_exc=exc, method="get")
     mocker.patch("app.actions.client.get_token", return_value="token")
+    # invalidate_token compare-and-deletes: it reads the cached token first and
+    # only deletes when it still matches the one that got the 401.
+    mocker.patch("app.actions.client.state_manager.get_state", return_value={"token": "token"})
     mocker.patch("app.actions.client.state_manager.delete_state", return_value=None)
     mocker.patch("app.actions.client.httpx.AsyncClient", return_value=mock_client)
 
@@ -209,3 +215,45 @@ async def test_close_client_closes_and_clears_the_singleton(mocker):
 
     mock_client.aclose.assert_awaited_once()
     assert lotek_client._client is None
+
+
+@pytest.mark.asyncio
+async def test_stale_401_does_not_invalidate_a_fresh_token(mocker, lotek_integration):
+    # A slow request carrying the OLD token can 401 after a peer already
+    # re-logged-in and cached a FRESH one. Deleting then would discard the
+    # valid token and force another login, which (per Lotek semantics)
+    # invalidates the fresh token for every peer mid-request with it.
+    from app.actions import client as lotek_client
+
+    mocker.patch.object(lotek_client.state_manager, "get_state", AsyncMock(return_value={"token": "FRESH"}))
+    delete = mocker.patch.object(lotek_client.state_manager, "delete_state", AsyncMock())
+
+    await lotek_client.invalidate_token(lotek_integration, "STALE")
+    delete.assert_not_awaited()
+
+    await lotek_client.invalidate_token(lotek_integration, "FRESH")
+    delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rejected_login_is_memoized_for_concurrent_waiters(mocker, lotek_integration, auth_config):
+    # Only ONE real login attempt may hit Lotek per run when credentials are
+    # refused — concurrent waiters get the cached rejection re-raised.
+    from app.actions import client as lotek_client
+
+    mocker.patch.object(lotek_client.state_manager, "get_state", AsyncMock(return_value=None))
+    attempts = []
+
+    async def refused(integration, auth):
+        attempts.append(1)
+        raise LotekUnauthorizedException(message="refused", status_code=400)
+
+    mocker.patch.object(lotek_client, "get_token_from_api", refused)
+
+    import asyncio as _asyncio
+    results = await _asyncio.gather(
+        *(lotek_client.get_token(lotek_integration, auth_config) for _ in range(5)),
+        return_exceptions=True,
+    )
+    assert all(isinstance(r, LotekUnauthorizedException) for r in results)
+    assert len(attempts) == 1

@@ -279,8 +279,10 @@ async def test_action_pull_observations_aborts_when_login_is_rejected(
     with pytest.raises(LotekUnauthorizedException):
         await action_pull_observations(lotek_integration, pull_config)
 
-    assert len(logins) <= FETCH_CONCURRENCY, (
-        f"login attempted beyond the aborting chunk: {len(logins)} attempts"
+    # The rejection memo in get_token means concurrent waiters re-raise the
+    # cached refusal instead of each attempting a real login (lockout risk).
+    assert len(logins) == 1, (
+        f"a refused login must be attempted exactly once per run: {len(logins)} attempts"
     )
 
 

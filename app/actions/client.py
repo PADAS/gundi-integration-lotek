@@ -2,6 +2,7 @@ import asyncio
 import httpx
 import logging
 import pydantic
+import time
 
 from datetime import datetime, timedelta, timezone
 from pydantic import BaseModel
@@ -39,7 +40,11 @@ def _get_client() -> httpx.AsyncClient:
     if _client is None:
         _client = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=30.0, write=15.0, pool=5.0),
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            # Invariant: max_connections >= cloud_run_concurrency (4) *
+            # handlers.FETCH_CONCURRENCY (5) = 20 peak simultaneous requests.
+            # 32 leaves headroom so bumping either knob doesn't silently start
+            # queuing on the pool (PoolTimeout is breaker-feeding).
+            limits=httpx.Limits(max_connections=32, max_keepalive_connections=10),
         )
     return _client
 
@@ -120,26 +125,54 @@ def _to_utc(val: datetime) -> datetime:
     return val.astimezone(timezone.utc)
 
 
-# Serializes the read-login-store sequence below. Device fetches run with
-# bounded concurrency (handlers.FETCH_CONCURRENCY), so after a 401 clears the
-# cached token, several coroutines can find it missing at once — without the
-# lock each would log in separately, and Lotek logins invalidate the account's
-# previous token, so concurrent logins invalidate each other in a loop. The
-# lock makes one coroutine log in while the rest then read its cached result.
-_token_lock = asyncio.Lock()
+# Serializes the read-login-store sequence below, PER INTEGRATION. Device
+# fetches run with bounded concurrency (handlers.FETCH_CONCURRENCY), so after
+# a 401 clears the cached token, several coroutines can find it missing at
+# once — without the lock each would log in separately, and Lotek logins
+# invalidate the account's previous token, so concurrent logins invalidate
+# each other in a loop. Per-integration (not global) because a login is slow
+# network I/O (connect 10s + read 30s worst case): one integration's re-auth
+# must not stall every other integration's fetches on the worker.
+_token_locks: dict = {}
+# A refused login is cached briefly and re-raised to concurrent waiters:
+# without this, every task in an in-flight chunk performs its own real login
+# attempt against an account that just rejected the password — the exact
+# lockout risk the no-retry policy on LotekUnauthorizedException exists to
+# avoid. The cooldown clears well before the next scheduled run, so fixed
+# credentials are picked up on the following tick.
+_login_rejections: dict = {}
+LOGIN_REJECTION_COOLDOWN_SECONDS = 60.0
+
+
+def _get_token_lock(integration_id: str) -> asyncio.Lock:
+    lock = _token_locks.get(integration_id)
+    if lock is None:
+        lock = _token_locks[integration_id] = asyncio.Lock()
+    return lock
 
 
 async def get_token(integration, auth):
-    async with _token_lock:
+    integration_id = str(integration.id)
+    async with _get_token_lock(integration_id):
+        rejection = _login_rejections.get(integration_id)
+        if rejection is not None:
+            rejected_at, rejection_exc = rejection
+            if time.monotonic() - rejected_at < LOGIN_REJECTION_COOLDOWN_SECONDS:
+                raise rejection_exc
+            del _login_rejections[integration_id]
         saved_token = await state_manager.get_state(
-            str(integration.id),
+            integration_id,
             "pull_observations",
             "token"
         )
         if not saved_token:
-            token = await get_token_from_api(integration, auth)
+            try:
+                token = await get_token_from_api(integration, auth)
+            except LotekUnauthorizedException as e:
+                _login_rejections[integration_id] = (time.monotonic(), e)
+                raise
             await state_manager.set_state(
-                str(integration.id),
+                integration_id,
                 "pull_observations",
                 {"token": token},
                 "token"
@@ -148,6 +181,27 @@ async def get_token(integration, auth):
             token = saved_token.get("token")
 
     return token
+
+
+async def invalidate_token(integration, token):
+    """Compare-and-delete the cached token after a 401 on a data call.
+
+    Unconditional deletion is wrong under concurrent fetches: a slow request
+    still carrying the OLD token can 401 after a peer has already re-logged-in
+    and cached a FRESH one — deleting then would discard the valid token and
+    force another login, which (per Lotek semantics) invalidates the fresh
+    token for every peer mid-request with it. Only delete if the cache still
+    holds the exact token that got the 401.
+    """
+    integration_id = str(integration.id)
+    async with _get_token_lock(integration_id):
+        saved_token = await state_manager.get_state(
+            integration_id, "pull_observations", "token"
+        )
+        if saved_token and saved_token.get("token") == token:
+            await state_manager.delete_state(
+                integration_id, "pull_observations", "token"
+            )
 
 async def get_token_from_api(integration, auth):
     params = {
@@ -191,11 +245,7 @@ async def get_devices(integration, auth):
         if ex.response.status_code == 401:
             msg = "Received status code 401 - Token expired, fetching a new one..."
             logger.info(msg)
-            await state_manager.delete_state(
-                str(integration.id),
-                "pull_observations",
-                "token"
-            )
+            await invalidate_token(integration, token)
             raise LotekTokenExpiredException(message=f"401 Response from Lotek API", error=ex)
         else:
             msg = f'Lotek get_devices failed for user {auth.username}. Caught exception: {ex}'
@@ -236,11 +286,7 @@ async def get_positions(device_id, auth, integration, start_datetime=None, end_d
         if ex.response.status_code == 401:
             msg = "Received status code 401 - Token expired, fetching a new one..."
             logger.info(msg)
-            await state_manager.delete_state(
-                str(integration.id),
-                "pull_observations",
-                "token"
-            )
+            await invalidate_token(integration, token)
             raise LotekTokenExpiredException(message=f"401 Response from Lotek API", error=ex)
 
         msg = f'Lotek get_positions failed for user {auth.username}. Caught exception: {ex}'
