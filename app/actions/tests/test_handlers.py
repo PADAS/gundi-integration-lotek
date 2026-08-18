@@ -640,9 +640,13 @@ async def test_action_pull_observations_does_not_retry_rejected_login_at_get_dev
         raise LotekUnauthorizedException(message="Lotek login failed", status_code=400)
 
     mocker.patch("app.actions.client.get_devices", new=get_devices)
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
 
+    # The dispatcher owns the get_devices retry loop; calling it directly is
+    # what exercises the no-retry-on-refused-login guarantee (review finding:
+    # the run_head_pass conversion made this assertion vacuous).
     with pytest.raises(LotekUnauthorizedException):
-        await run_head_pass(lotek_integration, pull_config)
+        await action_pull_observations(lotek_integration, pull_config)
 
     assert len(attempts) == 1, f"refused login was retried {len(attempts)} times"
 

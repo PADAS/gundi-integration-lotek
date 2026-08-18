@@ -90,6 +90,15 @@ class PullObservationsShardConfig(InternalActionConfiguration):
         title="Triggered By",
         description="Which action triggered this shard.",
     )
+    manual_run: bool = pydantic.Field(
+        False,
+        title="Manual Run",
+        description=(
+            "True when the dispatching pull_observations run was operator-"
+            "triggered while the integration is paused; exempts this shard "
+            "from the pause skip so the portal's Trigger button still pulls."
+        ),
+    )
     generation: int = pydantic.Field(
         0,
         ge=0,

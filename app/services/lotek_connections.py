@@ -5,6 +5,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 import redis.asyncio as redis
+import stamina
 
 from app import settings
 
@@ -68,10 +69,17 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300):
     client = _client()
     key = connection_key(username)
     token = str(uuid.uuid4())
-    now = time.time()
-    acquired = await client.eval(
-        _ACQUIRE_LUA, 1, key, now, now + ttl_seconds, settings.LOTEK_MAX_CONNECTIONS, token
-    )
+    # Retried like every IntegrationStateManager Redis op (review finding: an
+    # unretried transient Redis error here escaped as a fake per-device
+    # failure downstream — a blip in OUR Redis said nothing about Lotek).
+    async for attempt in stamina.retry_context(
+        on=redis.RedisError, attempts=3, wait_initial=0.1, wait_max=2.0
+    ):
+        with attempt:
+            now = time.time()
+            acquired = await client.eval(
+                _ACQUIRE_LUA, 1, key, now, now + ttl_seconds, settings.LOTEK_MAX_CONNECTIONS, token
+            )
     if not acquired:
         raise NoConnectionSlot(f"No Lotek connection slot available (limit {settings.LOTEK_MAX_CONNECTIONS}).")
     try:

@@ -336,6 +336,10 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             title=message,
             level=LogLevel.WARNING
         )
+        # Any non-starved outcome breaks the "consecutive" skip streak — a
+        # transport skip between two slot skips must not let them read as
+        # adjacent (review finding).
+        await _reset_dispatcher_skip_streak(integration_id)
         return {
             "devices_found": 0,
             "shards_triggered": 0,
@@ -380,13 +384,54 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     staleness.sort(key=lambda entry: entry[1])
     device_ids = [device_id for device_id, _ in staleness]
 
+    # Manual-run marker: the runner's pause check only skips SCHEDULED runs,
+    # so if this dispatcher is executing while run_on_schedule is off, the run
+    # is manual — the shards it publishes are machine-triggered and would
+    # otherwise skip on the pause, silently breaking the portal's Trigger
+    # button for the whole head pass (review finding).
+    manual_run = not action_config.run_on_schedule
+
+    # Per-shard guard (review finding): an unguarded loop let one pubsub blip
+    # abort every remaining shard AND escape through the runner's generic
+    # error handler (whose ERROR event embeds the integration's full config,
+    # auth included). Failures are collected, not fatal — the next tick
+    # re-lists and re-shards everything.
     shards = list(generate_batches(device_ids, SHARD_SIZE))
+    dispatched = 0
+    undispatched_devices = []
     for shard in shards:
-        await trigger_action(
-            integration_id, "pull_observations_shard",
-            config=PullObservationsShardConfig(devices=shard, triggered_by="pull_observations")
+        try:
+            await trigger_action(
+                integration_id, "pull_observations_shard",
+                config=PullObservationsShardConfig(
+                    devices=shard, triggered_by="pull_observations", manual_run=manual_run
+                )
+            )
+            dispatched += 1
+        except Exception as e:
+            undispatched_devices.extend(shard)
+            logger.warning(
+                f"Could not dispatch a shard of {len(shard)} device(s) for integration "
+                f"{integration_id}: {describe_exception(e)}"
+            )
+    if undispatched_devices:
+        message = (
+            f"Dispatched {dispatched} of {len(shards)} shard(s) for integration "
+            f"{integration_id}; {len(undispatched_devices)} device(s) get no pull this "
+            f"tick and are retried on the next schedule: {_summarize_ids(undispatched_devices)}."
         )
-    return {"devices_found": len(device_list), "shards_triggered": len(shards)}
+        logger.warning(message)
+        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.WARNING)
+    if shards and dispatched == 0:
+        # Nothing was handed off at all: systemic (commands topic down), must
+        # alert rather than publish action_complete.
+        raise LotekException(
+            message=(
+                f"Could not dispatch any of {len(shards)} shard(s) for integration "
+                f"{integration_id}; see the application log for the publish errors."
+            )
+        )
+    return {"devices_found": len(device_list), "shards_triggered": dispatched}
 
 
 async def _bump_dispatcher_skip_streak(integration_id):
@@ -419,7 +464,7 @@ async def _reset_dispatcher_skip_streak(integration_id):
         )
 
 
-async def _retrigger_shard(integration, device_ids, generation):
+async def _retrigger_shard(integration, device_ids, generation, manual_run=False):
     """Re-dispatch deferred devices as a fresh shard with its own budget,
     instead of parking them until the next scheduled tick.
 
@@ -454,6 +499,7 @@ async def _retrigger_shard(integration, device_ids, generation):
                 devices=device_ids,
                 triggered_by="pull_observations_shard",
                 generation=generation + 1,
+                manual_run=manual_run,
             )
         )
         return True
@@ -487,9 +533,13 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         )
         return {"skipped": True, "reason": "configuration_missing"}
 
-    if not pull_config.run_on_schedule:
+    if not pull_config.run_on_schedule and not action_config.manual_run:
         # The operator's pause toggle must also stop the shard cascade:
         # internal actions bypass the runner's skippable_pull pause check.
+        # manual_run exempts shards belonging to a portal-triggered run — the
+        # runner only pauses SCHEDULED runs, and without the exemption a
+        # manual Trigger on a paused integration dispatched shards that all
+        # skipped, showing success while pulling nothing (review finding).
         logger.info(f"Integration {integration_id} is paused (run_on_schedule=false); skipping shard.")
         return {"skipped": True, "reason": "integration_paused"}
 
@@ -523,7 +573,8 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             # exists to buy. Its devices wait for the next scheduled tick.
             if reason == "deadline":
                 retriggered = await _retrigger_shard(
-                    integration, deferred_devices, action_config.generation
+                    integration, deferred_devices, action_config.generation,
+                    manual_run=action_config.manual_run,
                 )
             disposition = (
                 "to an immediately re-triggered shard" if retriggered
@@ -597,12 +648,21 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
                 device_id for device_id, _, _ in device_states[chunk_start + FETCH_CONCURRENCY:]
             ]
             budget_starved = True
-            logger.info(
-                f"Deferring {len(deferred_devices)} device(s) for integration {integration_id}: "
-                f"Lotek connection budget exhausted."
-            )
             retriggered = await _retrigger_shard(
-                integration, deferred_devices, action_config.generation
+                integration, deferred_devices, action_config.generation,
+                manual_run=action_config.manual_run,
+            )
+            # Portal WARNING like every other deferral cause (review finding:
+            # this branch was logger.info only, so a starved tail whose
+            # re-trigger also failed parked with zero portal visibility —
+            # contradicting the zero-progress comment's claim).
+            await _log_deferral(
+                integration, "pull_observations_shard", "connection budget exhausted",
+                deferred_devices,
+                disposition=(
+                    "to an immediately re-triggered shard" if retriggered
+                    else "to the next scheduled run"
+                ),
             )
             break
 
@@ -648,7 +708,8 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         # budget back-off, not degradation (mirrors backfill's budget_starved;
         # review finding — the old condition flipped a starvation + pubsub
         # blip into a false systemic ERROR). Starvation visibility comes from
-        # the deferral WARNING and the re-trigger cap's ERROR instead.
+        # the _log_deferral WARNING on the starved branch and the re-trigger
+        # cap's ERROR instead.
         raise LotekException(
             message=(
                 f"No devices could be serviced for integration {integration.id}: "
@@ -894,7 +955,7 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
 
     lower_date = max(state.high_water - HEAD_LATE_UPLOAD_OVERLAP, freshness_floor)
     cdip_positions, transport_failure = await _fetch_window(
-        device_id, integration, auth, action_config, lower_date, present_time, guards, "pull_observations"
+        device_id, integration, auth, action_config, lower_date, present_time, guards, "pull_observations_shard"
     )
     if cdip_positions is None:
         return 0, True, transport_failure
@@ -906,7 +967,7 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
         # contributor to the publish congestion behind GUNDI-5602.
         logger.info(f"No positions fetched for device {device_id} integration ID: {integration.id}.")
 
-    observations_sent, delivery_failed = await _deliver(cdip_positions, device_id, integration, "pull_observations")
+    observations_sent, delivery_failed = await _deliver(cdip_positions, device_id, integration, "pull_observations_shard")
     if delivery_failed:
         # The breaker watches Lotek, not Gundi: a delivery failure is not
         # evidence of Lotek-wide degradation.
@@ -938,7 +999,7 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
             f"{integration.id} Exception: {describe_exception(e)}"
         )
         logger.exception(message)
-        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.ERROR)
+        await _try_log_activity(integration_id, "pull_observations_shard", message, LogLevel.ERROR)
         return observations_sent, True, False
 
     if stale_from is not None:
@@ -1189,9 +1250,9 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                     d.nDeviceID for d, _ in gapped[chunk_start + FETCH_CONCURRENCY:]
                 ]
                 budget_starved = True
-                logger.info(
-                    f"Deferring {len(deferred_devices)} gapped device(s) for integration "
-                    f"{integration_id}: Lotek connection budget exhausted."
+                await _log_deferral(
+                    integration, "backfill_observations", "connection budget exhausted",
+                    deferred_devices, disposition="to the next backfill trigger",
                 )
                 break
 

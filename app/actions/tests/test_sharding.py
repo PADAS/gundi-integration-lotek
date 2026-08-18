@@ -362,3 +362,61 @@ async def test_dispatcher_skip_streak_warns_after_consecutive_skips(
     await action_pull_observations(lotek_integration, pull_config)
     from app.actions.handlers import DISPATCHER_SKIP_STREAK_SOURCE
     assert DISPATCHER_SKIP_STREAK_SOURCE not in streak_state
+
+
+@pytest.mark.asyncio
+async def test_dispatch_failures_do_not_abort_remaining_shards(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # One pubsub blip must not abort the fan-out (and must never escape into
+    # the runner's config-embedding generic error handler).
+    device_ids = [str(i) for i in range(1, SHARD_SIZE * 3 + 1)]  # 3 shards
+    _setup_pull_mocks(mocker, mock_redis, _devices(*device_ids))
+    log = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+    calls = []
+
+    async def flaky_trigger(integration_id, action_id, config=None):
+        calls.append(config)
+        if len(calls) == 2:
+            raise Exception("pubsub blip")
+
+    mocker.patch("app.actions.handlers.trigger_action", new=flaky_trigger)
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert result["shards_triggered"] == 2  # shard 2 failed, 1 and 3 dispatched
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_all_dispatches_failing_raises(mocker, lotek_integration, pull_config, mock_redis):
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+    mocker.patch(
+        "app.actions.handlers.trigger_action",
+        new=AsyncMock(side_effect=Exception("commands topic down")),
+    )
+    from app.actions.client import LotekException
+    with pytest.raises(LotekException, match="Could not dispatch any"):
+        await action_pull_observations(lotek_integration, pull_config)
+
+
+@pytest.mark.asyncio
+async def test_manual_run_shards_bypass_the_pause(mocker, lotek_integration, pull_config, mock_redis):
+    # Portal Trigger on a paused integration: the runner bypasses the pause
+    # for the manual dispatcher run, and the shards it publishes must carry
+    # manual_run so they don't skip (review finding: they used to, showing a
+    # successful run that pulled nothing).
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    pull_config.run_on_schedule = False  # paused; reaching the dispatcher means manual
+
+    await action_pull_observations(lotek_integration, pull_config)
+
+    shard_config = trigger.await_args_list[0].kwargs["config"]
+    assert shard_config.manual_run is True
+
+    # And the shard itself honors the marker instead of skipping.
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    result = await action_pull_observations_shard(lotek_integration, shard_config)
+    assert result.get("reason") != "integration_paused"
