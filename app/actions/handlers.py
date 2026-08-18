@@ -80,6 +80,10 @@ SHARD_RETRIGGER_CAP = 3
 # saturated across ticks and must be visible in the portal.
 DISPATCHER_SKIP_WARN_AFTER = 2
 DISPATCHER_SKIP_STREAK_SOURCE = "slot_skip_streak"
+# How many device cursors the dispatcher reads concurrently when ordering the
+# fleet. Independent of SHARD_SIZE (this bounds Redis fan-out, not action
+# budget) — named so tuning one does not silently look like it covers the other.
+STATE_READ_CONCURRENCY = 25
 # Outcomes of a deferred-tail re-trigger attempt (see _retrigger_shard).
 RETRIGGER_HANDED_OFF = "handed_off"
 RETRIGGER_CAP_REACHED = "cap_reached"
@@ -296,7 +300,16 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     devices, order them least-fresh first, and fan the fleet out as
     pull_observations_shard sub-actions of SHARD_SIZE ids each. Every shard
     invocation gets its own MAX_ACTION_EXECUTION_TIME budget, so a 600-device
-    account no longer has to fit one 540s window."""
+    account no longer has to fit one 540s window.
+
+    RESULT CONTRACT CHANGE (Copilot review): this action no longer does the
+    fetching, so it no longer reports `observations_extracted`, `devices_failed`
+    or `devices_deferred` — those now belong to each pull_observations_shard
+    result (and its completion event). This action returns `devices_found` and
+    `shards_triggered`, plus `devices_undispatched` when a publish failed, and
+    `skipped`/`reason` when the tick was skipped. Anything aggregating per-tick
+    throughput must sum the shard results instead of reading this one.
+    """
     # Log only the id: the full Integration object embeds auth config data in
     # plaintext (same leak family as the action-runner _handle_error ticket).
     logger.info(f"Executing pull_observations action for integration {integration.id}...")
@@ -391,12 +404,12 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
     # Bounded-concurrency reads (Copilot review): sequential awaits made this
     # sort a per-device Redis round trip — a latency multiplier on exactly the
-    # large fleets sharding exists to serve. Chunks of 25 keep the dispatcher
-    # fast without a thundering herd on Redis.
+    # large fleets sharding exists to serve. STATE_READ_CONCURRENCY keeps the
+    # dispatcher fast without a thundering herd on Redis.
     staleness = []
     all_ids = [device.nDeviceID for device in device_list]
-    for i in range(0, len(all_ids), 25):
-        staleness.extend(await asyncio.gather(*(read_high_water(d) for d in all_ids[i:i + 25])))
+    for batch in generate_batches(all_ids, STATE_READ_CONCURRENCY):
+        staleness.extend(await asyncio.gather(*(read_high_water(d) for d in batch)))
     staleness.sort(key=lambda entry: entry[1])
     device_ids = [device_id for device_id, _ in staleness]
 
@@ -1378,6 +1391,14 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             any(state.has_gap for _, state in gapped)
             and not breaker_hot
             and windows_advanced_total > 0
+            # Budget starvation suppresses the cascade for the same reason a hot
+            # breaker does (Copilot review): a run that advanced a window and
+            # then starved would re-trigger straight back into a saturated
+            # account budget, competing with the head-pass shards that are
+            # holding it. Unlike the shard cascade this one has no generation
+            # cap, so the throttle has to come from here; the next scheduled
+            # head pass re-triggers it once the budget frees up.
+            and not budget_starved
         )
         result = {
             'observations_extracted': observations_extracted,

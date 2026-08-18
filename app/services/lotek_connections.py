@@ -19,12 +19,19 @@ class NoConnectionSlot(Exception):
 # Atomic acquire: purge expired slots, then add a new slot only if under the
 # ceiling. KEYS[1]=zset key. ARGV: now, expiry, ceiling, token.
 # Returns 1 if acquired, 0 if at capacity.
+# The key itself is given a TTL on every acquire (Copilot review): members
+# carry logical expiry in their score, but they are only purged by a LATER
+# acquire — so an account that stops being used would leave its zset behind
+# forever. The TTL is refreshed on each acquire and comfortably outlives the
+# longest-lived member, so it can never expire a key with live holders.
 _ACQUIRE_LUA = """
 redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
 if redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[3]) then
     redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
     return 1
 end
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
 return 0
 """
 
@@ -78,7 +85,8 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300):
         with attempt:
             now = time.time()
             acquired = await client.eval(
-                _ACQUIRE_LUA, 1, key, now, now + ttl_seconds, settings.LOTEK_MAX_CONNECTIONS, token
+                _ACQUIRE_LUA, 1, key, now, now + ttl_seconds,
+                settings.LOTEK_MAX_CONNECTIONS, token, ttl_seconds * 2,
             )
     if not acquired:
         raise NoConnectionSlot(f"No Lotek connection slot available (limit {settings.LOTEK_MAX_CONNECTIONS}).")

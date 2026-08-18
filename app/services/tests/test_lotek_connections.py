@@ -25,8 +25,9 @@ async def test_acquire_under_capacity_grants_and_releases(fake_redis):
     assert fake_redis.eval.await_count == 1
     args = fake_redis.eval.await_args.args
     assert args[2] == connection_key("user@example.com")
-    # ...and the exact member added is the one removed on release.
-    token = args[-1]
+    # ...and the exact member added is the one removed on release. (ARGV order:
+    # now, expiry, ceiling, token, key_ttl — the token is second from the end.)
+    token = args[-2]
     fake_redis.zrem.assert_awaited_once_with(connection_key("user@example.com"), token)
 
 
@@ -63,12 +64,15 @@ async def test_expiry_score_and_ceiling_are_passed_to_the_lua_script(fake_redis)
     async with lotek_slot("user@example.com", ttl_seconds=300):
         pass
     args = fake_redis.eval.await_args.args
-    # ARGV: now, expiry, ceiling, token (after script + numkeys + key)
+    # ARGV: now, expiry, ceiling, token, key_ttl (after script + numkeys + key)
     now_arg, expiry_arg, ceiling_arg = args[3], args[4], args[5]
     assert before <= now_arg <= time.time()
     assert expiry_arg == pytest.approx(now_arg + 300)
     from app import settings
     assert ceiling_arg == settings.LOTEK_MAX_CONNECTIONS
+    # The key's own TTL must outlive the longest-lived member, so a refresh can
+    # never expire a key that still has live holders.
+    assert args[7] > 300
 
 
 def test_connection_key_is_stable_and_username_scoped():
