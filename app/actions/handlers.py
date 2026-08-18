@@ -66,6 +66,20 @@ FETCH_CONCURRENCY = 5
 # budget. Sized so a shard finishes comfortably inside one budget even on a
 # slow tick (25 devices / FETCH_CONCURRENCY = 5 chunks of round trips).
 SHARD_SIZE = 25
+# Re-trigger governor (review finding, PR #20 discussion): a deferred tail may
+# hop to a fresh shard at most this many times before falling back to the next
+# scheduled tick. Without the cap, sustained slot starvation turned the
+# "pubsub round trip is the backoff" re-trigger into an unbounded busy-loop of
+# zero-progress invocations — bounded waste is acceptable, an ungoverned loop
+# is not. Exceeding the cap is surfaced at ERROR: it means the account could
+# not drain within ~cap budgets and someone should know.
+SHARD_RETRIGGER_CAP = 3
+# Consecutive whole-tick dispatcher skips on slot starvation before the skip
+# is promoted from local log to a portal WARNING. The first skip stays quiet
+# (publish-volume discipline); a streak means the account budget has been
+# saturated across ticks and must be visible in the portal.
+DISPATCHER_SKIP_WARN_AFTER = 2
+DISPATCHER_SKIP_STREAK_SOURCE = "slot_skip_streak"
 # Head fetches re-cover this much of the cursor's trailing edge: rows whose
 # server-assigned UploadTimeStamp falls inside a window we already queried can
 # become queryable only after our request completed (write latency / clock
@@ -276,16 +290,29 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     try:
         async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
             with attempt:
+                # Token outside the slot — see _fetch_window.
+                await client.get_token(integration, auth)
                 async with lotek_slot(auth.username):
                     device_list = await client.get_devices(integration, auth)
     except NoConnectionSlot:
         # Account budget saturated (shards/backfills from a previous tick are
         # still draining). Scheduled tick — skip cleanly and let the next one
-        # retry, mirroring the movebank pull's no_connection_slot skip.
-        logger.info(
+        # retry, mirroring the movebank pull's no_connection_slot skip. A
+        # single skip stays out of the portal, but a STREAK of skipped ticks
+        # means the account has been saturated for tens of minutes and must
+        # not stay invisible (review finding: this was logger.info only).
+        message = (
             f"Skipping pull for integration {integration_id}: Lotek connection budget "
             f"exhausted; the next scheduled tick will retry."
         )
+        logger.info(message)
+        streak = await _bump_dispatcher_skip_streak(integration_id)
+        if streak >= DISPATCHER_SKIP_WARN_AFTER:
+            await _try_log_activity(
+                integration_id, "pull_observations",
+                f"{message} ({streak} consecutive ticks skipped on connection-budget exhaustion.)",
+                LogLevel.WARNING,
+            )
         return {"skipped": True, "reason": "no_connection_slot"}
     except httpx.TransportError as e:
         # Transport failures reaching Lotek are the same class the per-device
@@ -322,6 +349,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         raise  # bare: preserve the original traceback
 
     logger.info(f"Extracted {len(device_list)} devices from Lotek for inbound: {integration.id}")
+    await _reset_dispatcher_skip_streak(integration_id)
     if not device_list:
         return {"devices_found": 0, "shards_triggered": 0}
 
@@ -347,14 +375,72 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     return {"devices_found": len(device_list), "shards_triggered": len(shards)}
 
 
-async def _retrigger_shard(integration_id, device_ids):
+async def _bump_dispatcher_skip_streak(integration_id):
+    """Best-effort consecutive-skip counter for the dispatcher's slot-starved
+    tick skips. A Redis blip must not turn a clean skip into a failure."""
+    try:
+        saved = await state_manager.get_state(
+            integration_id, "pull_observations", DISPATCHER_SKIP_STREAK_SOURCE
+        )
+        streak = int((saved or {}).get("streak", 0)) + 1
+        await state_manager.set_state(
+            integration_id, "pull_observations", {"streak": streak}, DISPATCHER_SKIP_STREAK_SOURCE
+        )
+        return streak
+    except Exception as e:
+        logger.warning(
+            f"Could not track skip streak for integration {integration_id}: {describe_exception(e)}"
+        )
+        return 1
+
+
+async def _reset_dispatcher_skip_streak(integration_id):
+    try:
+        await state_manager.delete_state(
+            integration_id, "pull_observations", DISPATCHER_SKIP_STREAK_SOURCE
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not reset skip streak for integration {integration_id}: {describe_exception(e)}"
+        )
+
+
+async def _retrigger_shard(integration, device_ids, generation):
     """Re-dispatch deferred devices as a fresh shard with its own budget,
-    instead of parking them until the next scheduled tick. Best-effort: the
-    next tick re-lists and re-shards everything anyway."""
+    instead of parking them until the next scheduled tick.
+
+    Governed by SHARD_RETRIGGER_CAP: `generation` is the CURRENT shard's hop
+    count, and the cap bounds how deep a defer-retrigger chain can grow before
+    the tail falls back to the next scheduled tick — an ungoverned chain under
+    sustained slot starvation was an unbounded busy-loop of zero-progress
+    invocations, invisible because each hop reported success (review finding).
+    Returns True only when the tail was actually handed off. Best-effort
+    otherwise: the next tick re-lists and re-shards everything anyway.
+    """
+    integration_id = str(integration.id)
+    if generation >= SHARD_RETRIGGER_CAP:
+        # ERROR, not WARNING: the account failed to drain within ~cap action
+        # budgets — either the connection budget is far too small for the
+        # fleet or something is systemically slow. The data self-heals on the
+        # next tick; the signal must not.
+        message = (
+            f"Shard re-trigger cap ({SHARD_RETRIGGER_CAP}) reached for integration "
+            f"{integration_id}: deferring {len(device_ids)} device(s) to the next "
+            f"scheduled tick: {_summarize_ids(device_ids)}."
+        )
+        logger.error(message)
+        await _try_log_activity(
+            integration_id, "pull_observations_shard", message, LogLevel.ERROR
+        )
+        return False
     try:
         await trigger_action(
             integration_id, "pull_observations_shard",
-            config=PullObservationsShardConfig(devices=device_ids, triggered_by="pull_observations_shard")
+            config=PullObservationsShardConfig(
+                devices=device_ids,
+                triggered_by="pull_observations_shard",
+                generation=generation + 1,
+            )
         )
         return True
     except Exception as e:
@@ -408,6 +494,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
     failed_devices = []
     deferred_devices = []
     retriggered = False
+    budget_starved = False
     serviced_devices = 0
     # Only reflects devices actually processed this run — a device deferred by
     # the rails before its gap status is checked doesn't trigger backfill this
@@ -422,7 +509,9 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             # does NOT re-trigger — that would defeat the pause the breaker
             # exists to buy. Its devices wait for the next scheduled tick.
             if reason == "deadline":
-                retriggered = await _retrigger_shard(integration_id, deferred_devices)
+                retriggered = await _retrigger_shard(
+                    integration, deferred_devices, action_config.generation
+                )
             break
         chunk = device_states[chunk_start:chunk_start + FETCH_CONCURRENCY]
         results = await asyncio.gather(
@@ -486,11 +575,14 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             deferred_devices = slot_starved + [
                 device_id for device_id, _, _ in device_states[chunk_start + FETCH_CONCURRENCY:]
             ]
+            budget_starved = True
             logger.info(
                 f"Deferring {len(deferred_devices)} device(s) for integration {integration_id}: "
                 f"Lotek connection budget exhausted."
             )
-            retriggered = await _retrigger_shard(integration_id, deferred_devices)
+            retriggered = await _retrigger_shard(
+                integration, deferred_devices, action_config.generation
+            )
             break
 
     if failed_devices:
@@ -525,11 +617,17 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             level=LogLevel.WARNING
         )
 
-    if device_states and serviced_devices == 0 and observations_extracted == 0 and not retriggered:
+    if (device_states and serviced_devices == 0 and observations_extracted == 0
+            and not retriggered and not budget_starved):
         # Zero progress: nothing serviced, nothing delivered, and no deferred
         # tail re-dispatched — systemic degradation, must alert rather than
         # publish action_complete. A successfully re-triggered deferral is
-        # progress (the work moved to a fresh budget), so it stays a warning.
+        # progress (the work moved to a fresh budget). Slot starvation NEVER
+        # raises, even when the re-trigger hand-off also failed: it is a clean
+        # budget back-off, not degradation (mirrors backfill's budget_starved;
+        # review finding — the old condition flipped a starvation + pubsub
+        # blip into a false systemic ERROR). Starvation visibility comes from
+        # the deferral WARNING and the re-trigger cap's ERROR instead.
         raise LotekException(
             message=(
                 f"No devices could be serviced for integration {integration.id}: "
@@ -647,6 +745,13 @@ async def _fetch_window(device_id, integration, auth, config, lower_date, upper_
     try:
         async for attempt in stamina.retry_context(**_fetch_retry_kwargs(guards.run_started_at), wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
             with attempt:
+                # Pre-resolve the token OUTSIDE the slot: get_positions calls
+                # get_token internally, and on a cache miss that is a full
+                # login (plus possible queueing on the per-integration token
+                # lock) — holding a slot through it both starves peers and
+                # risks outliving the slot TTL (review finding). Pre-warmed,
+                # the in-slot get_token is a single cached Redis read.
+                await client.get_token(integration, auth)
                 # The slot is held for exactly one request and re-acquired on
                 # retry, so a stamina backoff never parks a slot idle.
                 async with lotek_slot(auth.username):
@@ -939,6 +1044,8 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         try:
             async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
                 with attempt:
+                    # Token outside the slot — see _fetch_window.
+                    await client.get_token(integration, auth)
                     async with lotek_slot(auth.username):
                         device_list = await client.get_devices(integration, auth)
         except NoConnectionSlot:

@@ -90,6 +90,17 @@ class PullObservationsShardConfig(InternalActionConfiguration):
         title="Triggered By",
         description="Which action triggered this shard.",
     )
+    generation: int = pydantic.Field(
+        0,
+        ge=0,
+        title="Generation",
+        description=(
+            "Re-trigger hop count. The dispatcher publishes generation 0; each "
+            "deferred-tail re-trigger increments it. Capped in the handler so a "
+            "shard that keeps deferring falls back to the next scheduled tick "
+            "instead of looping."
+        ),
+    )
 
 
 class BackfillObservationsConfig(InternalActionConfiguration):

@@ -46,7 +46,7 @@ def _client() -> redis.Redis:
 
 
 @asynccontextmanager
-async def lotek_slot(username: str, *, ttl_seconds: int = 120):
+async def lotek_slot(username: str, *, ttl_seconds: int = 300):
     """Acquire one Lotek connection slot for `username`, shared across every
     shard/backfill invocation on the same Redis. Raises NoConnectionSlot if at
     capacity. (Movebank-connector pattern: once the head pass fans out into
@@ -55,8 +55,15 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 120):
 
     Slots are members of a per-username sorted set scored by expiry time, so a
     crashed holder's slot self-expires (purged on the next acquire) rather than
-    leaking the budget permanently. The TTL only needs to outlive one request
-    (connect 10s + read 30s worst case, times one stamina retry).
+    leaking the budget permanently. TTL sizing: the slot is released between
+    stamina attempts (re-acquired per attempt), so retries never extend a
+    hold. What CAN extend one is a 401-triggered re-login inside the request
+    (token invalidated mid-flight — callers pre-warm the token before
+    acquiring, so this is the rare path, but it stacks a login's
+    connect+read on top of the request's own, plus queueing on the
+    per-integration token lock). 300s covers that worst case; a hold that
+    somehow outlives the TTL only soft-fails (one extra admission until the
+    next purge).
     """
     client = _client()
     key = connection_key(username)

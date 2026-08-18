@@ -224,3 +224,141 @@ async def test_shard_config_requires_at_least_one_device():
     import pydantic
     with pytest.raises(pydantic.ValidationError):
         PullObservationsShardConfig(devices=[])
+
+
+# --- Re-trigger governor + starvation alarm fixes (PR #20 review blockers) ---
+
+
+@pytest.mark.asyncio
+async def test_retrigger_increments_generation(mocker, lotek_integration, pull_config, mock_redis):
+    import itertools
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    mocker.patch(
+        "app.actions.handlers._deadline_exceeded",
+        side_effect=itertools.chain([False] * 6, itertools.repeat(True)),
+    )
+
+    config = PullObservationsShardConfig(devices=[str(i) for i in range(1, 9)], generation=1)
+    await action_pull_observations_shard(lotek_integration, config)
+
+    shard_calls = [c for c in trigger.await_args_list if c.args[1] == "pull_observations_shard"]
+    assert shard_calls[0].kwargs["config"].generation == 2
+
+
+@pytest.mark.asyncio
+async def test_retrigger_cap_falls_back_to_next_tick_with_error(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # At the cap the tail is NOT re-triggered (next scheduled tick picks it
+    # up) and the exhaustion is surfaced at ERROR — an ungoverned chain under
+    # sustained starvation was an invisible busy-loop (review blocker).
+    from app.actions.handlers import SHARD_RETRIGGER_CAP
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    log = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+
+    @asynccontextmanager
+    async def starved_slot(username, **kwargs):
+        raise NoConnectionSlot("no slot")
+        yield
+
+    mocker.patch("app.actions.handlers.lotek_slot", starved_slot)
+
+    config = PullObservationsShardConfig(devices=["1", "2"], generation=SHARD_RETRIGGER_CAP)
+    result = await action_pull_observations_shard(lotek_integration, config)  # must not raise
+
+    assert result["devices_deferred"] == ["1", "2"]
+    shard_calls = [c for c in trigger.await_args_list if c.args[1] == "pull_observations_shard"]
+    assert shard_calls == []
+    cap_errors = [
+        c for c in log.await_args_list
+        if c.kwargs.get("level") == LogLevel.ERROR and "re-trigger cap" in c.kwargs.get("title", "")
+    ]
+    assert len(cap_errors) == 1
+
+
+@pytest.mark.asyncio
+async def test_slot_starvation_never_raises_even_when_retrigger_fails(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Starvation + a failed re-trigger publish is a clean back-off plus a
+    # pubsub blip — NOT systemic degradation. The old condition raised the
+    # zero-progress LotekException here (review blocker, both directions).
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch(
+        "app.actions.handlers.trigger_action",
+        new=AsyncMock(side_effect=Exception("pubsub down")),
+    )
+
+    @asynccontextmanager
+    async def starved_slot(username, **kwargs):
+        raise NoConnectionSlot("no slot")
+        yield
+
+    mocker.patch("app.actions.handlers.lotek_slot", starved_slot)
+
+    result = await action_pull_observations_shard(
+        lotek_integration, _shard_config("1", "2")
+    )  # must not raise
+
+    assert sorted(result["devices_deferred"], key=int) == ["1", "2"]
+    assert result["devices_failed"] == []
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_skip_streak_warns_after_consecutive_skips(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # One skipped tick stays out of the portal; a streak must not stay
+    # invisible (review blocker: the skip was logger.info only).
+    from app.actions.handlers import DISPATCHER_SKIP_WARN_AFTER
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    log = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+    mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+
+    streak_state = {}
+
+    async def get_state(integration_id, action_id, source_id="no-source"):
+        return streak_state.get(source_id)
+
+    async def set_state(integration_id, action_id, state, source_id="no-source", **kwargs):
+        streak_state[source_id] = state
+
+    async def delete_state(integration_id, action_id, source_id="no-source"):
+        streak_state.pop(source_id, None)
+
+    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(side_effect=get_state))
+    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(side_effect=set_state))
+    mocker.patch("app.services.state.IntegrationStateManager.delete_state", new=AsyncMock(side_effect=delete_state))
+
+    @asynccontextmanager
+    async def starved_slot(username, **kwargs):
+        raise NoConnectionSlot("no slot")
+        yield
+
+    mocker.patch("app.actions.handlers.lotek_slot", starved_slot)
+
+    warnings = lambda: [
+        c for c in log.await_args_list
+        if c.kwargs.get("level") == LogLevel.WARNING and "consecutive ticks" in c.kwargs.get("title", "")
+    ]
+    for tick in range(1, DISPATCHER_SKIP_WARN_AFTER + 1):
+        result = await action_pull_observations(lotek_integration, pull_config)
+        assert result == {"skipped": True, "reason": "no_connection_slot"}
+        assert len(warnings()) == (1 if tick >= DISPATCHER_SKIP_WARN_AFTER else 0)
+
+    # A successful tick resets the streak.
+    mocker.patch("app.actions.handlers.lotek_slot", None)  # restore not needed; grant below
+
+    @asynccontextmanager
+    async def granted_slot(username, **kwargs):
+        yield
+
+    mocker.patch("app.actions.handlers.lotek_slot", granted_slot)
+    await action_pull_observations(lotek_integration, pull_config)
+    from app.actions.handlers import DISPATCHER_SKIP_STREAK_SOURCE
+    assert DISPATCHER_SKIP_STREAK_SOURCE not in streak_state

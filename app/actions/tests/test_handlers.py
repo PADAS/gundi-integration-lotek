@@ -814,6 +814,7 @@ async def test_get_devices_failure_logs_exception_type_when_message_is_empty(
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
     mocker.patch(
         "app.actions.client.get_devices",
         new=AsyncMock(side_effect=httpx.ReadTimeout("")),
