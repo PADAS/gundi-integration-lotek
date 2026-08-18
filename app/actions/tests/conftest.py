@@ -51,6 +51,48 @@ def _reset_shared_http_client():
 
 
 @pytest.fixture(autouse=True)
+def _stub_state_delete(monkeypatch):
+    # The dispatcher clears its slot-skip streak with delete_state on every
+    # non-starved outcome. Most handler tests mock get_state/set_state but not
+    # delete_state, so without this the call reaches a real Redis and burns
+    # ~19s of stamina retries per test. Tests that assert on deletion patch it
+    # themselves.
+    from app.services.state import IntegrationStateManager
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(IntegrationStateManager, "delete_state", AsyncMock(return_value=None))
+
+
+@pytest.fixture(autouse=True)
+def _grant_backfill_trigger_claim(monkeypatch):
+    # set_if_absent is the atomic "one backfill trigger per window" claim. It
+    # is not part of the class-level get_state/set_state mocking most tests do,
+    # so without this it reaches a real Redis (slow stamina retries). Granted
+    # by default; the duplicate-suppression test overrides it.
+    from app.services.state import IntegrationStateManager
+
+    async def granted(self, integration_id, action_id, *, ttl_seconds, source_id="no-source"):
+        return True
+
+    monkeypatch.setattr(IntegrationStateManager, "set_if_absent", granted)
+
+
+@pytest.fixture(autouse=True)
+def _grant_connection_slots(monkeypatch):
+    # lotek_slot talks to real Redis (per-account connection budget). Grant
+    # every slot by default so handler tests don't need a Redis server; tests
+    # exercising budget exhaustion patch app.actions.handlers.lotek_slot to
+    # raise NoConnectionSlot themselves.
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def granted_slot(username, **kwargs):
+        yield
+
+    monkeypatch.setattr("app.actions.handlers.lotek_slot", granted_slot)
+
+
+@pytest.fixture(autouse=True)
 def _zero_retry_waits(monkeypatch):
     # Retry-path tests otherwise sleep through real stamina backoff (minutes
     # over the suite, enough to blow a CI step timeout — review finding).

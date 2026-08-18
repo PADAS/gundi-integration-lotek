@@ -4,14 +4,30 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 from gundi_core.schemas.v2 import LogLevel
+from unittest.mock import patch as _patch
+
 from app.actions.handlers import (
     FETCH_CONCURRENCY,
     RETRY_ATTEMPTS,
     action_auth,
     action_pull_observations,
+    action_pull_observations_shard,
     filter_and_transform_positions,
 )
+from app.actions.configurations import PullObservationsShardConfig
 from app.actions.client import LotekDevice, LotekException, LotekUnauthorizedException
+
+
+async def run_head_pass(integration, pull_config):
+    """Drive the head pass the way production does post-sharding (GUNDI-5620):
+    the device list (tests patch client.get_devices) becomes one shard, and the
+    shard action reads the pull config from the integration — patched here to
+    the test's pull_config fixture so per-test mutations apply."""
+    import app.actions.client as client
+    devices = await client.get_devices(integration, None)
+    config = PullObservationsShardConfig(devices=[d.nDeviceID for d in devices])
+    with _patch("app.actions.handlers.get_pull_config", return_value=pull_config):
+        return await action_pull_observations_shard(integration, config)
 
 
 @pytest.mark.asyncio
@@ -99,7 +115,7 @@ async def test_invalid_position_filtered_and_logs_warning_when_no_valid_observat
     mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     assert result == {'observations_extracted': 0, 'devices_failed': [], 'devices_deferred': []}
     # Publish-volume fix: quiet devices are local-log only — one portal WARNING
     # per dormant device was the largest pubsub-congestion contributor.
@@ -122,7 +138,7 @@ async def test_lookback_days_config_sets_first_run_gap_depth(mocker, lotek_integ
     mock_set_state = mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
     mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
     pull_config.default_lookback_days = 30
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     assert len(mock_get_positions.call_args_list) == 1
     saved = mock_set_state.call_args.args[2]
     gap_age_days = (datetime.now(timezone.utc) - saved["gap_start"]).days
@@ -137,7 +153,7 @@ async def test_action_pull_observations_success(mocker, lotek_integration, pull_
     mocker.patch("app.actions.client.get_positions", new=AsyncMock(return_value=[]))
     mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     assert result == {'observations_extracted': 0, 'devices_failed': [], 'devices_deferred': []}
 
 def _devices(*device_ids):
@@ -172,7 +188,7 @@ async def test_action_pull_observations_continues_after_one_device_fails(
 
     mocker.patch("app.actions.client.get_positions", new=get_positions)
 
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
 
     # Device 2 exhausts its retries and is given up on, but devices 1 and 3 are
     # still serviced. Devices fetch concurrently within a chunk, so only the
@@ -207,7 +223,7 @@ async def test_action_pull_observations_continues_after_lotek_error_status(
 
     mocker.patch("app.actions.client.get_positions", new=get_positions)
 
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
 
     assert queried == ["1", "2", "3"]
     assert result == {"observations_extracted": 2, "devices_failed": ["2"], "devices_deferred": []}
@@ -239,7 +255,7 @@ async def test_action_pull_observations_continues_after_malformed_device_data(
 
     mocker.patch("app.actions.client.get_positions", new=get_positions)
 
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
 
     assert queried[-1] == "3"
     assert result == {"observations_extracted": 2, "devices_failed": ["2"], "devices_deferred": []}
@@ -278,7 +294,7 @@ async def test_action_pull_observations_aborts_when_login_is_rejected(
     mocker.patch("app.services.state.IntegrationStateManager.delete_state", new=AsyncMock(return_value=None))
 
     with pytest.raises(LotekUnauthorizedException):
-        await action_pull_observations(lotek_integration, pull_config)
+        await run_head_pass(lotek_integration, pull_config)
 
     # The rejection memo in get_token means concurrent waiters re-raise the
     # cached refusal instead of each attempting a real login (lockout risk).
@@ -312,7 +328,7 @@ async def test_action_pull_observations_continues_when_one_device_send_fails(
 
     mocker.patch("app.services.gundi.send_observations_to_gundi", new=send_observations_to_gundi)
 
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
 
     assert len(sent_for) == 2, "second device was never attempted"
     assert result["devices_failed"] == ["1"]
@@ -341,7 +357,7 @@ async def test_action_pull_observations_counts_data_delivered_before_downstream_
     mocker.patch("app.actions.client.get_positions", new=AsyncMock(return_value=[lotek_position]))
     mocker.patch("app.services.gundi.send_observations_to_gundi", new=AsyncMock())
 
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
 
     assert result == {"observations_extracted": 1, "devices_failed": ["1"], "devices_deferred": []}
 
@@ -368,7 +384,7 @@ async def test_action_pull_observations_summary_names_failed_devices(
 
     mocker.patch("app.actions.client.get_positions", new=get_positions)
 
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
 
     warnings = [c.kwargs["title"] for c in mock_log_action_activity.call_args_list
                 if c.kwargs.get("level") == LogLevel.WARNING and "failing" in c.kwargs["title"]]
@@ -401,7 +417,7 @@ async def test_action_pull_observations_continues_when_one_device_checkpoint_fai
 
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=set_state)
 
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
 
     assert "2" in checkpointed, "second device was never processed"
     assert result["devices_failed"] == ["1"]
@@ -422,8 +438,11 @@ async def test_action_pull_observations_fails_when_every_device_fails(
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
     mocker.patch("app.actions.client.get_positions", new=AsyncMock(side_effect=httpx.ReadTimeout("")))
 
-    with pytest.raises(LotekException):
-        await action_pull_observations(lotek_integration, pull_config)
+    # Reported via the zero_progress result flag + an ERROR activity event,
+    # not raised (a raise leaks the integration config through the runner's
+    # generic error handler — review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
 
 
 @pytest.mark.asyncio
@@ -448,7 +467,7 @@ async def test_action_pull_observations_does_not_advance_state_for_failed_device
 
     mocker.patch("app.actions.client.get_positions", new=get_positions)
 
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
 
     advanced_devices = [call.args[-1] for call in mock_set_state.call_args_list]
     assert "1" in advanced_devices
@@ -472,8 +491,11 @@ async def test_action_pull_observations_logs_exception_type_when_message_is_empt
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
 
     # the only device fails and delivers nothing, so the run is reported as failed
-    with pytest.raises(LotekException):
-        await action_pull_observations(lotek_integration, pull_config)
+    # Reported via the zero_progress result flag + an ERROR activity event,
+    # not raised (a raise leaks the integration config through the runner's
+    # generic error handler — review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
 
     # Transport failures are local-log only (publish-volume fix); the
     # exception type must still be named in the local warning.
@@ -509,7 +531,7 @@ async def test_action_pull_observations_retries_transient_timeout(
 
     mocker.patch("app.actions.client.get_positions", new=get_positions)
 
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
 
     assert len(attempts) == 2, "the transient timeout should have been retried"
     assert result == {"observations_extracted": 1, "devices_failed": [], "devices_deferred": []}
@@ -542,7 +564,7 @@ async def test_action_pull_observations_aborts_on_auth_failure(
     mocker.patch("app.actions.client.get_positions", new=get_positions)
 
     with pytest.raises(LotekUnauthorizedException):
-        await action_pull_observations(lotek_integration, pull_config)
+        await run_head_pass(lotek_integration, pull_config)
 
     first_chunk = {str(i) for i in range(1, FETCH_CONCURRENCY + 1)}
     assert set(queried) == first_chunk, (
@@ -599,7 +621,7 @@ async def test_action_pull_observations_isolates_persistent_401_on_one_device(
 
     mocker.patch("app.actions.client.get_positions", new=get_positions)
 
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
 
     assert "3" in queried, "devices after the 401 device were never queried"
     assert result["devices_failed"] == ["2"]
@@ -624,7 +646,11 @@ async def test_action_pull_observations_does_not_retry_rejected_login_at_get_dev
         raise LotekUnauthorizedException(message="Lotek login failed", status_code=400)
 
     mocker.patch("app.actions.client.get_devices", new=get_devices)
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
 
+    # The dispatcher owns the get_devices retry loop; calling it directly is
+    # what exercises the no-retry-on-refused-login guarantee (review finding:
+    # the run_head_pass conversion made this assertion vacuous).
     with pytest.raises(LotekUnauthorizedException):
         await action_pull_observations(lotek_integration, pull_config)
 
@@ -649,7 +675,7 @@ async def test_action_pull_observations_quiet_device_unaffected_by_logging_failu
     mocker.patch("app.actions.handlers.log_action_activity",
                  new=AsyncMock(side_effect=RuntimeError("pubsub down")))
 
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
 
     assert result["devices_failed"] == []
     assert [c.args[-1] for c in mock_set_state.call_args_list] == ["1"], "cursor was not advanced"
@@ -678,7 +704,7 @@ async def test_action_pull_observations_isolates_transform_failure_to_the_device
 
     mocker.patch("app.actions.client.get_positions", new=get_positions)
 
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
 
     assert result["devices_failed"] == ["1"]
     assert mock_send.call_count == 1, "the device behind the malformed one was not delivered"
@@ -699,7 +725,7 @@ async def test_malformed_data_failure_logs_error_not_warning(
         return None if device_id == "1" else []  # device 1: malformed; device 2: fine
 
     get_positions.side_effect = get_positions_side_effect
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     assert result["devices_failed"] == ["1"]
     device_logs = [c for c in log.await_args_list if "Device: 1" in c.kwargs.get("title", "")]
     assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
@@ -722,8 +748,11 @@ async def test_action_pull_observations_emits_summary_before_all_failed_raise(
     mocker.patch("app.actions.client.get_positions", new=AsyncMock(side_effect=httpx.ReadTimeout("")))
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
 
-    with pytest.raises(LotekException):
-        await action_pull_observations(lotek_integration, pull_config)
+    # Reported via the zero_progress result flag + an ERROR activity event,
+    # not raised (a raise leaks the integration config through the runner's
+    # generic error handler — review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
 
     warnings = [c.kwargs["title"] for c in mock_log_action_activity.call_args_list
                 if c.kwargs.get("level") == LogLevel.WARNING and "failing" in c.kwargs["title"]]
@@ -781,7 +810,7 @@ async def test_action_pull_observations_retries_token_expiry_and_recovers(
 
     mocker.patch("app.actions.client.get_positions", new=get_positions)
 
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
 
     assert len(attempts) == 2, "token expiry was not retried"
     assert result == {"observations_extracted": 1, "devices_failed": [], "devices_deferred": []}
@@ -798,6 +827,7 @@ async def test_get_devices_failure_logs_exception_type_when_message_is_empty(
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    mocker.patch("app.actions.client.get_token", new=AsyncMock(return_value="token"))
     mocker.patch(
         "app.actions.client.get_devices",
         new=AsyncMock(side_effect=httpx.ReadTimeout("")),
@@ -845,7 +875,7 @@ async def test_head_pass_fetches_single_max_age_window_on_first_run(
     # First run: ONE request per device covering [now - max_data_age_hours, now]
     # — not a chunked walk over the whole lookback.
     get_positions, _, _, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1"))
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     assert get_positions.await_count == 1
     start, end = get_positions.call_args.args[3], get_positions.call_args.args[4]
     assert abs((end - start) - timedelta(hours=pull_config.max_data_age_hours)) < timedelta(minutes=1)
@@ -856,7 +886,7 @@ async def test_first_run_opens_gap_from_lookback_to_freshness_floor(
     mocker, lotek_integration, pull_config, mock_redis
 ):
     _, _, set_state, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1"))
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     saved = set_state.call_args.args[2]
     gap_span = saved["gap_end"] - saved["gap_start"]
     expected = timedelta(days=pull_config.default_lookback_days) - timedelta(
@@ -898,7 +928,7 @@ async def test_steady_state_advances_high_water_and_keeps_gap_closed(
     get_positions, _, set_state, log = _setup_pull_mocks(
         mocker, mock_redis, _devices("1"), saved_state={"high_water": recent}
     )
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     start = get_positions.call_args.args[3]
     from app.actions.handlers import HEAD_LATE_UPLOAD_OVERLAP
     assert abs(
@@ -929,7 +959,7 @@ async def test_stale_span_is_dropped_with_warning_and_not_added_to_gap(
     get_positions, _, set_state, log = _setup_pull_mocks(
         mocker, mock_redis, _devices("1"), saved_state={"high_water": stale}
     )
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     start = get_positions.call_args.args[3]
     assert abs(
         (datetime.now(timezone.utc) - start) - timedelta(hours=pull_config.max_data_age_hours)
@@ -959,7 +989,7 @@ async def test_legacy_updated_at_state_migrates_to_high_water(
     get_positions, _, set_state, _ = _setup_pull_mocks(
         mocker, mock_redis, _devices("1"), saved_state={"updated_at": recent}
     )
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     start = get_positions.call_args.args[3]
     from app.actions.handlers import HEAD_LATE_UPLOAD_OVERLAP
     assert abs(
@@ -989,7 +1019,7 @@ async def test_transient_fetch_failure_logs_warning_not_error(
         return []
 
     get_positions.side_effect = get_positions_side_effect
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     assert result["devices_failed"] == ["1"]
     # Transport failures are local-log only; the end-of-run summary is the
     # single portal publish and it is a WARNING, not an ERROR.
@@ -1015,9 +1045,9 @@ async def test_failed_head_fetch_does_not_advance_high_water(
         mocker, mock_redis, _devices("1"), saved_state={"high_water": recent}
     )
     get_positions.side_effect = httpx.ReadTimeout("")
-    with pytest.raises(LotekException):
-        # single device, nothing serviced → the run-level failure raise
-        await action_pull_observations(lotek_integration, pull_config)
+    # single device, nothing serviced → reported via zero_progress, not raised
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
     set_state.assert_not_awaited()
 
 
@@ -1032,7 +1062,7 @@ async def test_delivery_failure_stays_error_and_does_not_advance_high_water(
         "app.actions.handlers.gundi_tools.send_observations_to_gundi",
         new=AsyncMock(side_effect=[Exception("boom"), None]),
     )
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     assert result["devices_failed"] == ["1"]
     error_logs = [
         c for c in log.await_args_list
@@ -1054,20 +1084,49 @@ async def test_all_failed_run_raises_zero_progress(
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     get_positions, _, _, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
     get_positions.side_effect = httpx.ReadTimeout("")
-    with pytest.raises(LotekException, match="No devices could be serviced"):
-        await action_pull_observations(lotek_integration, pull_config)
+    # Zero progress is reported as an ERROR activity event and a result flag,
+    # not raised: raising routes through the runner's generic error handler,
+    # which publishes every integration config (auth included) (review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
+
+
+@pytest.mark.asyncio
+async def test_deferred_all_run_retriggers_tail_instead_of_raising(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Sharded head pass (GUNDI-5620): a deadline-deferred tail is handed a
+    # fresh budget immediately via a re-triggered shard. A successful hand-off
+    # IS progress, so the zero-progress alert must not fire.
+    _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["devices_deferred"] == ["1", "2"]
+    shard_calls = [
+        c for c in trigger.await_args_list if c.args[1] == "pull_observations_shard"
+    ]
+    assert len(shard_calls) == 1
+    assert shard_calls[0].kwargs["config"].devices == ["1", "2"]
 
 
 @pytest.mark.asyncio
 async def test_zero_progress_run_raises_even_when_devices_were_only_deferred(
     mocker, lotek_integration, pull_config, mock_redis
 ):
-    # A run that services nothing is systemic degradation — it must alert
-    # (ERROR/raise), not warn forever. Deferring every device counts.
+    # A run that services nothing AND cannot hand its tail off (re-trigger
+    # publish fails) is systemic degradation — it must alert (ERROR/raise).
     _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
+    mocker.patch(
+        "app.actions.handlers.trigger_action",
+        new=AsyncMock(side_effect=Exception("pubsub down")),
+    )
     mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
-    with pytest.raises(LotekException, match="No devices could be serviced"):
-        await action_pull_observations(lotek_integration, pull_config)
+    # Zero progress is reported as an ERROR activity event and a result flag,
+    # not raised: raising routes through the runner's generic error handler,
+    # which publishes every integration config (auth included) (review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
 
 
 @pytest.mark.asyncio
@@ -1089,7 +1148,7 @@ async def test_deadline_defers_remaining_devices_with_warning(
         "app.actions.handlers._deadline_exceeded",
         side_effect=itertools.chain([False] * 6, itertools.repeat(True)),
     )
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     assert result["devices_deferred"] == ["6", "7", "8"]
     assert result["devices_failed"] == []
     deferral_logs = [
@@ -1146,7 +1205,7 @@ async def test_breaker_trips_after_three_consecutive_transport_failures(
         raise httpx.ReadTimeout("")
 
     get_positions.side_effect = get_positions_side_effect
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     assert result["devices_failed"] == ["2", "3", "4", "5"]
     assert result["devices_deferred"] == ["6", "7", "8"]
     breaker_logs = [
@@ -1176,7 +1235,7 @@ async def test_breaker_counter_resets_on_success(
         return []
 
     get_positions.side_effect = get_positions_side_effect
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     assert result["devices_deferred"] == []
     assert result["devices_failed"] == ["1", "3", "5"]
 
@@ -1188,7 +1247,7 @@ async def test_head_pass_triggers_backfill_when_gap_open_and_lease_free(
     # First run on default config opens a gap → backfill must be triggered.
     _setup_pull_mocks(mocker, mock_redis, _devices("1"))
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     trigger.assert_awaited_once()
     args, kwargs = trigger.await_args
     assert args[:2] == (str(lotek_integration.id), "backfill_observations")
@@ -1209,7 +1268,7 @@ async def test_head_pass_does_not_trigger_backfill_when_lease_held(
         "app.services.state.IntegrationStateManager.get_state",
         new=AsyncMock(side_effect=lambda i, a, s="no-source": "1" if s == "lease" else {}),
     )
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     trigger.assert_not_awaited()
 
 
@@ -1220,7 +1279,7 @@ async def test_head_pass_does_not_trigger_backfill_without_gaps(
     recent = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     _setup_pull_mocks(mocker, mock_redis, _devices("1"), saved_state={"high_water": recent})
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     trigger.assert_not_awaited()
 
 
@@ -1232,7 +1291,7 @@ async def test_trigger_failure_does_not_fail_the_head_pass(
     mocker.patch(
         "app.actions.handlers.trigger_action", new=AsyncMock(side_effect=Exception("pubsub down"))
     )
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     assert result["devices_failed"] == []
 
 
@@ -1264,7 +1323,7 @@ async def test_stale_drop_publish_failure_does_not_stall_the_device(
             raise Exception("pubsub down")
 
     log.side_effect = flaky_publish
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     assert result["devices_failed"] == []
     saved = set_state.call_args.args[2]
     assert abs(datetime.now(timezone.utc) - saved["high_water"]) < timedelta(minutes=1)
@@ -1279,7 +1338,7 @@ async def test_unparseable_state_reset_is_surfaced_at_warning(
     get_positions, _, _, log = _setup_pull_mocks(
         mocker, mock_redis, _devices("1"), saved_state={"high_water": "not-a-date"}
     )
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     reset_warnings = [
         c for c in log.await_args_list
         if c.kwargs["level"] == LogLevel.WARNING and "unparseable" in c.kwargs["title"].lower()
@@ -1313,7 +1372,7 @@ async def test_head_pass_save_does_not_clobber_concurrently_closed_gap(
     # 1st read = the head pass loading its snapshot (gap open);
     # 2nd read = the merge-save re-read (backfill closed the gap meanwhile).
     get_state.side_effect = [open_gap_state, gap_closed_state]
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     saved = set_state.call_args.args[2]
     assert saved.get("gap_start") is None and saved.get("gap_end") is None, (
         "the head pass resurrected a gap a concurrent backfill had closed"
@@ -1342,7 +1401,7 @@ async def test_stale_first_run_save_does_not_resurrect_a_gap_closed_meanwhile(
     # 1st read = this run loading state (absent → is_new, gap birthed in memory);
     # 2nd read = the merge-save re-read (the faster run + backfill already ran).
     get_state.side_effect = [{}, gap_closed_doc]
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     saved = set_state.call_args.args[2]
     assert saved.get("gap_start") is None and saved.get("gap_end") is None, (
         "a stale is_new save resurrected a gap a backfill had already closed"
@@ -1370,7 +1429,7 @@ async def test_stale_first_run_save_does_not_rewind_an_advanced_gap(
     }
     _, get_state, set_state, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1"))
     get_state.side_effect = [{}, gap_advanced_doc]
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     saved = set_state.call_args.args[2]
     assert saved["gap_start"] == advanced_start, (
         "a stale is_new save rewound gap_start to its full-lookback snapshot"
@@ -1394,8 +1453,11 @@ async def test_lotek_5xx_failures_feed_the_circuit_breaker(
         mocker, mock_redis, _devices("1", "2", "3", "4", "5", "6", "7", "8")
     )
     get_positions.side_effect = LotekException(message="down", status_code=503)
-    with pytest.raises(LotekException, match="No devices could be serviced"):
-        await action_pull_observations(lotek_integration, pull_config)
+    # Zero progress is reported as an ERROR activity event and a result flag,
+    # not raised: raising routes through the runner's generic error handler,
+    # which publishes every integration config (auth included) (review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
     # the first chunk's 5 consecutive 503s trip the breaker at the chunk
     # boundary; devices 6-8 (chunk 2) are deferred and never dispatched
     deferral_logs = [
@@ -1420,8 +1482,11 @@ async def test_lotek_4xx_failure_stays_error_and_does_not_feed_breaker(
         mocker, mock_redis, _devices("1", "2", "3", "4")
     )
     get_positions.side_effect = LotekException(message="bad request", status_code=404)
-    with pytest.raises(LotekException, match="No devices could be serviced"):
-        await action_pull_observations(lotek_integration, pull_config)
+    # Zero progress is reported as an ERROR activity event and a result flag,
+    # not raised: raising routes through the runner's generic error handler,
+    # which publishes every integration config (auth included) (review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
     assert get_positions.await_count == 4, "4xx failures must not trip the breaker"
     device_logs = [c for c in log.await_args_list if "Device:" in c.kwargs.get("title", "")]
     assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
@@ -1445,7 +1510,7 @@ async def test_head_pass_services_least_fresh_devices_first(
         mocker, mock_redis, _devices("fresh", "stale", "middle")
     )
     get_state.side_effect = lambda i, a, d: states.get(d, {})
-    await action_pull_observations(lotek_integration, pull_config)
+    await run_head_pass(lotek_integration, pull_config)
     order = [c.args[0] for c in get_positions.await_args_list]
     assert order == ["stale", "middle", "fresh"]
 
@@ -1462,7 +1527,7 @@ async def test_stale_legacy_cursor_migrates_into_gap_not_permanent_drop(
     get_positions, _, set_state, log = _setup_pull_mocks(
         mocker, mock_redis, _devices("1"), saved_state={"updated_at": behind.isoformat()}
     )
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     saved = set_state.call_args.args[2]
     assert abs(saved["gap_start"] - behind) < timedelta(seconds=1), (
         "the owed range's start must be the legacy cursor"
@@ -1489,8 +1554,11 @@ async def test_no_stale_drop_warning_when_the_fetch_fails(
         mocker, mock_redis, _devices("1"), saved_state={"high_water": stale}
     )
     get_positions.side_effect = httpx.ReadTimeout("")
-    with pytest.raises(LotekException, match="No devices could be serviced"):
-        await action_pull_observations(lotek_integration, pull_config)
+    # Zero progress is reported as an ERROR activity event and a result flag,
+    # not raised: raising routes through the runner's generic error handler,
+    # which publishes every integration config (auth included) (review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
     set_state.assert_not_awaited()
     assert not any(
         "stale range" in c.kwargs.get("title", "").lower() for c in log.await_args_list
@@ -1525,6 +1593,6 @@ async def test_fetch_error_publish_failure_stays_contained_to_the_device(
             raise Exception("pubsub down")
 
     log.side_effect = flaky_publish
-    result = await action_pull_observations(lotek_integration, pull_config)
+    result = await run_head_pass(lotek_integration, pull_config)
     assert result["devices_failed"] == ["1"]
     assert get_positions.await_count == 3, "device 2 was never serviced"
