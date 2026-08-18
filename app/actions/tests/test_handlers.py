@@ -438,8 +438,11 @@ async def test_action_pull_observations_fails_when_every_device_fails(
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
     mocker.patch("app.actions.client.get_positions", new=AsyncMock(side_effect=httpx.ReadTimeout("")))
 
-    with pytest.raises(LotekException):
-        await run_head_pass(lotek_integration, pull_config)
+    # Reported via the zero_progress result flag + an ERROR activity event,
+    # not raised (a raise leaks the integration config through the runner's
+    # generic error handler — review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
 
 
 @pytest.mark.asyncio
@@ -488,8 +491,11 @@ async def test_action_pull_observations_logs_exception_type_when_message_is_empt
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
 
     # the only device fails and delivers nothing, so the run is reported as failed
-    with pytest.raises(LotekException):
-        await run_head_pass(lotek_integration, pull_config)
+    # Reported via the zero_progress result flag + an ERROR activity event,
+    # not raised (a raise leaks the integration config through the runner's
+    # generic error handler — review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
 
     # Transport failures are local-log only (publish-volume fix); the
     # exception type must still be named in the local warning.
@@ -742,8 +748,11 @@ async def test_action_pull_observations_emits_summary_before_all_failed_raise(
     mocker.patch("app.actions.client.get_positions", new=AsyncMock(side_effect=httpx.ReadTimeout("")))
     mock_log_action_activity = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
 
-    with pytest.raises(LotekException):
-        await run_head_pass(lotek_integration, pull_config)
+    # Reported via the zero_progress result flag + an ERROR activity event,
+    # not raised (a raise leaks the integration config through the runner's
+    # generic error handler — review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
 
     warnings = [c.kwargs["title"] for c in mock_log_action_activity.call_args_list
                 if c.kwargs.get("level") == LogLevel.WARNING and "failing" in c.kwargs["title"]]
@@ -1036,9 +1045,9 @@ async def test_failed_head_fetch_does_not_advance_high_water(
         mocker, mock_redis, _devices("1"), saved_state={"high_water": recent}
     )
     get_positions.side_effect = httpx.ReadTimeout("")
-    with pytest.raises(LotekException):
-        # single device, nothing serviced → the run-level failure raise
-        await run_head_pass(lotek_integration, pull_config)
+    # single device, nothing serviced → reported via zero_progress, not raised
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
     set_state.assert_not_awaited()
 
 
@@ -1075,8 +1084,11 @@ async def test_all_failed_run_raises_zero_progress(
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     get_positions, _, _, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
     get_positions.side_effect = httpx.ReadTimeout("")
-    with pytest.raises(LotekException, match="No devices could be serviced"):
-        await run_head_pass(lotek_integration, pull_config)
+    # Zero progress is reported as an ERROR activity event and a result flag,
+    # not raised: raising routes through the runner's generic error handler,
+    # which publishes every integration config (auth included) (review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
 
 
 @pytest.mark.asyncio
@@ -1110,8 +1122,11 @@ async def test_zero_progress_run_raises_even_when_devices_were_only_deferred(
         new=AsyncMock(side_effect=Exception("pubsub down")),
     )
     mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
-    with pytest.raises(LotekException, match="No devices could be serviced"):
-        await run_head_pass(lotek_integration, pull_config)
+    # Zero progress is reported as an ERROR activity event and a result flag,
+    # not raised: raising routes through the runner's generic error handler,
+    # which publishes every integration config (auth included) (review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
 
 
 @pytest.mark.asyncio
@@ -1438,8 +1453,11 @@ async def test_lotek_5xx_failures_feed_the_circuit_breaker(
         mocker, mock_redis, _devices("1", "2", "3", "4", "5", "6", "7", "8")
     )
     get_positions.side_effect = LotekException(message="down", status_code=503)
-    with pytest.raises(LotekException, match="No devices could be serviced"):
-        await run_head_pass(lotek_integration, pull_config)
+    # Zero progress is reported as an ERROR activity event and a result flag,
+    # not raised: raising routes through the runner's generic error handler,
+    # which publishes every integration config (auth included) (review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
     # the first chunk's 5 consecutive 503s trip the breaker at the chunk
     # boundary; devices 6-8 (chunk 2) are deferred and never dispatched
     deferral_logs = [
@@ -1464,8 +1482,11 @@ async def test_lotek_4xx_failure_stays_error_and_does_not_feed_breaker(
         mocker, mock_redis, _devices("1", "2", "3", "4")
     )
     get_positions.side_effect = LotekException(message="bad request", status_code=404)
-    with pytest.raises(LotekException, match="No devices could be serviced"):
-        await run_head_pass(lotek_integration, pull_config)
+    # Zero progress is reported as an ERROR activity event and a result flag,
+    # not raised: raising routes through the runner's generic error handler,
+    # which publishes every integration config (auth included) (review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
     assert get_positions.await_count == 4, "4xx failures must not trip the breaker"
     device_logs = [c for c in log.await_args_list if "Device:" in c.kwargs.get("title", "")]
     assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
@@ -1533,8 +1554,11 @@ async def test_no_stale_drop_warning_when_the_fetch_fails(
         mocker, mock_redis, _devices("1"), saved_state={"high_water": stale}
     )
     get_positions.side_effect = httpx.ReadTimeout("")
-    with pytest.raises(LotekException, match="No devices could be serviced"):
-        await run_head_pass(lotek_integration, pull_config)
+    # Zero progress is reported as an ERROR activity event and a result flag,
+    # not raised: raising routes through the runner's generic error handler,
+    # which publishes every integration config (auth included) (review finding).
+    result = await run_head_pass(lotek_integration, pull_config)
+    assert result["zero_progress"] is True
     set_state.assert_not_awaited()
     assert not any(
         "stale range" in c.kwargs.get("title", "").lower() for c in log.await_args_list

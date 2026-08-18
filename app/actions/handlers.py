@@ -80,6 +80,17 @@ SHARD_RETRIGGER_CAP = 3
 # saturated across ticks and must be visible in the portal.
 DISPATCHER_SKIP_WARN_AFTER = 2
 DISPATCHER_SKIP_STREAK_SOURCE = "slot_skip_streak"
+# Outcomes of a deferred-tail re-trigger attempt (see _retrigger_shard).
+RETRIGGER_HANDED_OFF = "handed_off"
+RETRIGGER_CAP_REACHED = "cap_reached"
+RETRIGGER_FAILED = "failed"
+# One backfill trigger per head-pass tick: every shard of a gapped fleet used
+# to read the lease and publish its own backfill command (the lease is only
+# created a pubsub hop later, when the backfill handler runs), so 25 shards
+# produced up to 25 commands — 24 of them full no-op invocations with their own
+# activity events (review finding). This claim is atomic, so exactly one shard
+# publishes per window.
+BACKFILL_TRIGGER_CLAIM_SOURCE = "backfill_trigger_claim"
 # Head fetches re-cover this much of the cursor's trailing edge: rows whose
 # server-assigned UploadTimeStamp falls inside a window we already queried can
 # become queryable only after our request completed (write latency / clock
@@ -355,6 +366,9 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             title=message,
             level=LogLevel.ERROR
         )
+        # Same reason as the transport path: a non-starved outcome breaks the
+        # "consecutive" skip streak (review finding — this path was missed).
+        await _reset_dispatcher_skip_streak(integration_id)
         raise  # bare: preserve the original traceback
 
     logger.info(f"Extracted {len(device_list)} devices from Lotek for inbound: {integration.id}")
@@ -370,7 +384,9 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     epoch = datetime.min.replace(tzinfo=timezone.utc)
 
     async def read_high_water(device_id):
-        state = await _read_device_state(integration_id, device_id)
+        # quiet: the shard publishes the unparseable-state warning when it
+        # actually discards the cursor; this read only orders the fleet.
+        state = await _read_device_state(integration_id, device_id, quiet=True)
         return device_id, state.high_water if state else epoch
 
     # Bounded-concurrency reads (Copilot review): sequential awaits made this
@@ -423,15 +439,21 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         logger.warning(message)
         await _try_log_activity(integration_id, "pull_observations", message, LogLevel.WARNING)
     if shards and dispatched == 0:
-        # Nothing was handed off at all: systemic (commands topic down), must
-        # alert rather than publish action_complete.
-        raise LotekException(
-            message=(
-                f"Could not dispatch any of {len(shards)} shard(s) for integration "
-                f"{integration_id}; see the application log for the publish errors."
-            )
+        # Nothing was handed off at all: systemic (commands topic down). ERROR
+        # activity event rather than a raise, for the same reason as the shard's
+        # zero-progress path — a raise routes through the runner's generic
+        # _handle_error, which publishes every integration configuration
+        # (plaintext Lotek password included) into the event payload.
+        message = (
+            f"Could not dispatch any of {len(shards)} shard(s) for integration "
+            f"{integration_id}; see the application log for the publish errors."
         )
-    return {"devices_found": len(device_list), "shards_triggered": dispatched}
+        logger.error(message)
+        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.ERROR)
+    result = {"devices_found": len(device_list), "shards_triggered": dispatched}
+    if undispatched_devices:
+        result["devices_undispatched"] = undispatched_devices
+    return result
 
 
 async def _bump_dispatcher_skip_streak(integration_id):
@@ -473,8 +495,14 @@ async def _retrigger_shard(integration, device_ids, generation, manual_run=False
     the tail falls back to the next scheduled tick — an ungoverned chain under
     sustained slot starvation was an unbounded busy-loop of zero-progress
     invocations, invisible because each hop reported success (review finding).
-    Returns True only when the tail was actually handed off. Best-effort
-    otherwise: the next tick re-lists and re-shards everything anyway.
+
+    Returns one of:
+      RETRIGGER_HANDED_OFF  — a fresh shard owns the tail
+      RETRIGGER_CAP_REACHED — cap hit; the tail waits for the next tick and the
+                              exhaustion was already reported at ERROR, so the
+                              caller must NOT also emit its own alert (review
+                              finding: one load event produced two ERRORs)
+      RETRIGGER_FAILED      — publish failed; nobody owns the tail this tick
     """
     integration_id = str(integration.id)
     if generation >= SHARD_RETRIGGER_CAP:
@@ -491,7 +519,7 @@ async def _retrigger_shard(integration, device_ids, generation, manual_run=False
         await _try_log_activity(
             integration_id, "pull_observations_shard", message, LogLevel.ERROR
         )
-        return False
+        return RETRIGGER_CAP_REACHED
     try:
         await trigger_action(
             integration_id, "pull_observations_shard",
@@ -502,15 +530,19 @@ async def _retrigger_shard(integration, device_ids, generation, manual_run=False
                 manual_run=manual_run,
             )
         )
-        return True
+        return RETRIGGER_HANDED_OFF
     except Exception as e:
         logger.warning(
             f"Could not re-trigger shard for integration {integration_id}: {describe_exception(e)}"
         )
-        return False
+        return RETRIGGER_FAILED
 
 
-@activity_logger()
+# on_start=False: the dispatcher's own started event already marks the tick, and
+# a started event per shard doubled the publish volume on the aiohttp/pubsub
+# path GUNDI-5620 identified as the dominant error source (review finding). The
+# completion event is kept — it carries this shard's observations_extracted.
+@activity_logger(on_start=False)
 async def action_pull_observations_shard(integration, action_config: PullObservationsShardConfig):
     """Internal action: process one shard of the head pass. Machine-triggered
     by pull_observations (and by itself, for a deadline-deferred tail)."""
@@ -559,6 +591,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
     deferred_devices = []
     retriggered = False
     budget_starved = False
+    cap_reached = False
     serviced_devices = 0
     # Only reflects devices actually processed this run — a device deferred by
     # the rails before its gap status is checked doesn't trigger backfill this
@@ -572,10 +605,14 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             # does NOT re-trigger — that would defeat the pause the breaker
             # exists to buy. Its devices wait for the next scheduled tick.
             if reason == "deadline":
-                retriggered = await _retrigger_shard(
+                outcome = await _retrigger_shard(
                     integration, deferred_devices, action_config.generation,
                     manual_run=action_config.manual_run,
                 )
+                retriggered = outcome == RETRIGGER_HANDED_OFF
+                # A cap-reached deferral already alerted at ERROR; suppress the
+                # zero-progress alert so one load event yields one signal.
+                cap_reached = outcome == RETRIGGER_CAP_REACHED
             disposition = (
                 "to an immediately re-triggered shard" if retriggered
                 else "to the next scheduled run"
@@ -651,7 +688,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             retriggered = await _retrigger_shard(
                 integration, deferred_devices, action_config.generation,
                 manual_run=action_config.manual_run,
-            )
+            ) == RETRIGGER_HANDED_OFF
             # Portal WARNING like every other deferral cause (review finding:
             # this branch was logger.info only, so a starved tail whose
             # re-trigger also failed parked with zero portal visibility —
@@ -698,32 +735,52 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             level=LogLevel.WARNING
         )
 
-    if (device_states and serviced_devices == 0 and observations_extracted == 0
-            and not retriggered and not budget_starved):
+    zero_progress = (
+        device_states and serviced_devices == 0 and observations_extracted == 0
+        and not retriggered and not budget_starved and not cap_reached
+    )
+    if zero_progress:
         # Zero progress: nothing serviced, nothing delivered, and no deferred
-        # tail re-dispatched — systemic degradation, must alert rather than
-        # publish action_complete. A successfully re-triggered deferral is
-        # progress (the work moved to a fresh budget). Slot starvation NEVER
-        # raises, even when the re-trigger hand-off also failed: it is a clean
-        # budget back-off, not degradation (mirrors backfill's budget_starved;
-        # review finding — the old condition flipped a starvation + pubsub
-        # blip into a false systemic ERROR). Starvation visibility comes from
-        # the _log_deferral WARNING on the starved branch and the re-trigger
-        # cap's ERROR instead.
-        raise LotekException(
-            message=(
-                f"No devices could be serviced for integration {integration.id}: "
-                f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
-                f"{len(action_config.devices)}. See the per-device errors in this action's activity log."
-            )
+        # tail re-dispatched — systemic degradation that must alert rather than
+        # pass as a clean completion. A successfully re-triggered deferral is
+        # progress (the work moved to a fresh budget); slot starvation and a
+        # cap-reached deferral are clean back-offs that alert on their own
+        # branches.
+        #
+        # Reported as an ERROR activity event, NOT raised (review finding):
+        # raising routes through the runner's generic _handle_error, which
+        # publishes `config_data` containing every integration configuration —
+        # the auth action's plaintext Lotek password included — and a fleet-wide
+        # outage would leak it once per shard, up to SHARD_SIZE-many times per
+        # tick. An ERROR activity event carries the same health signal (the
+        # unhealthy-connection metric counts ERROR activity events) without the
+        # credential exposure.
+        message = (
+            f"No devices could be serviced for integration {integration.id}: "
+            f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
+            f"{len(action_config.devices)}. See the per-device errors in this action's activity log."
+        )
+        logger.error(message)
+        await _try_log_activity(
+            integration_id, "pull_observations_shard", message, LogLevel.ERROR
         )
 
-    if any_open_gap:
+    if any_open_gap and not zero_progress:
         try:
+            # Atomic per-window claim first: concurrent shards all reach this
+            # point within seconds of each other, and the lease below is only
+            # created a pubsub hop later (when the backfill handler runs), so a
+            # plain lease read let every shard publish its own command (review
+            # finding). Exactly one shard wins the claim per window.
+            claimed = await state_manager.set_if_absent(
+                integration_id, "backfill_observations",
+                ttl_seconds=app_settings.MAX_ACTION_EXECUTION_TIME,
+                source_id=BACKFILL_TRIGGER_CLAIM_SOURCE,
+            )
             lease = await state_manager.get_state(
                 integration_id, "backfill_observations", BACKFILL_LEASE_SOURCE
             )
-            if not lease:
+            if claimed and not lease:
                 # backfill_observations is an InternalActionConfiguration with no
                 # persisted portal config, so this MUST carry a non-empty config
                 # override — a bare trigger_action(..., "backfill_observations")
@@ -731,7 +788,14 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
                 # as "no config at all" and 404s before the handler ever runs.
                 await trigger_action(
                     integration_id, "backfill_observations",
-                    config=BackfillObservationsConfig(triggered_by="pull_observations_shard")
+                    config=BackfillObservationsConfig(
+                        triggered_by="pull_observations_shard",
+                        # Carry the manual marker: without it a Trigger on a
+                        # paused integration pulled head data but its backfill
+                        # skipped on the pause, silently importing no history
+                        # (review finding).
+                        manual_run=action_config.manual_run,
+                    )
                 )
         except Exception as e:
             # The shard succeeded; a failed trigger must not fail the run.
@@ -739,18 +803,30 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
                 f"Could not trigger backfill for integration {integration.id}: {describe_exception(e)}"
             )
 
-    return {
+    result = {
         'observations_extracted': observations_extracted,
         'devices_failed': failed_devices,
         'devices_deferred': deferred_devices,
     }
+    if zero_progress:
+        # Only present on the bad path (like `skipped`/`reason` elsewhere), so
+        # the systemic-degradation signal is machine-readable in the completion
+        # event without changing the shape of every healthy result.
+        result['zero_progress'] = True
+    return result
 
 
-async def _read_device_state(integration_id, device_id, action_id="pull_observations"):
+async def _read_device_state(integration_id, device_id, action_id="pull_observations", quiet=False):
     """Read one device's saved state. Returns a DeviceState, or None when the
     key is absent or unparseable. Unparseable state is surfaced at WARNING —
     it means a cursor is about to be discarded and the lookback re-imported
-    (review finding: this was announced only at DEBUG)."""
+    (review finding: this was announced only at DEBUG).
+
+    `quiet` suppresses the portal publish for readers that are not the writer:
+    the dispatcher reads every device's cursor just to order the fleet, and the
+    shard that actually discards the cursor publishes the same warning moments
+    later — publishing on both doubled the volume per affected device (review
+    finding). The local log line is kept either way."""
     saved = await state_manager.get_state(integration_id, "pull_observations", device_id)
     if not saved:
         return None
@@ -763,7 +839,8 @@ async def _read_device_state(integration_id, device_id, action_id="pull_observat
             f"{integration_id} Error: {describe_exception(e)}"
         )
         logger.warning(message)
-        await _try_log_activity(integration_id, action_id, message, LogLevel.WARNING)
+        if not quiet:
+            await _try_log_activity(integration_id, action_id, message, LogLevel.WARNING)
         return None
 
 
@@ -1104,10 +1181,13 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         )
         return {"skipped": True, "reason": "configuration_missing"}
 
-    if not pull_config.run_on_schedule:
+    if not pull_config.run_on_schedule and not action_config.manual_run:
         # The operator's pause toggle must also stop the cascade: internal
         # actions bypass the runner's skippable_pull pause check, and backfill
         # is only ever machine-triggered — a paused integration skips cleanly
+        # (review finding). manual_run exempts a backfill descending from an
+        # operator-triggered head pass: without it a Trigger on a paused
+        # integration pulled the head window but silently imported no history
         # (review finding).
         logger.info(f"Integration {integration_id} is paused (run_on_schedule=false); skipping backfill.")
         return {"skipped": True, "reason": "integration_paused"}
@@ -1329,7 +1409,10 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         try:
             await trigger_action(
                 integration_id, "backfill_observations",
-                config=BackfillObservationsConfig(triggered_by="backfill_observations")
+                config=BackfillObservationsConfig(
+                    triggered_by="backfill_observations",
+                    manual_run=action_config.manual_run,
+                )
             )
         except Exception as e:
             # The next head pass will re-trigger; losing one cascade step is fine.

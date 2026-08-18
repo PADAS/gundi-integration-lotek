@@ -129,3 +129,12 @@ class BackfillObservationsConfig(InternalActionConfiguration):
         title="Triggered By",
         description="Which action triggered this backfill run.",
     )
+    manual_run: bool = pydantic.Field(
+        False,
+        title="Manual Run",
+        description=(
+            "True when this backfill descends from an operator-triggered head "
+            "pass on a paused integration; exempts it from the pause skip so a "
+            "manual run imports history instead of stopping at the head window."
+        ),
+    )

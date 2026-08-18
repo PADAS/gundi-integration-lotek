@@ -150,12 +150,13 @@ async def test_shard_does_not_retrigger_on_hot_breaker(
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
 
     # Every device fails, the breaker trips, and nothing is re-triggered: the
-    # zero-progress alarm fires (systemic degradation must alert).
-    from app.actions.client import LotekException
-    with pytest.raises(LotekException, match="No devices could be serviced"):
-        await action_pull_observations_shard(
-            lotek_integration, _shard_config(*(str(i) for i in range(1, 9)))
-        )
+    # zero-progress alarm fires (systemic degradation must alert) — as an ERROR
+    # activity event plus a result flag, never a raise (a raise would leak the
+    # integration's config through the runner's generic error handler).
+    result = await action_pull_observations_shard(
+        lotek_integration, _shard_config(*(str(i) for i in range(1, 9)))
+    )
+    assert result["zero_progress"] is True
 
     shard_calls = [c for c in trigger.await_args_list if c.args[1] == "pull_observations_shard"]
     assert shard_calls == []
@@ -389,16 +390,16 @@ async def test_dispatch_failures_do_not_abort_remaining_shards(
 
 
 @pytest.mark.asyncio
-async def test_all_dispatches_failing_raises(mocker, lotek_integration, pull_config, mock_redis):
+async def test_all_dispatches_failing_reports_without_raising(mocker, lotek_integration, pull_config, mock_redis):
     _setup_pull_mocks(mocker, mock_redis, _devices("1"))
     mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
     mocker.patch(
         "app.actions.handlers.trigger_action",
         new=AsyncMock(side_effect=Exception("commands topic down")),
     )
-    from app.actions.client import LotekException
-    with pytest.raises(LotekException, match="Could not dispatch any"):
-        await action_pull_observations(lotek_integration, pull_config)
+    result = await action_pull_observations(lotek_integration, pull_config)
+    assert result["shards_triggered"] == 0
+    assert result["devices_undispatched"] == ["1"]
 
 
 @pytest.mark.asyncio
@@ -420,3 +421,99 @@ async def test_manual_run_shards_bypass_the_pause(mocker, lotek_integration, pul
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
     result = await action_pull_observations_shard(lotek_integration, shard_config)
     assert result.get("reason") != "integration_paused"
+
+
+@pytest.mark.asyncio
+async def test_only_one_shard_triggers_backfill_per_window(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # 25 shards of a gapped fleet used to each publish a backfill command (the
+    # lease only exists a pubsub hop later). The atomic claim lets exactly one
+    # win; the losers publish nothing (review finding).
+    from app.services.state import IntegrationStateManager
+    _setup_pull_mocks(mocker, mock_redis, [], saved_state=None)
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+
+    claims = {"count": 0}
+
+    async def claim_once(self, integration_id, action_id, *, ttl_seconds, source_id="no-source"):
+        claims["count"] += 1
+        return claims["count"] == 1  # first caller wins, rest lose
+
+    mocker.patch.object(IntegrationStateManager, "set_if_absent", claim_once)
+
+    for _ in range(3):  # three concurrent-ish shards of the same gapped fleet
+        await action_pull_observations_shard(lotek_integration, _shard_config("1"))
+
+    backfill_calls = [c for c in trigger.await_args_list if c.args[1] == "backfill_observations"]
+    assert len(backfill_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_manual_run_propagates_to_the_backfill_trigger(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # A manual Trigger on a paused integration must import history too: without
+    # the marker the backfill skipped on the pause and the run silently covered
+    # only the head window (review finding).
+    _setup_pull_mocks(mocker, mock_redis, [], saved_state=None)
+    pull_config.run_on_schedule = False
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+
+    config = PullObservationsShardConfig(devices=["1"], manual_run=True)
+    await action_pull_observations_shard(lotek_integration, config)
+
+    backfill_calls = [c for c in trigger.await_args_list if c.args[1] == "backfill_observations"]
+    assert len(backfill_calls) == 1
+    assert backfill_calls[0].kwargs["config"].manual_run is True
+
+
+@pytest.mark.asyncio
+async def test_retrigger_cap_does_not_also_emit_zero_progress(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # One load event, one signal: a cap-reached deadline cut already alerts at
+    # ERROR, so the zero-progress alert must not fire on top of it.
+    import itertools
+    from app.actions.handlers import SHARD_RETRIGGER_CAP
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    log = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+    mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
+
+    config = PullObservationsShardConfig(devices=["1", "2"], generation=SHARD_RETRIGGER_CAP)
+    result = await action_pull_observations_shard(lotek_integration, config)
+
+    assert "zero_progress" not in result
+    errors = [c.kwargs["title"] for c in log.await_args_list if c.kwargs.get("level") == LogLevel.ERROR]
+    assert len(errors) == 1
+    assert "re-trigger cap" in errors[0]
+
+
+@pytest.mark.asyncio
+async def test_backfill_honors_manual_run_on_a_paused_integration(
+    mocker, lotek_integration, pull_config, mock_redis, auth_config
+):
+    from app.actions.configurations import BackfillObservationsConfig
+    from app.actions.handlers import action_backfill_observations
+    _setup_pull_mocks(mocker, mock_redis, [])
+    pull_config.run_on_schedule = False
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch("app.actions.handlers.get_auth_config", return_value=auth_config)
+    mocker.patch(
+        "app.services.state.IntegrationStateManager.acquire_lease",
+        new=AsyncMock(return_value=None),  # stop right after the pause check
+    )
+
+    paused = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig(manual_run=False)
+    )
+    assert paused == {"skipped": True, "reason": "integration_paused"}
+
+    manual = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig(manual_run=True)
+    )
+    assert manual["reason"] != "integration_paused"
