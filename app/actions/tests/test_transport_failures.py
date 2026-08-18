@@ -51,7 +51,7 @@ async def test_pull_get_devices_transport_failure_is_warning_and_clean_return(
 
     assert result["skipped"] is True
     assert result["reason"] == "lotek_unreachable"
-    assert result["observations_extracted"] == 0
+    assert result["shards_triggered"] == 0
     levels = _levels(mock_log)
     assert "WARNING" in levels
     assert "ERROR" not in levels

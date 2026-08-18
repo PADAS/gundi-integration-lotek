@@ -14,10 +14,16 @@ from datetime import datetime, timezone, timedelta
 from app.services.errors import ConfigurationNotFound
 from app.actions.client import LotekException, LotekTokenExpiredException, LotekUnauthorizedException
 from app.services.utils import find_config_for_action
-from app.actions.configurations import AuthenticateConfig, BackfillObservationsConfig, PullObservationsConfig
+from app.actions.configurations import (
+    AuthenticateConfig,
+    BackfillObservationsConfig,
+    PullObservationsConfig,
+    PullObservationsShardConfig,
+)
 from app.actions.core import action_title
 from app.actions.device_state import DeviceState
 from app.services.action_scheduler import trigger_action
+from app.services.lotek_connections import lotek_slot, NoConnectionSlot
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.state import IntegrationStateManager
 from gundi_core.schemas.v2.gundi import LogLevel
@@ -54,6 +60,12 @@ BACKFILL_LEASE_SOURCE = "lease"
 # chunk overshoots by at most 2 requests. Chunk results are recorded in list
 # order, preserving the sequential consecutive-failure semantics.
 FETCH_CONCURRENCY = 5
+# Sharded head pass (GUNDI-5620, movebank-connector pattern): the scheduled
+# pull_observations only lists devices and dispatches shards of this many
+# device ids as pull_observations_shard sub-actions, each with its own action
+# budget. Sized so a shard finishes comfortably inside one budget even on a
+# slow tick (25 devices / FETCH_CONCURRENCY = 5 chunks of round trips).
+SHARD_SIZE = 25
 # Head fetches re-cover this much of the cursor's trailing edge: rows whose
 # server-assigned UploadTimeStamp falls inside a window we already queried can
 # become queryable only after our request completed (write latency / clock
@@ -250,17 +262,31 @@ def ensure_timezone_aware(val: datetime, default_tz: timezone = timezone.utc) ->
 @action_title("Integration Settings")
 @activity_logger()
 async def action_pull_observations(integration, action_config: PullObservationsConfig):
+    """Dispatcher (GUNDI-5620, movebank-connector pattern): list the account's
+    devices, order them least-fresh first, and fan the fleet out as
+    pull_observations_shard sub-actions of SHARD_SIZE ids each. Every shard
+    invocation gets its own MAX_ACTION_EXECUTION_TIME budget, so a 600-device
+    account no longer has to fit one 540s window."""
     # Log only the id: the full Integration object embeds auth config data in
     # plaintext (same leak family as the action-runner _handle_error ticket).
     logger.info(f"Executing pull_observations action for integration {integration.id}...")
 
-    # The clock starts before get_devices: it spends the same action budget.
-    run_started = datetime.now(tz=timezone.utc)
+    integration_id = str(integration.id)
     auth = get_auth_config(integration)
     try:
         async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
             with attempt:
-                device_list = await client.get_devices(integration, auth)
+                async with lotek_slot(auth.username):
+                    device_list = await client.get_devices(integration, auth)
+    except NoConnectionSlot:
+        # Account budget saturated (shards/backfills from a previous tick are
+        # still draining). Scheduled tick — skip cleanly and let the next one
+        # retry, mirroring the movebank pull's no_connection_slot skip.
+        logger.info(
+            f"Skipping pull for integration {integration_id}: Lotek connection budget "
+            f"exhausted; the next scheduled tick will retry."
+        )
+        return {"skipped": True, "reason": "no_connection_slot"}
     except httpx.TransportError as e:
         # Transport failures reaching Lotek are the same class the per-device
         # breaker treats as WARNING; classifying them ERROR here marked every
@@ -273,15 +299,14 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         )
         logger.warning(message)
         await log_action_activity(
-            integration_id=str(integration.id),
+            integration_id=integration_id,
             action_id="pull_observations",
             title=message,
             level=LogLevel.WARNING
         )
         return {
-            "observations_extracted": 0,
-            "devices_failed": [],
-            "devices_deferred": [],
+            "devices_found": 0,
+            "shards_triggered": 0,
             "skipped": True,
             "reason": "lotek_unreachable",
         }
@@ -289,7 +314,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         message = f"Error fetching devices from Lotek. Integration ID: {integration.id} Exception: {describe_exception(e)}"
         logger.exception(message)
         await log_action_activity(
-            integration_id=str(integration.id),
+            integration_id=integration_id,
             action_id="pull_observations",
             title=message,
             level=LogLevel.ERROR
@@ -297,47 +322,116 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         raise  # bare: preserve the original traceback
 
     logger.info(f"Extracted {len(device_list)} devices from Lotek for inbound: {integration.id}")
-    present_time = datetime.now(tz=timezone.utc)
-    # Least-fresh first (mirrors the backfill's LRS ordering): the deadline and
-    # breaker always cut the tail of this list, and Lotek returns devices in a
-    # stable order — without re-ordering, sustained slowness starved the same
-    # tail devices every run until bounded staleness dropped their data
-    # permanently (review finding). Sorting by high_water puts the devices
-    # most behind first, so deferral rotates naturally as serviced devices
-    # move to the back.
-    integration_id = str(integration.id)
-    device_states = []
+    if not device_list:
+        return {"devices_found": 0, "shards_triggered": 0}
+
+    # Least-fresh first (mirrors the backfill's LRS ordering): if shards get
+    # cut by their rails, it's always the freshest tail that defers, and the
+    # ordering rotates naturally as serviced devices move to the back. Reads
+    # only the saved cursor (one Redis get per device); devices with no state
+    # yet sort first (most behind by definition).
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    staleness = []
     for device in device_list:
-        state, is_new = await _load_device_state(
-            integration_id, device.nDeviceID, present_time, action_config
+        state = await _read_device_state(integration_id, device.nDeviceID)
+        staleness.append((device.nDeviceID, state.high_water if state else epoch))
+    staleness.sort(key=lambda entry: entry[1])
+    device_ids = [device_id for device_id, _ in staleness]
+
+    shards = list(generate_batches(device_ids, SHARD_SIZE))
+    for shard in shards:
+        await trigger_action(
+            integration_id, "pull_observations_shard",
+            config=PullObservationsShardConfig(devices=shard, triggered_by="pull_observations")
         )
-        device_states.append((device, state, is_new))
+    return {"devices_found": len(device_list), "shards_triggered": len(shards)}
+
+
+async def _retrigger_shard(integration_id, device_ids):
+    """Re-dispatch deferred devices as a fresh shard with its own budget,
+    instead of parking them until the next scheduled tick. Best-effort: the
+    next tick re-lists and re-shards everything anyway."""
+    try:
+        await trigger_action(
+            integration_id, "pull_observations_shard",
+            config=PullObservationsShardConfig(devices=device_ids, triggered_by="pull_observations_shard")
+        )
+        return True
+    except Exception as e:
+        logger.warning(
+            f"Could not re-trigger shard for integration {integration_id}: {describe_exception(e)}"
+        )
+        return False
+
+
+@activity_logger()
+async def action_pull_observations_shard(integration, action_config: PullObservationsShardConfig):
+    """Internal action: process one shard of the head pass. Machine-triggered
+    by pull_observations (and by itself, for a deadline-deferred tail)."""
+    logger.info(
+        f"Executing pull_observations_shard ({len(action_config.devices)} devices) "
+        f"for integration {integration.id}..."
+    )
+    integration_id = str(integration.id)
+    run_started = datetime.now(tz=timezone.utc)
+    try:
+        auth = get_auth_config(integration)
+        pull_config = get_pull_config(integration)
+    except ConfigurationNotFound as e:
+        # Skip quietly, mirroring backfill: machine-triggered, so raising would
+        # route through the generic _handle_error — an ERROR event embedding
+        # the integration's full config (auth included). The scheduled parent
+        # is where a missing config gets surfaced.
+        logger.warning(
+            f"Skipping shard for integration {integration_id}: {describe_exception(e)}"
+        )
+        return {"skipped": True, "reason": "configuration_missing"}
+
+    if not pull_config.run_on_schedule:
+        # The operator's pause toggle must also stop the shard cascade:
+        # internal actions bypass the runner's skippable_pull pause check.
+        logger.info(f"Integration {integration_id} is paused (run_on_schedule=false); skipping shard.")
+        return {"skipped": True, "reason": "integration_paused"}
+
+    present_time = datetime.now(tz=timezone.utc)
+    device_states = []
+    for device_id in action_config.devices:
+        state, is_new = await _load_device_state(
+            integration_id, device_id, present_time, pull_config
+        )
+        device_states.append((device_id, state, is_new))
+    # Least-fresh first within the shard too: a rail cut defers the freshest tail.
     device_states.sort(key=lambda entry: entry[1].high_water)
 
     guards = RunGuards(run_started)
     observations_extracted = 0
     failed_devices = []
     deferred_devices = []
+    retriggered = False
     serviced_devices = 0
     # Only reflects devices actually processed this run — a device deferred by
-    # the deadline/breaker before its gap status is checked doesn't trigger
-    # backfill this cycle. Self-correcting: the next run's head pass reaches it
-    # and triggers then, same as the worst-case import delay the design accepts.
+    # the rails before its gap status is checked doesn't trigger backfill this
+    # cycle. Self-correcting: the re-triggered tail (or the next tick) reaches it.
     any_open_gap = False
     stale_drops = []
     for chunk_start in range(0, len(device_states), FETCH_CONCURRENCY):
         if reason := guards.should_stop():
-            deferred_devices = [d.nDeviceID for d, _, _ in device_states[chunk_start:]]
-            await _log_deferral(integration, "pull_observations", reason, deferred_devices)
+            deferred_devices = [device_id for device_id, _, _ in device_states[chunk_start:]]
+            await _log_deferral(integration, "pull_observations_shard", reason, deferred_devices)
+            # A deadline cut gets a fresh budget immediately; a hot breaker
+            # does NOT re-trigger — that would defeat the pause the breaker
+            # exists to buy. Its devices wait for the next scheduled tick.
+            if reason == "deadline":
+                retriggered = await _retrigger_shard(integration_id, deferred_devices)
             break
         chunk = device_states[chunk_start:chunk_start + FETCH_CONCURRENCY]
         results = await asyncio.gather(
             *(
                 _head_pass_device(
-                    device, state, is_new, integration, auth, action_config,
+                    device_id, state, is_new, integration, auth, pull_config,
                     present_time, guards, stale_drops=stale_drops
                 )
-                for device, state, is_new in chunk
+                for device_id, state, is_new in chunk
             ),
             # Collect every task's outcome rather than aborting the chunk on
             # the first exception: per-device failures must stay per-device.
@@ -351,22 +445,30 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         for res in results:
             if isinstance(res, (LotekUnauthorizedException, asyncio.CancelledError)):
                 raise res
-        for (device, state, is_new), res in zip(chunk, results):
+        slot_starved = []
+        for (device_id, state, is_new), res in zip(chunk, results):
+            if isinstance(res, NoConnectionSlot):
+                # Account connection budget exhausted: not a device failure and
+                # not evidence about Lotek — defer this device with the rest of
+                # the shard and re-trigger (the pubsub round trip is the backoff,
+                # movebank-connector pattern).
+                slot_starved.append(device_id)
+                continue
             if isinstance(res, BaseException):
                 # Sending to Gundi and checkpointing can fail too, and a device that fetched
                 # fine but failed downstream must not take the rest of the batch with it.
                 message = (
-                    f"Failed to process device {device.nDeviceID} for integration "
+                    f"Failed to process device {device_id} for integration "
                     f"{integration.id}: {describe_exception(res)}"
                 )
                 logger.error(message, exc_info=res)
                 await log_action_activity(
-                    integration_id=str(integration.id),
-                    action_id="pull_observations",
+                    integration_id=integration_id,
+                    action_id="pull_observations_shard",
                     title=message,
                     level=LogLevel.ERROR
                 )
-                failed_devices.append(device.nDeviceID)
+                failed_devices.append(device_id)
                 guards.record(transport_failure=False)
                 continue
             sent, device_failed, transport_failure = res
@@ -377,20 +479,30 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             if state.has_gap:
                 any_open_gap = True
             if device_failed:
-                failed_devices.append(device.nDeviceID)
+                failed_devices.append(device_id)
             else:
                 serviced_devices += 1
+        if slot_starved:
+            deferred_devices = slot_starved + [
+                device_id for device_id, _, _ in device_states[chunk_start + FETCH_CONCURRENCY:]
+            ]
+            logger.info(
+                f"Deferring {len(deferred_devices)} device(s) for integration {integration_id}: "
+                f"Lotek connection budget exhausted."
+            )
+            retriggered = await _retrigger_shard(integration_id, deferred_devices)
+            break
 
     if failed_devices:
         message = (
-            f"Pulled observations with {len(failed_devices)} of {len(device_list)} device(s) "
+            f"Pulled observations with {len(failed_devices)} of {len(action_config.devices)} device(s) "
             f"failing for integration {integration.id}: {_summarize_ids(failed_devices)}. "
             f"They will be retried on the next run."
         )
         logger.warning(message)
         await log_action_activity(
-            integration_id=str(integration.id),
-            action_id="pull_observations",
+            integration_id=integration_id,
+            action_id="pull_observations_shard",
             title=message,
             level=LogLevel.WARNING
         )
@@ -401,37 +513,35 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         # finding on the publish-volume fix). Per-device ranges are in the
         # local log.
         message = (
-            f"Dropped data older than max_data_age_hours={action_config.max_data_age_hours} "
+            f"Dropped data older than max_data_age_hours={pull_config.max_data_age_hours} "
             f"permanently for {len(stale_drops)} device(s) on integration {integration.id}: "
             f"{_summarize_ids(stale_drops)}. See the application log for per-device ranges."
         )
         logger.warning(message)
         await log_action_activity(
-            integration_id=str(integration.id),
-            action_id="pull_observations",
+            integration_id=integration_id,
+            action_id="pull_observations_shard",
             title=message,
             level=LogLevel.WARNING
         )
 
-    if device_list and serviced_devices == 0 and observations_extracted == 0:
-        # Zero progress: nothing serviced and nothing delivered — whether every
-        # device failed or the rails deferred them all, this is systemic
-        # degradation and must alert rather than publish action_complete. A
-        # device that delivered part of its window before failing still counts
-        # as progress, so partial runs stay warnings. This comes after the
-        # summary so the worst case keeps its device-naming log.
+    if device_states and serviced_devices == 0 and observations_extracted == 0 and not retriggered:
+        # Zero progress: nothing serviced, nothing delivered, and no deferred
+        # tail re-dispatched — systemic degradation, must alert rather than
+        # publish action_complete. A successfully re-triggered deferral is
+        # progress (the work moved to a fresh budget), so it stays a warning.
         raise LotekException(
             message=(
                 f"No devices could be serviced for integration {integration.id}: "
                 f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
-                f"{len(device_list)}. See the per-device errors in this action's activity log."
+                f"{len(action_config.devices)}. See the per-device errors in this action's activity log."
             )
         )
 
     if any_open_gap:
         try:
             lease = await state_manager.get_state(
-                str(integration.id), "backfill_observations", BACKFILL_LEASE_SOURCE
+                integration_id, "backfill_observations", BACKFILL_LEASE_SOURCE
             )
             if not lease:
                 # backfill_observations is an InternalActionConfiguration with no
@@ -440,11 +550,11 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 # publishes an empty config_overrides, which execute_action reads
                 # as "no config at all" and 404s before the handler ever runs.
                 await trigger_action(
-                    str(integration.id), "backfill_observations",
-                    config=BackfillObservationsConfig(triggered_by="pull_observations")
+                    integration_id, "backfill_observations",
+                    config=BackfillObservationsConfig(triggered_by="pull_observations_shard")
                 )
         except Exception as e:
-            # The head pass succeeded; a failed trigger must not fail the run.
+            # The shard succeeded; a failed trigger must not fail the run.
             logger.warning(
                 f"Could not trigger backfill for integration {integration.id}: {describe_exception(e)}"
             )
@@ -524,20 +634,24 @@ async def _save_device_state_fields(integration_id, device_id, updates, init_onl
     )
 
 
-async def _fetch_window(device, integration, auth, config, lower_date, upper_date, guards, action_id):
+async def _fetch_window(device_id, integration, auth, config, lower_date, upper_date, guards, action_id):
     """Fetch + transform one window for one device.
 
     Returns (cdip_positions | None, transport_failure). None means the fetch
     failed — already logged and classified; the caller marks the device failed
     and records transport_failure for the circuit breaker. Raises only
-    LotekUnauthorizedException (integration-wide).
+    LotekUnauthorizedException (integration-wide) and NoConnectionSlot
+    (account-wide budget, the caller defers and re-triggers).
     """
     integration_id = str(integration.id)
     try:
         async for attempt in stamina.retry_context(**_fetch_retry_kwargs(guards.run_started_at), wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
             with attempt:
-                positions = await client.get_positions(device.nDeviceID, auth, integration, lower_date, upper_date, True)
-        logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device.nDeviceID} between {lower_date} and {upper_date}.")
+                # The slot is held for exactly one request and re-acquired on
+                # retry, so a stamina backoff never parks a slot idle.
+                async with lotek_slot(auth.username):
+                    positions = await client.get_positions(device_id, auth, integration, lower_date, upper_date, True)
+        logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device_id} between {lower_date} and {upper_date}.")
         # Transform inside the try: a malformed payload is a per-device, fetch-class
         # failure and must get the same device/date-window log and isolation.
         return filter_and_transform_positions(positions, integration, config), False
@@ -545,17 +659,22 @@ async def _fetch_window(device, integration, auth, config, lower_date, upper_dat
         # Credentials are an integration-wide problem: every remaining device
         # would fail the same way, so fail fast instead of N identical errors.
         raise
+    except NoConnectionSlot:
+        # Account-wide connection budget exhausted (other shards/backfills are
+        # saturating it). Not a device failure and not evidence about Lotek —
+        # the caller defers the rest of its devices and re-triggers.
+        raise
     except httpx.TransportError as e:
         # WARNING + breaker-feeding: enough timeouts/transport failures in a
         # row mean Lotek-wide degradation, not a bad device.
         # Local log only: failed devices are aggregated into one end-of-run
         # summary publish. Per-device publishes multiplied exactly when Lotek
         # (or the instance) was already drowning — a congestion feedback loop.
-        message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
+        message = f"Error fetching positions from Lotek. Device: {device_id}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         logger.warning(message, exc_info=True)
         return None, True
     except LotekException as e:
-        message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
+        message = f"Error fetching positions from Lotek. Device: {device_id}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         if e.status_code >= 500 or e.status_code == 429:
             # A Lotek-side 5xx/429 is outage/throttling, the same class of
             # Lotek-wide degradation as a timeout: WARNING + breaker-feeding.
@@ -580,13 +699,13 @@ async def _fetch_window(device, integration, auth, config, lower_date, upper_dat
         # above), a data-shape break is permanent and won't self-heal on retry —
         # it must stay visible to health/alerting or it can persist unnoticed
         # forever (review finding).
-        message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
+        message = f"Error fetching positions from Lotek. Device: {device_id}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         logger.exception(message)
         await _try_log_activity(integration_id, action_id, message, LogLevel.ERROR)
         return None, False
 
 
-async def _deliver(cdip_positions, device, integration, action_id):
+async def _deliver(cdip_positions, device_id, integration, action_id):
     """Send one device's transformed positions to Gundi in batches.
 
     Returns (observations_sent, delivery_failed). Handled here rather than in
@@ -600,14 +719,14 @@ async def _deliver(cdip_positions, device, integration, action_id):
     observations_sent = 0
     try:
         if cdip_positions:
-            logger.info(f"{len(cdip_positions)} observations pulled successfully for device {device.nDeviceID} integration ID: {integration.id}.")
+            logger.info(f"{len(cdip_positions)} observations pulled successfully for device {device_id} integration ID: {integration.id}.")
             for i, batch in enumerate(generate_batches(cdip_positions)):
-                logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Device: {device.nDeviceID}')
+                logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Device: {device_id}')
                 await gundi_tools.send_observations_to_gundi(observations=batch, integration_id=integration.id)
                 observations_sent += len(batch)
     except Exception as e:
         message = (
-            f"Error delivering observations for device {device.nDeviceID}. Integration ID: "
+            f"Error delivering observations for device {device_id}. Integration ID: "
             f"{integration.id} Exception: {describe_exception(e)}"
         )
         # needs_attention drives log-based alerting on delivery failures (template
@@ -625,7 +744,7 @@ async def _deliver(cdip_positions, device, integration, action_id):
     return observations_sent, False
 
 
-async def _head_pass_device(device, state, is_new, integration, auth, action_config, present_time, guards, stale_drops=None):
+async def _head_pass_device(device_id, state, is_new, integration, auth, action_config, present_time, guards, stale_drops=None):
     """Fetch, deliver and checkpoint one device's freshest window.
 
     Returns (observations_sent, device_failed, transport_failure).
@@ -649,7 +768,7 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
 
     lower_date = max(state.high_water - HEAD_LATE_UPLOAD_OVERLAP, freshness_floor)
     cdip_positions, transport_failure = await _fetch_window(
-        device, integration, auth, action_config, lower_date, present_time, guards, "pull_observations"
+        device_id, integration, auth, action_config, lower_date, present_time, guards, "pull_observations"
     )
     if cdip_positions is None:
         return 0, True, transport_failure
@@ -659,9 +778,9 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
         # device — on a mostly-dormant 400-device integration that was
         # hundreds of pubsub publishes per tick, the single largest
         # contributor to the publish congestion behind GUNDI-5602.
-        logger.info(f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}.")
+        logger.info(f"No positions fetched for device {device_id} integration ID: {integration.id}.")
 
-    observations_sent, delivery_failed = await _deliver(cdip_positions, device, integration, "pull_observations")
+    observations_sent, delivery_failed = await _deliver(cdip_positions, device_id, integration, "pull_observations")
     if delivery_failed:
         # The breaker watches Lotek, not Gundi: a delivery failure is not
         # evidence of Lotek-wide degradation.
@@ -686,10 +805,10 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
         updates["version"] = state.version
         init_only = {"gap_start": state.gap_start, "gap_end": state.gap_end}
     try:
-        await _save_device_state_fields(integration_id, device.nDeviceID, updates, init_only=init_only)
+        await _save_device_state_fields(integration_id, device_id, updates, init_only=init_only)
     except Exception as e:
         message = (
-            f"Error saving cursor for device {device.nDeviceID}. Integration ID: "
+            f"Error saving cursor for device {device_id}. Integration ID: "
             f"{integration.id} Exception: {describe_exception(e)}"
         )
         logger.exception(message)
@@ -704,11 +823,11 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
         # one end-of-run summary publish (review finding).
         logger.warning(
             f"Dropped stale range [{stale_from.isoformat()}, {freshness_floor.isoformat()}] "
-            f"permanently for device {device.nDeviceID}: older than max_data_age_hours="
+            f"permanently for device {device_id}: older than max_data_age_hours="
             f"{action_config.max_data_age_hours}. Integration ID: {integration_id}"
         )
         if stale_drops is not None:
-            stale_drops.append(device.nDeviceID)
+            stale_drops.append(device_id)
 
     return observations_sent, False, False
 
@@ -736,13 +855,13 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
         upper_date = min(state.gap_end, state.gap_start + BACKFILL_WINDOW)
 
         cdip_positions, transport_failure = await _fetch_window(
-            device, integration, auth, pull_config, window_start, upper_date, guards, "backfill_observations"
+            device.nDeviceID, integration, auth, pull_config, window_start, upper_date, guards, "backfill_observations"
         )
         if cdip_positions is None:
             device_failed = True
             break
 
-        sent, delivery_failed = await _deliver(cdip_positions, device, integration, "backfill_observations")
+        sent, delivery_failed = await _deliver(cdip_positions, device.nDeviceID, integration, "backfill_observations")
         observations_sent += sent
         if delivery_failed:
             device_failed = True
@@ -820,7 +939,17 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         try:
             async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
                 with attempt:
-                    device_list = await client.get_devices(integration, auth)
+                    async with lotek_slot(auth.username):
+                        device_list = await client.get_devices(integration, auth)
+        except NoConnectionSlot:
+            # Account budget saturated by head-pass shards: back off quietly.
+            # The lease releases via the finally; open gaps re-trigger on the
+            # next scheduled head pass.
+            logger.info(
+                f"Skipping backfill for integration {integration_id}: Lotek connection "
+                f"budget exhausted; open gaps are retried on the next trigger."
+            )
+            return {"skipped": True, "reason": "no_connection_slot"}
         except httpx.TransportError as e:
             # Same WARNING classification as the head pass: an unreachable
             # Lotek must not mark the connection unhealthy. The early return
@@ -872,6 +1001,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         serviced_devices = 0
         gaps_closed = 0
         windows_advanced_total = 0
+        budget_starved = False
         for chunk_start in range(0, len(gapped), FETCH_CONCURRENCY):
             if reason := guards.should_stop():
                 deferred_devices = [d.nDeviceID for d, _ in gapped[chunk_start:]]
@@ -893,7 +1023,14 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             for res in results:
                 if isinstance(res, (LotekUnauthorizedException, asyncio.CancelledError)):
                     raise res
+            slot_starved = []
             for (device, state), res in zip(chunk, results):
+                if isinstance(res, NoConnectionSlot):
+                    # Account connection budget exhausted (head-pass shards are
+                    # saturating it): not a device failure, not evidence about
+                    # Lotek. Defer the rest and let the next trigger retry.
+                    slot_starved.append(device.nDeviceID)
+                    continue
                 if isinstance(res, BaseException):
                     message = (
                         f"Failed to backfill device {device.nDeviceID} for integration "
@@ -919,6 +1056,16 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                     failed_devices.append(device.nDeviceID)
                 else:
                     serviced_devices += 1
+            if slot_starved:
+                deferred_devices = slot_starved + [
+                    d.nDeviceID for d, _ in gapped[chunk_start + FETCH_CONCURRENCY:]
+                ]
+                budget_starved = True
+                logger.info(
+                    f"Deferring {len(deferred_devices)} gapped device(s) for integration "
+                    f"{integration_id}: Lotek connection budget exhausted."
+                )
+                break
 
         if failed_devices:
             message = (
@@ -934,8 +1081,9 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 level=LogLevel.WARNING
             )
 
-        if gapped and serviced_devices == 0 and observations_extracted == 0:
-            # Same systemic-degradation contract as the head pass. The raise
+        if gapped and serviced_devices == 0 and observations_extracted == 0 and not budget_starved:
+            # Same systemic-degradation contract as the head pass (a
+            # budget-starved run is a clean back-off, not degradation). The raise
             # also breaks the self-retrigger cascade below — a wholly-failing
             # backfill must not re-trigger itself forever.
             raise LotekException(

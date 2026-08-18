@@ -51,6 +51,21 @@ def _reset_shared_http_client():
 
 
 @pytest.fixture(autouse=True)
+def _grant_connection_slots(monkeypatch):
+    # lotek_slot talks to real Redis (per-account connection budget). Grant
+    # every slot by default so handler tests don't need a Redis server; tests
+    # exercising budget exhaustion patch app.actions.handlers.lotek_slot to
+    # raise NoConnectionSlot themselves.
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def granted_slot(username, **kwargs):
+        yield
+
+    monkeypatch.setattr("app.actions.handlers.lotek_slot", granted_slot)
+
+
+@pytest.fixture(autouse=True)
 def _zero_retry_waits(monkeypatch):
     # Retry-path tests otherwise sleep through real stamina backoff (minutes
     # over the suite, enough to blow a CI step timeout — review finding).

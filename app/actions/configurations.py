@@ -1,6 +1,6 @@
 import pydantic
 
-from typing import Optional
+from typing import List, Optional
 
 from .core import (
     AuthActionConfiguration,
@@ -69,6 +69,26 @@ class PullObservationsConfig(PullActionConfiguration, ExecutableActionMixin):
             "max_pdop",
             "run_on_schedule",
         ],
+    )
+
+
+class PullObservationsShardConfig(InternalActionConfiguration):
+    """Internal-only: one shard of the head pass (GUNDI-5620). The scheduled
+    pull_observations action only lists devices and dispatches shards; each
+    shard invocation gets its own MAX_ACTION_EXECUTION_TIME budget, so a large
+    account's fleet no longer has to fit one 540s window. The devices list is
+    always non-empty, which also keeps the config_overrides payload non-empty
+    (see BackfillObservationsConfig for why that matters)."""
+    devices: List[str] = pydantic.Field(
+        ...,
+        min_items=1,
+        title="Devices",
+        description="Device ids this shard is responsible for.",
+    )
+    triggered_by: str = pydantic.Field(
+        "pull_observations",
+        title="Triggered By",
+        description="Which action triggered this shard.",
     )
 
 
