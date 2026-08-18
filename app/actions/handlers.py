@@ -134,10 +134,15 @@ def _summarize_ids(ids):
     return listed
 
 
-async def _log_deferral(integration, action_id, reason, deferred_ids):
+async def _log_deferral(integration, action_id, reason, deferred_ids, disposition="to the next run"):
+    # disposition tells the operator what actually happens to the tail: a
+    # deadline-cut shard hands it to a re-triggered shard immediately, while a
+    # breaker stop really does wait for the next scheduled tick (Copilot
+    # review: the fixed "to the next run" text was misleading under deadline
+    # pressure).
     message = (
         f"Stopping early ({reason}) for integration {integration.id}: deferring "
-        f"{len(deferred_ids)} device(s) to the next run: {_summarize_ids(deferred_ids)}."
+        f"{len(deferred_ids)} device(s) {disposition}: {_summarize_ids(deferred_ids)}."
     )
     logger.warning(message)
     await log_action_activity(
@@ -359,10 +364,19 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     # only the saved cursor (one Redis get per device); devices with no state
     # yet sort first (most behind by definition).
     epoch = datetime.min.replace(tzinfo=timezone.utc)
+
+    async def read_high_water(device_id):
+        state = await _read_device_state(integration_id, device_id)
+        return device_id, state.high_water if state else epoch
+
+    # Bounded-concurrency reads (Copilot review): sequential awaits made this
+    # sort a per-device Redis round trip — a latency multiplier on exactly the
+    # large fleets sharding exists to serve. Chunks of 25 keep the dispatcher
+    # fast without a thundering herd on Redis.
     staleness = []
-    for device in device_list:
-        state = await _read_device_state(integration_id, device.nDeviceID)
-        staleness.append((device.nDeviceID, state.high_water if state else epoch))
+    all_ids = [device.nDeviceID for device in device_list]
+    for i in range(0, len(all_ids), 25):
+        staleness.extend(await asyncio.gather(*(read_high_water(d) for d in all_ids[i:i + 25])))
     staleness.sort(key=lambda entry: entry[1])
     device_ids = [device_id for device_id, _ in staleness]
 
@@ -504,7 +518,6 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
     for chunk_start in range(0, len(device_states), FETCH_CONCURRENCY):
         if reason := guards.should_stop():
             deferred_devices = [device_id for device_id, _, _ in device_states[chunk_start:]]
-            await _log_deferral(integration, "pull_observations_shard", reason, deferred_devices)
             # A deadline cut gets a fresh budget immediately; a hot breaker
             # does NOT re-trigger — that would defeat the pause the breaker
             # exists to buy. Its devices wait for the next scheduled tick.
@@ -512,6 +525,14 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
                 retriggered = await _retrigger_shard(
                     integration, deferred_devices, action_config.generation
                 )
+            disposition = (
+                "to an immediately re-triggered shard" if retriggered
+                else "to the next scheduled run"
+            )
+            await _log_deferral(
+                integration, "pull_observations_shard", reason, deferred_devices,
+                disposition=disposition,
+            )
             break
         chunk = device_states[chunk_start:chunk_start + FETCH_CONCURRENCY]
         results = await asyncio.gather(
