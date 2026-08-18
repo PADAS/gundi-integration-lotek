@@ -79,3 +79,18 @@ def test_connection_key_is_stable_and_username_scoped():
     assert connection_key("a") == connection_key("a")
     assert connection_key("a") != connection_key("b")
     assert connection_key("a").startswith("lotek:connections:")
+
+
+@pytest.mark.asyncio
+async def test_close_connection_client_closes_and_resets(monkeypatch):
+    # The FastAPI lifespan closes every other module-level client; without this
+    # the pooled connections are reclaimed by __del__ after the loop is gone,
+    # logging "Event loop is closed" per connection on each restart.
+    from app.services.lotek_connections import close_connection_client
+
+    client = AsyncMock()
+    monkeypatch.setattr(lc, "_shared_client", client)
+    await close_connection_client()
+    client.aclose.assert_awaited_once()
+    assert lc._shared_client is None
+    await close_connection_client()  # idempotent: no client, no error

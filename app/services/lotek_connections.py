@@ -53,6 +53,19 @@ def _client() -> redis.Redis:
     return _shared_client
 
 
+async def close_connection_client() -> None:
+    """Close the shared Redis client on shutdown, like every other module-level
+    client the FastAPI lifespan closes. Without this the connections are only
+    reclaimed by __del__ after the event loop is gone, which logs a
+    "RuntimeError: Event loop is closed" traceback per pooled connection on
+    every restart (observed on the local stage stack).
+    """
+    global _shared_client
+    if _shared_client is not None:
+        await _shared_client.aclose()
+        _shared_client = None
+
+
 @asynccontextmanager
 async def lotek_slot(username: str, *, ttl_seconds: int = 300):
     """Acquire one Lotek connection slot for `username`, shared across every

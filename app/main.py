@@ -12,6 +12,7 @@ import app.settings as settings
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.actions.client import close_client as close_lotek_client
+from app.services.lotek_connections import close_connection_client
 from app.services.action_runner import execute_action, _portal
 from app.services.self_registration import register_integration_in_gundi
 from app.services.webhooks import close_diagnostic_client
@@ -32,6 +33,7 @@ async def lifespan(app: FastAPI):
     await _portal.close()
     await close_diagnostic_client()
     await close_lotek_client()
+    await close_connection_client()
 
 
 app = FastAPI(
