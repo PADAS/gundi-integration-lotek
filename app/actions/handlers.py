@@ -1232,73 +1232,41 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         gapped.sort(key=lambda pair: pair[1].last_backfilled or epoch)
 
         guards = RunGuards(run_started)
+        traversal = DeviceTraversal(
+            integration, "backfill_observations", guards, concurrency=FETCH_CONCURRENCY
+        )
         observations_extracted = 0
-        failed_devices = []
-        deferred_devices = []
-        serviced_devices = 0
         gaps_closed = 0
         windows_advanced_total = 0
-        budget_starved = False
-        for chunk_start in range(0, len(gapped), FETCH_CONCURRENCY):
-            if reason := guards.should_stop():
-                deferred_devices = [d.nDeviceID for d, _ in gapped[chunk_start:]]
-                await _log_deferral(integration, "backfill_observations", reason, deferred_devices)
-                break
-            chunk = gapped[chunk_start:chunk_start + FETCH_CONCURRENCY]
-            results = await asyncio.gather(
-                *(
-                    _backfill_device(device, state, integration, auth, pull_config, guards)
-                    for device, state in chunk
-                ),
-                # Collect every task's outcome rather than aborting the chunk
-                # on the first exception: per-device failures stay per-device.
-                return_exceptions=True,
-            )
-            # Credentials refused is integration-wide and fatal; re-raise it
-            # over any per-device outcomes in the same chunk. Cancellation
-            # must also propagate (see the head-pass loop).
-            for res in results:
-                if isinstance(res, (LotekUnauthorizedException, asyncio.CancelledError)):
-                    raise res
-            slot_starved = []
-            for (device, state), res in zip(chunk, results):
-                if isinstance(res, NoConnectionSlot):
-                    # Account connection budget exhausted (head-pass shards are
-                    # saturating it): not a device failure, not evidence about
-                    # Lotek. Defer the rest and let the next trigger retry.
-                    slot_starved.append(device.nDeviceID)
-                    continue
-                if isinstance(res, BaseException):
-                    message = (
-                        f"Failed to backfill device {device.nDeviceID} for integration "
-                        f"{integration_id}: {describe_exception(res)}"
-                    )
-                    logger.error(message, exc_info=res)
-                    await log_action_activity(
-                        integration_id=integration_id,
-                        action_id="backfill_observations",
-                        title=message,
-                        level=LogLevel.ERROR
-                    )
-                    failed_devices.append(device.nDeviceID)
-                    guards.record(transport_failure=False)
-                    continue
-                sent, device_failed, transport_failure, gap_closed, windows_advanced = res
-                # Single recording site, mirroring the head-pass loop.
-                guards.record(transport_failure=transport_failure)
-                observations_extracted += sent
-                gaps_closed += int(gap_closed)
-                windows_advanced_total += windows_advanced
-                if device_failed:
-                    failed_devices.append(device.nDeviceID)
-                else:
-                    serviced_devices += 1
-            if slot_starved:
-                # Defer only the starved devices (spec D3); see the head pass.
-                deferred_devices.extend(slot_starved)
-                budget_starved = True
 
-        if budget_starved:
+        async for (device, state), res in traversal.run(
+            gapped,
+            key=lambda pair: pair[0].nDeviceID,
+            process=lambda pair: _backfill_device(
+                pair[0], pair[1], integration, auth, pull_config, guards
+            ),
+        ):
+            sent, device_failed, transport_failure, gap_closed, windows_advanced = res
+            # Single recording site, mirroring the head pass.
+            guards.record(transport_failure=transport_failure)
+            observations_extracted += sent
+            gaps_closed += int(gap_closed)
+            windows_advanced_total += windows_advanced
+            if device_failed:
+                traversal.mark_failed(device.nDeviceID)
+
+        failed_devices = traversal.failed_devices
+        deferred_devices = traversal.deferred_devices
+
+        # Policy, deliberately NOT in the traversal (spec D6): unlike the shard,
+        # backfill never re-triggers its own tail from here — the cascade below
+        # owns that, throttled by gaps_remaining.
+        if traversal.stop_reason:
+            await _log_deferral(
+                integration, "backfill_observations", traversal.stop_reason,
+                deferred_devices,
+            )
+        if traversal.budget_starved:
             await _log_deferral(
                 integration, "backfill_observations", "connection budget exhausted",
                 deferred_devices, disposition="to the next backfill trigger",
@@ -1318,17 +1286,29 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 level=LogLevel.WARNING
             )
 
-        if gapped and serviced_devices == 0 and observations_extracted == 0 and not budget_starved:
-            # Same systemic-degradation contract as the head pass (a
-            # budget-starved run is a clean back-off, not degradation). The raise
-            # also breaks the self-retrigger cascade below — a wholly-failing
-            # backfill must not re-trigger itself forever.
-            raise LotekException(
-                message=(
-                    f"No devices could be backfilled for integration {integration_id}: "
-                    f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
-                    f"{len(gapped)}. See the per-device errors in this action's activity log."
-                )
+        # Backfill's suppression policy differs from the shard's and is
+        # preserved exactly: ONLY starvation explains a no-progress run here (a
+        # budget-starved run is a clean back-off, not degradation). Deadline and
+        # breaker stops must still alert.
+        zero_progress = (
+            gapped and traversal.serviced_devices == 0
+            and observations_extracted == 0 and not traversal.budget_starved
+        )
+        if zero_progress:
+            # Same systemic-degradation contract as the head pass. Reported, NOT
+            # raised: raising routes through the runner's generic _handle_error,
+            # which publishes config_data containing every integration
+            # configuration — the auth action's plaintext Lotek password
+            # included (GUNDI-5628). An ERROR activity event carries the same
+            # health signal without the credential exposure (spec D7).
+            message = (
+                f"No devices could be backfilled for integration {integration_id}: "
+                f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
+                f"{len(gapped)}. See the per-device errors in this action's activity log."
+            )
+            logger.error(message)
+            await _try_log_activity(
+                integration_id, "backfill_observations", message, LogLevel.ERROR
             )
 
         # _backfill_device mutates the states in place, so this reflects
@@ -1353,7 +1333,11 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             # holding it. Unlike the shard cascade this one has no generation
             # cap, so the throttle has to come from here; the next scheduled
             # head pass re-triggers it once the budget frees up.
-            and not budget_starved
+            and not traversal.budget_starved
+            # A wholly-failing backfill must not re-trigger itself forever. The
+            # removed raise used to guarantee this by unwinding before the
+            # re-trigger below; now it has to be explicit (spec D7).
+            and not zero_progress
         )
         result = {
             'observations_extracted': observations_extracted,
@@ -1361,6 +1345,11 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             'devices_deferred': deferred_devices,
             'gaps_closed': gaps_closed,
         }
+        if zero_progress:
+            # Only present on the bad path (like `skipped`/`reason` elsewhere),
+            # so the systemic-degradation signal is machine-readable in the
+            # completion event without changing every healthy result's shape.
+            result['zero_progress'] = True
     finally:
         # Ownership-checked release: an unconditional DEL could outlive this
         # run's TTL (e.g. retried through a Redis blip after a cancellation)

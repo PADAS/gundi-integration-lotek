@@ -9,7 +9,7 @@ from app.actions.handlers import (
     BACKFILL_MAX_WINDOWS_PER_DEVICE,
     action_backfill_observations,
 )
-from app.actions.client import LotekDevice, LotekException
+from app.actions.client import LotekDevice
 from app.actions.configurations import BackfillObservationsConfig, PullObservationsConfig
 
 
@@ -248,8 +248,12 @@ async def test_backfill_malformed_data_failure_logs_error_not_warning(
         mocker, mock_redis, _devices("1"), {"1": _gap_state()}
     )
     get_positions.return_value = None  # blows up in filter_and_transform_positions
-    with pytest.raises(LotekException):  # single device, zero progress
-        await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+    # Single device, so this is also a zero-progress run — reported on the
+    # result now instead of raised (spec D7).
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result["zero_progress"] is True
     device_logs = [c for c in log.await_args_list if "Device: 1" in c.kwargs.get("title", "")]
     assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
 
@@ -338,8 +342,10 @@ async def test_backfill_does_not_retrigger_when_all_gaps_closed(
 async def test_backfill_does_not_retrigger_on_zero_progress(
     mocker, lotek_integration, mock_redis
 ):
-    # Zero progress raises — the raise is the cascade's natural chain-breaker,
-    # otherwise a wholly-failing backfill would re-trigger itself forever.
+    # Zero progress breaks the cascade: the raise used to be its natural
+    # chain-breaker, and `not zero_progress` on the gaps_remaining gate now
+    # carries that explicitly (spec D7). A wholly-failing backfill must not
+    # re-trigger itself forever.
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     get_positions, _, _, _, _ = _setup_backfill_mocks(
@@ -347,23 +353,36 @@ async def test_backfill_does_not_retrigger_on_zero_progress(
     )
     get_positions.side_effect = httpx.ReadTimeout("")
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
-    with pytest.raises(LotekException):
-        await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result["zero_progress"] is True
     trigger.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_backfill_zero_progress_raises(
+async def test_backfill_zero_progress_reports_and_still_releases_the_lease(
     mocker, lotek_integration, mock_redis
 ):
+    # Was test_backfill_zero_progress_raises: the ERROR activity event replaced
+    # the raise (spec D7), so the lease release now happens on a normal return
+    # through the finally rather than while an exception unwinds.
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
-    get_positions, _, _, release, _ = _setup_backfill_mocks(
+    get_positions, _, _, release, log = _setup_backfill_mocks(
         mocker, mock_redis, _devices("1"), {"1": _gap_state()}
     )
     get_positions.side_effect = httpx.ReadTimeout("")
-    with pytest.raises(LotekException, match="No devices could be backfilled"):
-        await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result["zero_progress"] is True
+    zero_progress_errors = [
+        c for c in log.await_args_list
+        if c.kwargs.get("level") == LogLevel.ERROR
+        and "No devices could be backfilled" in c.kwargs.get("title", "")
+    ]
+    assert zero_progress_errors, "the health signal must still reach the activity feed"
     release.assert_awaited_once()
 
 
@@ -435,3 +454,58 @@ async def test_backfill_skips_quietly_when_config_is_missing(
     get_positions.assert_not_awaited()
     error_logs = [c for c in log.await_args_list if c.kwargs.get("level") == LogLevel.ERROR]
     assert not error_logs
+
+
+# --- spec D7: zero progress reports instead of raising -----------------------
+
+
+@pytest.mark.asyncio
+async def test_zero_progress_backfill_reports_instead_of_raising(
+    mocker, lotek_integration, mock_redis
+):
+    """Raising routed through the runner's generic _handle_error, which
+    publishes config_data containing the integration's plaintext auth
+    (GUNDI-5628). Backfill adopts the head pass's ERROR-event + result-flag
+    contract instead (spec D7), and must still suppress the self-retrigger."""
+    _setup_backfill_mocks(mocker, mock_redis, _devices("1"), {"1": _gap_state()})
+    mocker.patch(
+        "app.actions.handlers._backfill_device",
+        new=AsyncMock(side_effect=ValueError("boom")),
+    )
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig(triggered_by="test")
+    )
+
+    assert result["zero_progress"] is True
+    # ERROR activity event carries the health signal...
+    assert try_log.await_args.args[3] is LogLevel.ERROR
+    # ...and the cascade stays broken, exactly as the raise used to guarantee.
+    trigger.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_zero_progress_backfill_breaks_the_cascade_after_a_window_advanced(
+    mocker, lotek_integration, mock_redis
+):
+    # The removed raise broke the cascade implicitly by unwinding before the
+    # re-trigger. A run that advanced an empty window and then failed satisfies
+    # every other gaps_remaining conjunct, so `not zero_progress` has to be
+    # explicit or a wholly-failing backfill would re-trigger itself forever.
+    get_positions, _, _, _, _ = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {"1": _gap_state(days_back_start=14)}
+    )
+    # Window 1 delivers nothing but advances the gap; window 2's fetch fails.
+    get_positions.side_effect = [[]] + [httpx.ReadTimeout("")] * 4
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+
+    assert result["observations_extracted"] == 0
+    assert result["devices_failed"] == ["1"]
+    assert result["zero_progress"] is True
+    trigger.assert_not_awaited()
