@@ -509,3 +509,71 @@ async def test_zero_progress_backfill_breaks_the_cascade_after_a_window_advanced
     assert result["devices_failed"] == ["1"]
     assert result["zero_progress"] is True
     trigger.assert_not_awaited()
+
+
+def _zero_progress_errors(log):
+    return [
+        c for c in log.await_args_list
+        if c.kwargs.get("level") == LogLevel.ERROR
+        and "No devices could be backfilled" in c.kwargs.get("title", "")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_breaker_stop_still_publishes_the_zero_progress_error(
+    mocker, lotek_integration, mock_redis
+):
+    # Pins backfill's suppression policy (spec criterion 8: alerting unchanged).
+    # ONLY connection-budget starvation excuses a no-progress backfill run. A
+    # hot circuit breaker must NOT: a Lotek-wide outage is exactly when a
+    # breaker stop and zero progress co-occur, and the cdip health metric counts
+    # ERROR activity events — suppressing here would make the outage look
+    # healthy. The shard's expression deliberately differs; unifying the two
+    # (an earlier draft hoisted a shared `deferred_cleanly` onto the traversal)
+    # would silently break this, so assert it rather than trust the expression.
+    get_positions, _, _, _, log = _setup_backfill_mocks(
+        mocker, mock_redis,
+        _devices("1", "2", "3", "4", "5", "6"),
+        {d: _gap_state() for d in ("1", "2", "3", "4", "5", "6")},
+    )
+    # Every fetch times out: chunk 1 (FETCH_CONCURRENCY=5) records 5 consecutive
+    # transport failures, so should_stop() before chunk 2 returns
+    # "circuit breaker" and defers device 6.
+    get_positions.side_effect = httpx.ReadTimeout("")
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result["devices_failed"] == ["1", "2", "3", "4", "5"]
+    assert result["devices_deferred"] == ["6"]  # the breaker really did stop it
+    breaker_deferrals = [
+        c for c in log.await_args_list
+        if c.kwargs.get("level") == LogLevel.WARNING
+        and "circuit breaker" in c.kwargs.get("title", "")
+    ]
+    assert breaker_deferrals, "the breaker stop must be the reason the tail deferred"
+    assert result["zero_progress"] is True
+    assert _zero_progress_errors(log), (
+        "a breaker stop must NOT suppress the zero-progress ERROR"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deadline_stop_still_publishes_the_zero_progress_error(
+    mocker, lotek_integration, mock_redis
+):
+    # Same policy, other stop reason: a deadline cut is not a clean back-off for
+    # backfill (unlike the shard, it hands nothing off to a fresh budget), so it
+    # must keep alerting too.
+    get_positions, _, _, _, log = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1", "2"), {"1": _gap_state(), "2": _gap_state()}
+    )
+    mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    get_positions.assert_not_awaited()  # stopped before the first chunk
+    assert result["devices_deferred"] == ["1", "2"]
+    assert result["zero_progress"] is True
+    assert _zero_progress_errors(log), (
+        "a deadline stop must NOT suppress the zero-progress ERROR"
+    )
