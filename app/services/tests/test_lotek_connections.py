@@ -32,12 +32,16 @@ async def test_acquire_under_capacity_grants_and_releases(fake_redis):
 
 
 @pytest.mark.asyncio
-async def test_acquire_at_capacity_raises_and_does_not_release(fake_redis):
+async def test_acquire_at_capacity_raises_and_best_effort_releases(fake_redis):
+    # Give-up (including the fail-fast default with no wait budget) cannot
+    # tell "server said 0" apart from "granted but the reply was lost", so it
+    # always attempts a cleanup zrem before raising — a no-op if the token
+    # was never actually added.
     fake_redis.eval = AsyncMock(return_value=0)
     with pytest.raises(NoConnectionSlot):
         async with lotek_slot("user@example.com"):
             pytest.fail("body must not run when at capacity")
-    fake_redis.zrem.assert_not_awaited()
+    fake_redis.zrem.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -147,7 +151,45 @@ async def test_slot_gives_up_when_wait_budget_exhausted(fake_redis, monkeypatch)
             pytest.fail("body must not run when the account stays saturated")
 
     assert fake_redis.eval.await_count >= 1
-    fake_redis.zrem.assert_not_awaited()
+    # Best-effort cleanup on give-up: we cannot tell "server said 0" apart
+    # from "server granted it but the reply was lost" from the client side,
+    # so the give-up path always attempts to remove the token. It is a no-op
+    # if the token was never actually added.
+    fake_redis.zrem.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_slot_give_up_releases_a_token_the_server_actually_granted(fake_redis, monkeypatch):
+    """If the final poll's reply is lost after the server already granted the
+    slot (e.g. a network blip on the way back), the give-up path must not
+    strand that slot for the full TTL: it removes the token before raising."""
+    monkeypatch.setattr(lc, "SLOT_WAIT_POLL_INITIAL", 0)
+    monkeypatch.setattr(lc, "SLOT_WAIT_POLL_MAX", 0)
+    monkeypatch.setattr(lc, "SLOT_WAIT_JITTER", 0)
+    fake_redis.eval = AsyncMock(return_value=0)
+
+    with pytest.raises(NoConnectionSlot):
+        async with lotek_slot("user@example.com", max_wait_seconds=0.05):
+            pytest.fail("body must not run when the account stays saturated")
+
+    # The token removed is the same one used in every acquire attempt.
+    token = fake_redis.eval.await_args.args[-2]
+    fake_redis.zrem.assert_awaited_once_with(connection_key("user@example.com"), token)
+
+
+@pytest.mark.asyncio
+async def test_slot_give_up_zrem_failure_does_not_mask_no_connection_slot(fake_redis, monkeypatch):
+    """A failed best-effort cleanup on give-up must not turn into some other
+    exception that hides the real NoConnectionSlot from the caller."""
+    monkeypatch.setattr(lc, "SLOT_WAIT_POLL_INITIAL", 0)
+    monkeypatch.setattr(lc, "SLOT_WAIT_POLL_MAX", 0)
+    monkeypatch.setattr(lc, "SLOT_WAIT_JITTER", 0)
+    fake_redis.eval = AsyncMock(return_value=0)
+    fake_redis.zrem = AsyncMock(side_effect=ConnectionError("redis blip"))
+
+    with pytest.raises(NoConnectionSlot):
+        async with lotek_slot("user@example.com", max_wait_seconds=0.05):
+            pytest.fail("body must not run when the account stays saturated")
 
 
 @pytest.mark.asyncio

@@ -145,11 +145,19 @@ class IntegrationStateManager:
         increments when two runs overlap — the same race merge_state_fields was
         added to close — and an untimed key leaks for anything abandoned
         mid-streak.
+
+        INCR and EXPIRE are retried as two separate attempt loops (not one
+        block): retrying INCR+EXPIRE together as a unit means a RedisError on
+        the EXPIRE call re-runs the INCR too, silently over-counting the
+        streak. Isolating EXPIRE in its own retry loop means a retry there can
+        only repeat the (idempotent) EXPIRE, never the increment.
         """
         key = f"integration_state.{integration_id}.{action_id}.{source_id}"
         for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
                 value = await self.db_client.incr(key)
+        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
+            with attempt:
                 await self.db_client.expire(key, ttl_seconds)
         return int(value)
 

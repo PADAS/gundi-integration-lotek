@@ -319,6 +319,18 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             with attempt:
                 # Token outside the slot — see _fetch_window.
                 await client.get_token(integration, auth)
+                # Deliberately fail-fast here (no max_wait_seconds), unlike
+                # every per-device/backfill acquire, which now waits. This is
+                # not an inconsistency to "harmonise" away — it is the
+                # system's anti-tick-overlap governor. A saturated shard can
+                # legitimately occupy its whole invocation for up to
+                # DEADLINE_FRACTION * MAX_ACTION_EXECUTION_TIME (~432s)
+                # waiting for a slot instead of exiting in seconds. If this
+                # dispatcher acquire also waited, tick N+1's shards would pile
+                # onto tick N's queue and the account would never drain — a
+                # positive feedback loop. Refusing fast here skips the whole
+                # tick instead, and SHARD_RETRIGGER_CAP is the secondary
+                # damper. Do not add max_wait_seconds to this call.
                 async with lotek_slot(auth.username):
                     device_list = await client.get_devices(integration, auth)
     except NoConnectionSlot:

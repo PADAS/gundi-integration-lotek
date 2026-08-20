@@ -259,3 +259,43 @@ async def test_increment_counter_is_atomic_and_expires(mocker, mock_redis, integ
     mock_redis.Redis.return_value.expire.assert_called_once_with(
         f"integration_state.{integration_id}.pull_observations.slot_skip_streak", 3600
     )
+
+
+@pytest.mark.asyncio
+async def test_increment_counter_expire_retry_does_not_reincrement(mocker, integration_v2, monkeypatch):
+    """INCR and EXPIRE must be retried as two separate attempt loops: retrying
+    them as one block means a RedisError on EXPIRE re-runs INCR too, silently
+    over-counting the streak (review finding M3)."""
+    import stamina
+    from redis.exceptions import RedisError
+
+    # Keep the (real) retry loop from sleeping between attempts; the `redis`
+    # name in app.services.state must stay the real module here (not a mock)
+    # so `on=redis.RedisError` in the retried block still matches a real
+    # RedisError instance.
+    real_retry_context = stamina.retry_context
+
+    def fast_retry_context(*args, **kwargs):
+        kwargs["wait_initial"] = 0
+        kwargs["wait_max"] = 0
+        kwargs["wait_jitter"] = 0
+        return real_retry_context(*args, **kwargs)
+
+    monkeypatch.setattr(stamina, "retry_context", fast_retry_context)
+
+    state_manager = IntegrationStateManager()
+    state_manager.db_client = mocker.MagicMock()
+    state_manager.db_client.incr = mocker.AsyncMock(return_value=5)
+    state_manager.db_client.expire = mocker.AsyncMock(
+        side_effect=[RedisError("blip"), True]
+    )
+    integration_id = str(integration_v2.id)
+
+    value = await state_manager.increment_counter(
+        integration_id, "pull_observations", source_id="slot_skip_streak", ttl_seconds=3600
+    )
+
+    assert value == 5
+    # EXPIRE's own retry must not re-run INCR.
+    assert state_manager.db_client.incr.await_count == 1
+    assert state_manager.db_client.expire.await_count == 2

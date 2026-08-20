@@ -636,6 +636,29 @@ async def test_backfill_honors_manual_run_on_a_paused_integration(
     assert manual["reason"] != "integration_paused"
 
 
+@pytest.mark.asyncio
+async def test_shard_fetch_requests_a_bounded_wait_on_the_slot(
+    mocker, lotek_integration, pull_config, mock_redis, _grant_connection_slots
+):
+    """The headline behaviour change (spec D2): the per-device fetch's
+    lotek_slot acquire in _fetch_window must pass max_wait_seconds, not just
+    have a parameter for it. A signature check alone (as the old guard here
+    did) cannot catch that wiring being deleted from the call site — this
+    drives an actual device through the shard so the recorded call is
+    inspected end to end."""
+    from app.actions.handlers import DEADLINE_FRACTION
+    from app import settings as app_settings
+
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+
+    await action_pull_observations_shard(lotek_integration, _shard_config("1"))
+
+    assert len(_grant_connection_slots) == 1
+    recorded = _grant_connection_slots[0]
+    assert 0 < recorded["max_wait_seconds"] <= DEADLINE_FRACTION * app_settings.MAX_ACTION_EXECUTION_TIME
+
+
 def test_partitioning_constants_may_oversubscribe_the_budget():
     """Guards the spec-D1 contract: SHARD_SIZE and FETCH_CONCURRENCY are
     work-partitioning parameters, NOT concurrency limits, so they are ALLOWED

@@ -577,3 +577,27 @@ async def test_deadline_stop_still_publishes_the_zero_progress_error(
     assert _zero_progress_errors(log), (
         "a deadline stop must NOT suppress the zero-progress ERROR"
     )
+
+
+@pytest.mark.asyncio
+async def test_backfill_device_listing_requests_a_bounded_wait_on_the_slot(
+    mocker, lotek_integration, mock_redis, _grant_connection_slots
+):
+    """Same headline wiring as the shard's per-device fetch (review finding
+    I1), but for the backfill's own device-listing lotek_slot acquire. A
+    gap-less device means no per-device fetch happens at all, so the only
+    lotek_slot call in this run is the device-listing one — isolating it."""
+    from app.actions.handlers import DEADLINE_FRACTION
+    from app import settings as app_settings
+
+    now = datetime.now(timezone.utc)
+    get_positions, _, _, _, _ = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {"1": {"high_water": now.isoformat()}}
+    )
+
+    await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+
+    get_positions.assert_not_awaited()  # no gap, so no per-device fetch
+    assert len(_grant_connection_slots) == 1
+    recorded = _grant_connection_slots[0]
+    assert 0 < recorded["max_wait_seconds"] <= DEADLINE_FRACTION * app_settings.MAX_ACTION_EXECUTION_TIME

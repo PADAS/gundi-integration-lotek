@@ -142,6 +142,18 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds:
         # caller can afford to spend.
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            # Give-up path: if the Lua actually granted this token on a poll
+            # whose reply we never saw (lost reply on the final attempt), no
+            # one else will ever release it. Best-effort zrem so a lost-reply
+            # slot isn't stranded for the full TTL; failure here must not mask
+            # the NoConnectionSlot we're about to raise.
+            try:
+                await client.zrem(key, token)
+            except Exception as exc:
+                logger.warning(
+                    f"Failed to release Lotek connection slot on give-up "
+                    f"(will expire via TTL): {exc}"
+                )
             raise NoConnectionSlot(
                 f"No Lotek connection slot available within "
                 f"{max_wait_seconds:.1f}s (limit {settings.LOTEK_MAX_CONNECTIONS})."
