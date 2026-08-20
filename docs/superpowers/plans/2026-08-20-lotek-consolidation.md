@@ -1142,7 +1142,13 @@ Expected: PASS. Any existing test using `pytest.raises(LotekException)` for back
 - [ ] **Step 5: Verify the consolidation actually shrank the file**
 
 Run: `wc -l app/actions/handlers.py`
-Expected: **≤ 1,240 lines** (from 1,443 — the spec's ≥200-line success criterion). If it is above that, the traversal seam leaked policy; re-read spec D6 and move it back into the handlers rather than adding traversal flags.
+Expected: **~1,350 lines**, and `action_backfill_observations` down from 274 to roughly 226.
+
+The spec's original "≤1,240" gate was based on a bad line-count proxy and has been corrected
+(see the amended Success criteria) — extraction relocates lines rather than deleting them,
+and this plan also adds code. **Do not cut behaviour, inline the traversal, or move policy
+into it to chase a number.** The binding check is Step 6 below: both duplication greps must
+return 0.
 
 - [ ] **Step 6: Commit**
 
@@ -1500,13 +1506,15 @@ Expected: **≥ 263 tests** (PR #20's count) — Tasks 1-10 add roughly 15 and r
 - [ ] **Step 3: Confirm the success criteria from the spec**
 
 ```bash
-wc -l app/actions/handlers.py                    # target: <= 1240 (was 1443)
+wc -l app/actions/handlers.py                    # expect ~1350 (was 1443); NOT a hard gate
 grep -c "^[A-Z_]* = " app/actions/handlers.py    # constants: expect <= 20 (was 22)
 grep -n "raise LotekException" app/actions/handlers.py   # expect: no zero-progress hit
 grep -rn "config_data" app/actions/handlers.py   # expect: no matches
 ```
 
-Expected: all four hold. The last two are the spec's criterion 4 — no `raise`-based leak surface left in the file.
+Expected: the last three hold. The line count is a diagnostic, not a gate — see the spec's
+amended Success criteria. The two `grep`s for `raise LotekException` and `config_data` are
+the spec's criterion 6: no `raise`-based leak surface left in the file.
 
 - [ ] **Step 4: Confirm the duplication is actually gone**
 
