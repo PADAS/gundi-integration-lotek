@@ -178,8 +178,11 @@ into the traversal to chase a line count.
 4. A test pins that oversubscribed fan-out (shards × `FETCH_CONCURRENCY` > `LOTEK_MAX_CONNECTIONS`)
    makes progress rather than mass-deferring.
 5. A test pins that a lost acquire reply does not strand a slot.
-6. No `raise` in either action's zero-progress path; no `config_data` leak surface left in
-   `handlers.py`.
+6. No `raise` in either action's zero-progress path (`grep -n "raise LotekException"` over
+   `handlers.py` returns nothing), and therefore no route from a zero-progress run into the
+   runner's `_handle_error` `config_data` publish. Note the literal `config_data` string
+   still appears in `handlers.py` inside explanatory comments that name the leak being
+   avoided — the criterion is about the code path, not the token.
 7. Full suite green, under 3.0s, with no net loss of test count.
 8. **Alerting is unchanged.** Which runs emit a zero-progress ERROR must be identical
    before and after: the shard suppresses on hand-off / cap-reached / starvation but not on
