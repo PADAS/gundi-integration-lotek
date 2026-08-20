@@ -594,12 +594,12 @@ class DeviceTraversal:
     stop_reason: Optional[str]  # None | "deadline" | "circuit breaker"
     budget_starved: bool      # at least one device lost the slot race
 
-    @property
-    def deferred_cleanly(self) -> bool:
-        """True when the tail was handed off or backed off deliberately, i.e. the
-        run's lack of progress is explained. Replaces the retriggered /
-        budget_starved / cap_reached boolean trio (review finding: one copy of
-        that trio had already drifted)."""
+    # NOTE: there is deliberately NO `deferred_cleanly` here. Whether a given
+    # stop counts as "cleanly deferred" is POLICY and the two callers disagree:
+    # the shard suppresses its zero-progress alert on a successful hand-off, a
+    # cap-reached deferral, or starvation, but NOT on a breaker stop; the
+    # backfill suppresses on starvation only. Hoisting it here would silently
+    # change both handlers' alerting. Each caller computes its own (spec D6).
 ```
 
 - `serviced_devices` cannot be counted by the traversal (only the caller knows whether a yielded result means success), so `run()` exposes `mark_failed(device_id)` for the caller to call inside the loop; `serviced_devices` is derived as `yielded - len(failed_devices)`.
@@ -708,7 +708,6 @@ async def test_slot_starvation_records_narrowly(integration):
     assert seen == [2, 3]                 # peers unaffected (spec D3)
     assert t.deferred_devices == ["1"]
     assert t.budget_starved is True
-    assert t.deferred_cleanly is True
     assert t.failed_devices == []         # starvation is not a device failure
 
 
@@ -720,15 +719,15 @@ async def test_guard_stop_defers_the_unreached_tail(integration):
     assert seen == [1, 2]                 # first chunk only
     assert t.stop_reason == "deadline"
     assert t.deferred_devices == ["3", "4"]
-    assert t.deferred_cleanly is True
 
 
 @pytest.mark.asyncio
-async def test_clean_completion_is_not_a_clean_deferral(integration):
+async def test_clean_completion_records_no_stop_and_no_starvation(integration):
     t = DeviceTraversal(integration, "act", FakeGuards(), concurrency=2)
     _ = [item async for item, _ in t.run([1], key=str, process=_ok)]
     assert t.stop_reason is None
-    assert t.deferred_cleanly is False    # nothing was deferred at all
+    assert t.budget_starved is False
+    assert t.deferred_devices == []
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -816,13 +815,6 @@ class DeviceTraversal:
         # Only the caller knows whether a yielded result counts as success, so
         # it calls mark_failed() for the ones that don't.
         return self._yielded - len(self.failed_devices)
-
-    @property
-    def deferred_cleanly(self):
-        """True when the run's lack of progress is explained by a deliberate
-        hand-off or back-off. Replaces the retriggered/budget_starved/
-        cap_reached boolean trio, one copy of which had already drifted."""
-        return bool(self.stop_reason) or self.budget_starved
 
     def mark_failed(self, device_id):
         """Caller-side failure: the device produced a result, but the result
@@ -959,9 +951,19 @@ Replace the whole loop body in `action_pull_observations_shard` — from `guards
 Then replace the `zero_progress` computation with the traversal-backed form:
 
 ```python
+    # Suppression policy, preserved EXACTLY as it was before the traversal
+    # existed: a successful hand-off, a cap-reached deferral (which already
+    # alerted at ERROR inside _retrigger_shard), or slot starvation all explain
+    # the lack of progress. A BREAKER stop deliberately does not — a Lotek-wide
+    # outage must still raise the zero-progress ERROR that the cdip health
+    # metric counts.
+    deferred_cleanly = (
+        retrigger_outcome in (RETRIGGER_HANDED_OFF, RETRIGGER_CAP_REACHED)
+        or traversal.budget_starved
+    )
     zero_progress = (
         device_states and traversal.serviced_devices == 0
-        and observations_extracted == 0 and not traversal.deferred_cleanly
+        and observations_extracted == 0 and not deferred_cleanly
     )
 ```
 
@@ -970,7 +972,7 @@ Delete the now-unused `retriggered`, `budget_starved`, `cap_reached`, and `servi
 - [ ] **Step 7: Run the full suite**
 
 Run: `./venv/bin/python -m pytest app -q`
-Expected: PASS. Tests asserting the old cap-reached suppression now exercise `deferred_cleanly`; if one fails on the `cap_reached` path specifically, note that `_retrigger_shard` already emits its own ERROR on cap, and `stop_reason` being set makes `deferred_cleanly` true — same suppression, one fewer boolean.
+Expected: PASS, with **no change to which runs emit the zero-progress ERROR**. The local `deferred_cleanly` expression above is a like-for-like translation of the old `not retriggered and not budget_starved and not cap_reached` trio: `retrigger_outcome == RETRIGGER_HANDED_OFF` replaces `retriggered`, `RETRIGGER_CAP_REACHED` replaces `cap_reached`, and `traversal.budget_starved` replaces `budget_starved`. A breaker stop still alerts, exactly as before. If a test about breaker-stop alerting fails here, the translation is wrong — fix the expression, do not update the test.
 
 - [ ] **Step 8: Commit**
 
@@ -1076,9 +1078,12 @@ In `action_backfill_observations`, replace the loop (from `guards = RunGuards(ru
 Replace the zero-progress `raise` block with:
 
 ```python
+        # Backfill's suppression policy differs from the shard's and is
+        # preserved exactly: ONLY starvation explains a no-progress run here.
+        # Deadline and breaker stops must still alert.
         zero_progress = (
             gapped and traversal.serviced_devices == 0
-            and observations_extracted == 0 and not traversal.deferred_cleanly
+            and observations_extracted == 0 and not traversal.budget_starved
         )
         if zero_progress:
             # Same systemic-degradation contract as the head pass. Reported, NOT

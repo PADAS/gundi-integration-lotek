@@ -103,8 +103,16 @@ their own accumulators inline via `async for`, so `gaps_closed` / `windows_advan
 `any_open_gap` need no callback plumbing.
 
 This also retires the three parallel booleans (`retriggered` / `budget_starved` /
-`cap_reached`) in favour of traversal attributes plus one `deferred_cleanly` property, which
-is what drifted in symptom 2.
+`cap_reached`) in favour of traversal attributes plus one locally-computed
+`deferred_cleanly` expression per caller, which is what drifted in symptom 2.
+
+The suppression expression stays in the **caller**, not the traversal: the two handlers
+genuinely disagree about what counts as a clean deferral. The shard suppresses its
+zero-progress ERROR on a successful hand-off, a cap-reached deferral, or starvation, but
+*not* on a breaker stop; the backfill suppresses on starvation only. Hoisting a single
+`deferred_cleanly` onto the traversal would silently suppress outage alerts in both — and
+the cdip health metric counts ERROR events, so that would make a real Lotek outage look
+healthier than it is. Alerting behaviour must be unchanged by this refactor.
 
 ### D7. Backfill zero-progress stops raising
 
