@@ -20,8 +20,9 @@ from app.actions.configurations import (
     PullObservationsConfig,
     PullObservationsShardConfig,
 )
-from app.actions.core import action_title
+from app.actions.core import action_title, describe_exception
 from app.actions.device_state import DeviceState
+from app.actions.traversal import DeviceTraversal
 from app.services.action_scheduler import trigger_action
 from app.services.lotek_connections import lotek_slot, NoConnectionSlot
 from app.services.activity_logger import activity_logger, log_action_activity
@@ -187,12 +188,6 @@ async def _try_log_activity(integration_id, action_id, title, level):
         logger.warning(
             f"Could not publish activity log for integration {integration_id}: {describe_exception(e)}"
         )
-
-
-def describe_exception(exc):
-    # httpx timeout exceptions carry an empty message, which used to render as a bare
-    # "Exception: " in the activity log and told operators nothing.
-    return str(exc) or type(exc).__name__
 
 
 def generate_batches(iterable, n=settings.OBSERVATIONS_BATCH_SIZE):
@@ -602,110 +597,60 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
     device_states.sort(key=lambda entry: entry[1].high_water)
 
     guards = RunGuards(run_started)
+    traversal = DeviceTraversal(
+        integration, "pull_observations_shard", guards, concurrency=FETCH_CONCURRENCY
+    )
     observations_extracted = 0
-    failed_devices = []
-    deferred_devices = []
-    retriggered = False
-    budget_starved = False
-    cap_reached = False
-    serviced_devices = 0
+    stale_drops = []
     # Only reflects devices actually processed this run — a device deferred by
     # the rails before its gap status is checked doesn't trigger backfill this
     # cycle. Self-correcting: the re-triggered tail (or the next tick) reaches it.
     any_open_gap = False
-    stale_drops = []
-    for chunk_start in range(0, len(device_states), FETCH_CONCURRENCY):
-        if reason := guards.should_stop():
-            deferred_devices = [device_id for device_id, _, _ in device_states[chunk_start:]]
-            # A deadline cut gets a fresh budget immediately; a hot breaker
-            # does NOT re-trigger — that would defeat the pause the breaker
-            # exists to buy. Its devices wait for the next scheduled tick.
-            if reason == "deadline":
-                outcome = await _retrigger_shard(
-                    integration, deferred_devices, action_config.generation,
-                    manual_run=action_config.manual_run,
-                )
-                retriggered = outcome == RETRIGGER_HANDED_OFF
-                # A cap-reached deferral already alerted at ERROR; suppress the
-                # zero-progress alert so one load event yields one signal.
-                cap_reached = outcome == RETRIGGER_CAP_REACHED
-            disposition = (
-                "to an immediately re-triggered shard" if retriggered
-                else "to the next scheduled run"
-            )
-            await _log_deferral(
-                integration, "pull_observations_shard", reason, deferred_devices,
-                disposition=disposition,
-            )
-            break
-        chunk = device_states[chunk_start:chunk_start + FETCH_CONCURRENCY]
-        results = await asyncio.gather(
-            *(
-                _head_pass_device(
-                    device_id, state, is_new, integration, auth, pull_config,
-                    present_time, guards, stale_drops=stale_drops
-                )
-                for device_id, state, is_new in chunk
-            ),
-            # Collect every task's outcome rather than aborting the chunk on
-            # the first exception: per-device failures must stay per-device.
-            return_exceptions=True,
-        )
-        # Credentials refused is integration-wide and fatal; re-raise it over
-        # any per-device outcomes in the same chunk. Cancellation must also
-        # propagate: with return_exceptions=True a task's CancelledError comes
-        # back as a result, and treating it as a device failure would swallow
-        # shutdown/timeout cancellation and keep the run going.
-        for res in results:
-            if isinstance(res, (LotekUnauthorizedException, asyncio.CancelledError)):
-                raise res
-        slot_starved = []
-        for (device_id, state, is_new), res in zip(chunk, results):
-            if isinstance(res, NoConnectionSlot):
-                # Account connection budget exhausted: not a device failure and
-                # not evidence about Lotek — defer this device with the rest of
-                # the shard and re-trigger (the pubsub round trip is the backoff,
-                # movebank-connector pattern).
-                slot_starved.append(device_id)
-                continue
-            if isinstance(res, BaseException):
-                # Sending to Gundi and checkpointing can fail too, and a device that fetched
-                # fine but failed downstream must not take the rest of the batch with it.
-                message = (
-                    f"Failed to process device {device_id} for integration "
-                    f"{integration.id}: {describe_exception(res)}"
-                )
-                logger.error(message, exc_info=res)
-                await log_action_activity(
-                    integration_id=integration_id,
-                    action_id="pull_observations_shard",
-                    title=message,
-                    level=LogLevel.ERROR
-                )
-                failed_devices.append(device_id)
-                guards.record(transport_failure=False)
-                continue
-            sent, device_failed, transport_failure = res
-            # Single recording site: transport failures arm the breaker, anything
-            # else (success included) breaks the consecutive streak.
-            guards.record(transport_failure=transport_failure)
-            observations_extracted += sent
-            if state.has_gap:
-                any_open_gap = True
-            if device_failed:
-                failed_devices.append(device_id)
-            else:
-                serviced_devices += 1
-        if slot_starved:
-            # Defer ONLY the devices that lost the slot race — their in-chunk
-            # peers keep their results and later chunks still run (spec D3).
-            # Before this, one starved device aborted the shard's entire tail,
-            # which on an oversubscribed fan-out made mass deferral the normal
-            # outcome rather than an exceptional one (review finding).
-            deferred_devices.extend(slot_starved)
-            budget_starved = True
 
-    if budget_starved:
+    async for (device_id, state, is_new), res in traversal.run(
+        device_states,
+        key=lambda entry: entry[0],
+        process=lambda entry: _head_pass_device(
+            entry[0], entry[1], entry[2], integration, auth, pull_config,
+            present_time, guards, stale_drops=stale_drops,
+        ),
+    ):
+        sent, device_failed, transport_failure = res
+        # Single recording site: transport failures arm the breaker, anything
+        # else (success included) breaks the consecutive streak.
+        guards.record(transport_failure=transport_failure)
+        observations_extracted += sent
+        if state.has_gap:
+            any_open_gap = True
+        if device_failed:
+            traversal.mark_failed(device_id)
+
+    failed_devices = traversal.failed_devices
+    deferred_devices = traversal.deferred_devices
+
+    # Policy, deliberately NOT in the traversal (spec D6): a deadline cut gets a
+    # fresh budget immediately; a hot breaker does NOT re-trigger — that would
+    # defeat the pause the breaker exists to buy. Its devices wait for the next
+    # scheduled tick.
+    retrigger_outcome = None
+    if traversal.stop_reason == "deadline" and deferred_devices:
+        retrigger_outcome = await _retrigger_shard(
+            integration, deferred_devices, action_config.generation,
+            manual_run=action_config.manual_run,
+        )
+    if traversal.stop_reason:
+        await _log_deferral(
+            integration, "pull_observations_shard", traversal.stop_reason,
+            deferred_devices,
+            disposition=(
+                "to an immediately re-triggered shard"
+                if retrigger_outcome == RETRIGGER_HANDED_OFF
+                else "to the next scheduled run"
+            ),
+        )
+    if traversal.budget_starved:
+        # Portal WARNING like every other deferral cause: a starved tail must
+        # not park with zero portal visibility (review finding).
         await _log_deferral(
             integration, "pull_observations_shard", "connection budget exhausted",
             deferred_devices, disposition="to the next scheduled run",
@@ -743,9 +688,19 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             level=LogLevel.WARNING
         )
 
+    # Suppression policy, preserved EXACTLY as it was before the traversal
+    # existed: a successful hand-off, a cap-reached deferral (which already
+    # alerted at ERROR inside _retrigger_shard), or slot starvation all explain
+    # the lack of progress. A BREAKER stop deliberately does not — a Lotek-wide
+    # outage must still raise the zero-progress ERROR that the cdip health
+    # metric counts.
+    deferred_cleanly = (
+        retrigger_outcome in (RETRIGGER_HANDED_OFF, RETRIGGER_CAP_REACHED)
+        or traversal.budget_starved
+    )
     zero_progress = (
-        device_states and serviced_devices == 0 and observations_extracted == 0
-        and not retriggered and not budget_starved and not cap_reached
+        device_states and traversal.serviced_devices == 0
+        and observations_extracted == 0 and not deferred_cleanly
     )
     if zero_progress:
         # Zero progress: nothing serviced, nothing delivered, and no deferred

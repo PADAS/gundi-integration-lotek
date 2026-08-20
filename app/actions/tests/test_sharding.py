@@ -169,6 +169,36 @@ async def test_starved_device_does_not_abort_the_whole_shard(
 
 
 @pytest.mark.asyncio
+async def test_quiet_success_beside_a_failed_device_is_not_zero_progress(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """A device serviced with nothing new to send is still progress, even when
+    a peer failed. serviced_devices must therefore discount only the devices
+    the CALLER marked failed — the ones the traversal already logged never
+    yielded a result, so subtracting them too would double-count and fire the
+    zero-progress ERROR that the cdip health metric counts on a healthy run.
+    """
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+    mocker.patch("app.actions.traversal.log_action_activity", new=AsyncMock())
+
+    async def fake_head_pass(device_id, *args, **kwargs):
+        if device_id == "boom":
+            raise ValueError("delivery rejected")
+        return (0, False, False)  # serviced, but nothing new to send
+
+    mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
+
+    result = await action_pull_observations_shard(
+        lotek_integration, _shard_config("boom", "quiet")
+    )
+
+    assert result["devices_failed"] == ["boom"]
+    assert "zero_progress" not in result
+
+
+@pytest.mark.asyncio
 async def test_shard_does_not_retrigger_on_hot_breaker(
     mocker, lotek_integration, pull_config, mock_redis
 ):

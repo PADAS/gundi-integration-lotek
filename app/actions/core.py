@@ -40,6 +40,12 @@ class ExecutableActionMixin:
     pass
 
 
+def describe_exception(exc):
+    # httpx timeout exceptions carry an empty message, which used to render as a bare
+    # "Exception: " in the activity log and told operators nothing.
+    return str(exc) or type(exc).__name__
+
+
 def action_title(title: str):
     """Set the display name used when registering the action in Gundi,
     instead of the default derived from the handler function name."""
