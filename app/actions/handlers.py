@@ -702,27 +702,19 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             else:
                 serviced_devices += 1
         if slot_starved:
-            deferred_devices = slot_starved + [
-                device_id for device_id, _, _ in device_states[chunk_start + FETCH_CONCURRENCY:]
-            ]
+            # Defer ONLY the devices that lost the slot race — their in-chunk
+            # peers keep their results and later chunks still run (spec D3).
+            # Before this, one starved device aborted the shard's entire tail,
+            # which on an oversubscribed fan-out made mass deferral the normal
+            # outcome rather than an exceptional one (review finding).
+            deferred_devices.extend(slot_starved)
             budget_starved = True
-            retriggered = await _retrigger_shard(
-                integration, deferred_devices, action_config.generation,
-                manual_run=action_config.manual_run,
-            ) == RETRIGGER_HANDED_OFF
-            # Portal WARNING like every other deferral cause (review finding:
-            # this branch was logger.info only, so a starved tail whose
-            # re-trigger also failed parked with zero portal visibility —
-            # contradicting the zero-progress comment's claim).
-            await _log_deferral(
-                integration, "pull_observations_shard", "connection budget exhausted",
-                deferred_devices,
-                disposition=(
-                    "to an immediately re-triggered shard" if retriggered
-                    else "to the next scheduled run"
-                ),
-            )
-            break
+
+    if budget_starved:
+        await _log_deferral(
+            integration, "pull_observations_shard", "connection budget exhausted",
+            deferred_devices, disposition="to the next scheduled run",
+        )
 
     if failed_devices:
         message = (
@@ -1352,15 +1344,15 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 else:
                     serviced_devices += 1
             if slot_starved:
-                deferred_devices = slot_starved + [
-                    d.nDeviceID for d, _ in gapped[chunk_start + FETCH_CONCURRENCY:]
-                ]
+                # Defer only the starved devices (spec D3); see the head pass.
+                deferred_devices.extend(slot_starved)
                 budget_starved = True
-                await _log_deferral(
-                    integration, "backfill_observations", "connection budget exhausted",
-                    deferred_devices, disposition="to the next backfill trigger",
-                )
-                break
+
+        if budget_starved:
+            await _log_deferral(
+                integration, "backfill_observations", "connection budget exhausted",
+                deferred_devices, disposition="to the next backfill trigger",
+            )
 
         if failed_devices:
             message = (

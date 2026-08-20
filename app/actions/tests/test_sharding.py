@@ -103,12 +103,14 @@ def _shard_config(*device_ids):
 
 
 @pytest.mark.asyncio
-async def test_shard_defers_and_retriggers_on_slot_starvation(
+async def test_shard_defers_starved_devices_without_retriggering(
     mocker, lotek_integration, pull_config, mock_redis
 ):
-    # Mid-shard budget exhaustion defers the starved device plus the untouched
-    # tail into a re-triggered shard (the pubsub round trip is the backoff) —
-    # no device failures, no ERROR-level noise, no zero-progress raise.
+    # A fully saturated budget defers every starved device (spec D3: narrow
+    # deferral, not the whole tail — here they happen to be the same set
+    # because every device starves) and does NOT immediately re-trigger a
+    # shard for them; they wait for the next scheduled tick. No device
+    # failures, no ERROR-level noise, no zero-progress raise.
     _setup_pull_mocks(mocker, mock_redis, [])
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
@@ -128,9 +130,42 @@ async def test_shard_defers_and_retriggers_on_slot_starvation(
     assert result["devices_failed"] == []
     assert sorted(result["devices_deferred"], key=int) == [str(i) for i in range(1, 9)]
     shard_calls = [c for c in trigger.await_args_list if c.args[1] == "pull_observations_shard"]
-    assert len(shard_calls) == 1
-    assert sorted(shard_calls[0].kwargs["config"].devices, key=int) == [str(i) for i in range(1, 9)]
+    assert shard_calls == []
     assert LogLevel.ERROR not in [c.kwargs.get("level") for c in log.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_starved_device_does_not_abort_the_whole_shard(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """One device losing the slot race must defer THAT device, not the shard's
+    entire remaining tail (spec D3). Its in-chunk peers keep their results and
+    the loop carries on to later chunks."""
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+
+    devices = [f"dev{i}" for i in range(10)]
+    calls = []
+
+    async def fake_head_pass(device_id, *args, **kwargs):
+        calls.append(device_id)
+        if device_id == "dev0":
+            raise NoConnectionSlot("saturated")
+        return (5, False, False)
+
+    mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
+    mocker.patch("app.actions.handlers._retrigger_shard", return_value="handed_off")
+
+    result = await action_pull_observations_shard(
+        lotek_integration, _shard_config(*devices)
+    )
+
+    # Every device was attempted, not just the first chunk.
+    assert len(calls) == 10
+    # Only the starved one is deferred.
+    assert result["devices_deferred"] == ["dev0"]
+    # The other nine still delivered.
+    assert result["observations_extracted"] == 45
 
 
 @pytest.mark.asyncio
@@ -249,12 +284,15 @@ async def test_retrigger_increments_generation(mocker, lotek_integration, pull_c
 
 
 @pytest.mark.asyncio
-async def test_retrigger_cap_falls_back_to_next_tick_with_error(
+async def test_slot_starvation_at_retrigger_cap_still_defers_without_error(
     mocker, lotek_integration, pull_config, mock_redis
 ):
-    # At the cap the tail is NOT re-triggered (next scheduled tick picks it
-    # up) and the exhaustion is surfaced at ERROR — an ungoverned chain under
-    # sustained starvation was an invisible busy-loop (review blocker).
+    # Slot starvation no longer attempts a re-trigger at all (spec D3: it
+    # defers only the starved devices to the next scheduled tick), so the
+    # generation being at the re-trigger cap must not matter to it — no
+    # cap-reached ERROR, just the ordinary WARNING deferral. The cap's ERROR
+    # path is still exercised via the deadline cut (see
+    # test_retrigger_cap_does_not_also_emit_zero_progress).
     from app.actions.handlers import SHARD_RETRIGGER_CAP
     _setup_pull_mocks(mocker, mock_redis, [])
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
@@ -274,23 +312,22 @@ async def test_retrigger_cap_falls_back_to_next_tick_with_error(
     assert result["devices_deferred"] == ["1", "2"]
     shard_calls = [c for c in trigger.await_args_list if c.args[1] == "pull_observations_shard"]
     assert shard_calls == []
-    cap_errors = [
-        c for c in log.await_args_list
-        if c.kwargs.get("level") == LogLevel.ERROR and "re-trigger cap" in c.kwargs.get("title", "")
-    ]
-    assert len(cap_errors) == 1
+    assert LogLevel.ERROR not in [c.kwargs.get("level") for c in log.await_args_list]
 
 
 @pytest.mark.asyncio
-async def test_slot_starvation_never_raises_even_when_retrigger_fails(
+async def test_slot_starvation_never_raises_and_does_not_retrigger(
     mocker, lotek_integration, pull_config, mock_redis
 ):
-    # Starvation + a failed re-trigger publish is a clean back-off plus a
-    # pubsub blip — NOT systemic degradation. The old condition raised the
-    # zero-progress LotekException here (review blocker, both directions).
+    # Starvation is a clean back-off to the next scheduled tick — NOT systemic
+    # degradation, and (spec D3) not even an attempt to re-trigger, so a dead
+    # pubsub can't turn a starved shard into a raise either (review blocker,
+    # both directions; the old condition raised the zero-progress
+    # LotekException here when the re-trigger publish it used to attempt
+    # also failed).
     _setup_pull_mocks(mocker, mock_redis, [])
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
-    mocker.patch(
+    trigger = mocker.patch(
         "app.actions.handlers.trigger_action",
         new=AsyncMock(side_effect=Exception("pubsub down")),
     )
@@ -308,6 +345,8 @@ async def test_slot_starvation_never_raises_even_when_retrigger_fails(
 
     assert sorted(result["devices_deferred"], key=int) == ["1", "2"]
     assert result["devices_failed"] == []
+    shard_calls = [c for c in trigger.await_args_list if c.args[1] == "pull_observations_shard"]
+    assert shard_calls == []
 
 
 @pytest.mark.asyncio
