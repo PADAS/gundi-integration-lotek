@@ -82,6 +82,27 @@ def test_connection_key_is_stable_and_username_scoped():
 
 
 @pytest.mark.asyncio
+async def test_reacquire_with_same_token_is_idempotent(fake_redis):
+    """A lost reply on the acquire that took the last slot must not refuse the
+    caller that already owns that slot. The Lua checks ZSCORE for the token
+    before the ZCARD ceiling test, so a retry with the same token re-grants.
+
+    Simulated at the script level: the real guarantee lives in the Lua, so this
+    test pins that the script text contains the membership fast-path ahead of
+    the capacity check.
+    """
+    from app.services.lotek_connections import _ACQUIRE_LUA
+
+    zscore_at = _ACQUIRE_LUA.find("ZSCORE")
+    zcard_at = _ACQUIRE_LUA.find("ZCARD")
+    assert zscore_at != -1, "acquire must check token membership before capacity"
+    assert zscore_at < zcard_at, "membership fast-path must precede the ceiling test"
+    # The fast-path must re-arm the member's expiry rather than returning a
+    # stale score, so a waiting retry cannot inherit an about-to-expire slot.
+    assert "ZADD" in _ACQUIRE_LUA[zscore_at:zcard_at]
+
+
+@pytest.mark.asyncio
 async def test_close_connection_client_closes_and_resets(monkeypatch):
     # The FastAPI lifespan closes every other module-level client; without this
     # the pooled connections are reclaimed by __del__ after the loop is gone,

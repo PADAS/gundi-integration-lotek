@@ -16,22 +16,32 @@ class NoConnectionSlot(Exception):
     """Raised when the Lotek connection budget for a username is exhausted."""
 
 
-# Atomic acquire: purge expired slots, then add a new slot only if under the
-# ceiling. KEYS[1]=zset key. ARGV: now, expiry, ceiling, token.
-# Returns 1 if acquired, 0 if at capacity.
-# The key itself is given a TTL on every acquire (Copilot review): members
-# carry logical expiry in their score, but they are only purged by a LATER
-# acquire — so an account that stops being used would leave its zset behind
-# forever. The TTL is refreshed on each acquire and comfortably outlives the
-# longest-lived member, so it can never expire a key with live holders.
+# Atomic acquire: purge expired slots, re-grant to an existing holder, then add
+# a new slot only if under the ceiling. KEYS[1]=zset key.
+# ARGV: now, expiry, ceiling, token, key_ttl.
+# Returns 1 if acquired (or already held), 0 if at capacity.
+#
+# The ZSCORE fast-path makes the script idempotent for a given token. Without
+# it, a lost reply on the acquire that filled the last slot made the stamina
+# retry refuse the very caller that owns the slot, stranding it for the full
+# TTL (review finding). Re-granting also refreshes the expiry so a retried
+# holder does not inherit an about-to-expire slot.
+#
+# The key itself gets a TTL on every path: members carry logical expiry in
+# their score but are only purged by a LATER acquire, so an account that stops
+# being used would leave its zset behind forever. The TTL comfortably outlives
+# the longest-lived member, so it can never expire a key with live holders.
 _ACQUIRE_LUA = """
 redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
-if redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[3]) then
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+if redis.call('ZSCORE', KEYS[1], ARGV[4]) then
     redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
-    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
     return 1
 end
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
+if redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[3]) then
+    redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
+    return 1
+end
 return 0
 """
 
