@@ -503,6 +503,13 @@ async def test_only_one_shard_triggers_backfill_per_window(
     _setup_pull_mocks(mocker, mock_redis, [], saved_state=None)
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    # delete_state is autouse-stubbed to a no-op elsewhere in this test package
+    # (conftest's _stub_state_delete), which would hide a regression on this
+    # exact path (a losing shard erroneously releasing the winner's claim) —
+    # re-patch it here, escaping the autouse stub, so it is observable.
+    delete_state = mocker.patch.object(
+        IntegrationStateManager, "delete_state", new=AsyncMock()
+    )
 
     claims = {"count": 0}
 
@@ -517,6 +524,12 @@ async def test_only_one_shard_triggers_backfill_per_window(
 
     backfill_calls = [c for c in trigger.await_args_list if c.args[1] == "backfill_observations"]
     assert len(backfill_calls) == 1
+    # The two shards that lost the claim (claimed=False) must NOT release it —
+    # doing so would delete the winner's claim and hand a second shard a
+    # licence to publish the same window (the most dangerous regression on
+    # this code path, per the review). The winner published successfully, so
+    # it doesn't release either: delete_state must be untouched altogether.
+    delete_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
