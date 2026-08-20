@@ -556,3 +556,21 @@ async def test_backfill_honors_manual_run_on_a_paused_integration(
         lotek_integration, BackfillObservationsConfig(manual_run=True)
     )
     assert manual["reason"] != "integration_paused"
+
+
+def test_partitioning_constants_may_oversubscribe_the_budget():
+    """Guards the spec-D1 contract: SHARD_SIZE and FETCH_CONCURRENCY are
+    work-partitioning parameters, NOT concurrency limits, so they are ALLOWED
+    to exceed the account budget — the budget applies backpressure (Task 3).
+
+    This test exists so nobody 'fixes' the arithmetic by shrinking the
+    partitioning constants: that would reintroduce the coupling spec D1
+    removed. If you need to bound concurrency, change LOTEK_MAX_CONNECTIONS.
+    """
+    from app.actions.handlers import FETCH_CONCURRENCY, SHARD_SIZE
+    from app.services.lotek_connections import lotek_slot
+    import inspect
+
+    assert FETCH_CONCURRENCY > 0 and SHARD_SIZE > 0
+    # The budget must be a WAITING primitive for oversubscription to be safe.
+    assert "max_wait_seconds" in inspect.signature(lotek_slot).parameters

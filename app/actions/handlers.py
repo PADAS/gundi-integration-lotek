@@ -51,20 +51,15 @@ BREAKER_THRESHOLD = 3
 BACKFILL_MAX_WINDOWS_PER_DEVICE = 2
 BACKFILL_WINDOW = timedelta(days=7)
 BACKFILL_LEASE_SOURCE = "lease"
-# Devices are fetched in bounded-concurrency chunks over the shared HTTP
-# client (GUNDI-5620). Sequential fetching put 400-600 Lotek round trips on
-# the action budget one at a time, which is what pushed the big integrations
-# into the MAX_ACTION_EXECUTION_TIME ceiling. Guards (deadline + breaker) are
-# checked between chunks, so their granularity coarsens from 1 device to
-# FETCH_CONCURRENCY devices — with the breaker threshold at 3, a fully-bad
-# chunk overshoots by at most 2 requests. Chunk results are recorded in list
-# order, preserving the sequential consecutive-failure semantics.
+# How many devices one invocation processes per chunk. WORK PARTITIONING, not a
+# concurrency limit: the account-wide ceiling is LOTEK_MAX_CONNECTIONS, enforced
+# in Redis by lotek_slot, which now WAITS rather than refusing. Chunk size may
+# freely oversubscribe that ceiling — the budget applies backpressure (spec D1).
 FETCH_CONCURRENCY = 5
-# Sharded head pass (GUNDI-5620, movebank-connector pattern): the scheduled
-# pull_observations only lists devices and dispatches shards of this many
-# device ids as pull_observations_shard sub-actions, each with its own action
-# budget. Sized so a shard finishes comfortably inside one budget even on a
-# slow tick (25 devices / FETCH_CONCURRENCY = 5 chunks of round trips).
+# How much work fits in one action budget, i.e. how the dispatcher partitions
+# the fleet across sub-actions. WORK PARTITIONING, not a concurrency limit —
+# see FETCH_CONCURRENCY. Do not shrink this to "fit" LOTEK_MAX_CONNECTIONS;
+# that reintroduces the coupling spec D1 removed.
 SHARD_SIZE = 25
 # Re-trigger governor (review finding, PR #20 discussion): a deferred tail may
 # hop to a fresh shard at most this many times before falling back to the next
