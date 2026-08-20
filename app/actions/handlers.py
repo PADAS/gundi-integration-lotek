@@ -587,12 +587,24 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         return {"skipped": True, "reason": "integration_paused"}
 
     present_time = datetime.now(tz=timezone.utc)
+    # Batched like the dispatcher's fleet-ordering reads: the sort below forces
+    # every state eager anyway, so sequential awaits were a flat ~SHARD_SIZE
+    # round-trip startup tax per invocation and per re-trigger hop.
+    # _load_device_state performs no Redis write (its legacy-migration branch
+    # only mutates the in-memory state and returns is_new=True for a later
+    # save), so it is side-effect-free and order-independent.
     device_states = []
-    for device_id in action_config.devices:
-        state, is_new = await _load_device_state(
-            integration_id, device_id, present_time, pull_config
+    for batch in generate_batches(list(action_config.devices), STATE_READ_CONCURRENCY):
+        loaded = await asyncio.gather(
+            *(
+                _load_device_state(integration_id, device_id, present_time, pull_config)
+                for device_id in batch
+            )
         )
-        device_states.append((device_id, state, is_new))
+        device_states.extend(
+            (device_id, state, is_new)
+            for device_id, (state, is_new) in zip(batch, loaded)
+        )
     # Least-fresh first within the shard too: a rail cut defers the freshest tail.
     device_states.sort(key=lambda entry: entry[1].high_water)
 

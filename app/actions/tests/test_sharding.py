@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -5,13 +6,19 @@ from unittest.mock import AsyncMock
 
 from gundi_core.schemas.v2 import LogLevel
 from app.actions.configurations import PullObservationsShardConfig
+from app.actions.device_state import DeviceState
 from app.actions.handlers import (
     SHARD_SIZE,
+    STATE_READ_CONCURRENCY,
     action_pull_observations,
     action_pull_observations_shard,
 )
 from app.services.lotek_connections import NoConnectionSlot
 from .test_handlers import _devices, _setup_pull_mocks
+
+
+def _plain_state():
+    return DeviceState(high_water=datetime.now(tz=timezone.utc))
 
 
 # --- Parent dispatcher -------------------------------------------------------
@@ -100,6 +107,37 @@ async def test_pull_observations_dispatches_nothing_for_empty_device_list(
 
 def _shard_config(*device_ids):
     return PullObservationsShardConfig(devices=list(device_ids))
+
+
+@pytest.mark.asyncio
+async def test_shard_loads_device_states_concurrently(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """The following .sort() forces every state eager, so these reads are a
+    serial startup tax with no network I/O to hide behind — paid again on every
+    re-trigger hop. The dispatcher's identical pattern was batched in PR #20."""
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+
+    in_flight = 0
+    peak = 0
+
+    async def slow_load(*args, **kwargs):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        return (_plain_state(), False)
+
+    mocker.patch("app.actions.handlers._load_device_state", side_effect=slow_load)
+    mocker.patch("app.actions.handlers._head_pass_device", return_value=(0, False, False))
+
+    await action_pull_observations_shard(
+        lotek_integration, _shard_config(*(f"dev{i}" for i in range(10)))
+    )
+
+    assert peak > 1, "state reads must overlap, not run one-at-a-time"
 
 
 @pytest.mark.asyncio
