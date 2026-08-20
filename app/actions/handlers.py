@@ -109,6 +109,14 @@ def _deadline_exceeded(run_started_at):
     return elapsed > DEADLINE_FRACTION * app_settings.MAX_ACTION_EXECUTION_TIME
 
 
+def _slot_wait_budget(run_started_at):
+    """Seconds this run can still afford to spend queueing for a connection
+    slot. Mirrors _deadline_exceeded's fraction so waiting stops exactly when
+    the traversal would have stopped anyway."""
+    elapsed = (datetime.now(tz=timezone.utc) - run_started_at).total_seconds()
+    return max(0.0, DEADLINE_FRACTION * app_settings.MAX_ACTION_EXECUTION_TIME - elapsed)
+
+
 def _fetch_retry_kwargs(run_started_at):
     # Past the soft deadline, don't spend the remaining budget re-trying slow
     # transport failures — but keep the token-expiry retry: it is a cheap
@@ -926,7 +934,10 @@ async def _fetch_window(device_id, integration, auth, config, lower_date, upper_
                 await client.get_token(integration, auth)
                 # The slot is held for exactly one request and re-acquired on
                 # retry, so a stamina backoff never parks a slot idle.
-                async with lotek_slot(auth.username):
+                async with lotek_slot(
+                    auth.username,
+                    max_wait_seconds=_slot_wait_budget(guards.run_started_at),
+                ):
                     positions = await client.get_positions(device_id, auth, integration, lower_date, upper_date, True)
         logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device_id} between {lower_date} and {upper_date}.")
         # Transform inside the try: a malformed payload is a per-device, fetch-class
@@ -1221,7 +1232,9 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 with attempt:
                     # Token outside the slot — see _fetch_window.
                     await client.get_token(integration, auth)
-                    async with lotek_slot(auth.username):
+                    async with lotek_slot(
+                        auth.username, max_wait_seconds=_slot_wait_budget(run_started)
+                    ):
                         device_list = await client.get_devices(integration, auth)
         except NoConnectionSlot:
             # Account budget saturated by head-pass shards: back off quietly.

@@ -1,5 +1,7 @@
+import asyncio
 import hashlib
 import logging
+import random
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -19,6 +21,12 @@ logger = logging.getLogger(__name__)
 # this budget and escaped as RedisError into the generic per-device handler —
 # a fabricated Lotek failure caused by our own Redis (review finding).
 SLOT_REDIS_RETRY = dict(attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0)
+
+# Backpressure poll schedule for a saturated account budget. Jittered so that
+# N shards refused in the same millisecond do not retry in lockstep.
+SLOT_WAIT_POLL_INITIAL = 0.25
+SLOT_WAIT_POLL_MAX = 2.0
+SLOT_WAIT_JITTER = 0.25
 
 
 class NoConnectionSlot(Exception):
@@ -86,12 +94,17 @@ async def close_connection_client() -> None:
 
 
 @asynccontextmanager
-async def lotek_slot(username: str, *, ttl_seconds: int = 300):
+async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds: float = 0.0):
     """Acquire one Lotek connection slot for `username`, shared across every
-    shard/backfill invocation on the same Redis. Raises NoConnectionSlot if at
-    capacity. (Movebank-connector pattern: once the head pass fans out into
-    concurrently-running shard sub-actions, an out-of-process cap is the only
-    thing bounding simultaneous requests against one Lotek account.)
+    shard/backfill invocation on the same Redis.
+
+    With `max_wait_seconds > 0` a saturated budget makes the caller QUEUE
+    (jittered poll) rather than fail: fan-out deliberately oversubscribes the
+    ceiling, so refusing on first contention aborted whole shards and turned
+    ordinary large-fleet ticks into zero-progress churn (spec D2). The wait is
+    capped by the caller's remaining action budget, so queueing can never cause
+    a timeout that failing fast would have avoided. NoConnectionSlot now means
+    "saturated for longer than I can afford to wait".
 
     Slots are members of a per-username sorted set scored by expiry time, so a
     crashed holder's slot self-expires (purged on the next acquire) rather than
@@ -107,19 +120,36 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300):
     """
     client = _client()
     key = connection_key(username)
+    # One token for the whole acquire, including every wait poll: the Lua's
+    # ZSCORE fast-path re-grants an already-held slot, so re-using the token is
+    # what makes a lost reply safe (Task 1).
     token = str(uuid.uuid4())
-    # Retried like every IntegrationStateManager Redis op (review finding: an
-    # unretried transient Redis error here escaped as a fake per-device
-    # failure downstream — a blip in OUR Redis said nothing about Lotek).
-    async for attempt in stamina.retry_context(on=redis.RedisError, **SLOT_REDIS_RETRY):
-        with attempt:
-            now = time.time()
-            acquired = await client.eval(
-                _ACQUIRE_LUA, 1, key, now, now + ttl_seconds,
-                settings.LOTEK_MAX_CONNECTIONS, token, ttl_seconds * 2,
+    deadline = time.monotonic() + max(0.0, max_wait_seconds)
+    backoff = SLOT_WAIT_POLL_INITIAL
+    acquired = 0
+    while True:
+        async for attempt in stamina.retry_context(on=redis.RedisError, **SLOT_REDIS_RETRY):
+            with attempt:
+                now = time.time()
+                acquired = await client.eval(
+                    _ACQUIRE_LUA, 1, key, now, now + ttl_seconds,
+                    settings.LOTEK_MAX_CONNECTIONS, token, ttl_seconds * 2,
+                )
+        if acquired:
+            break
+        # Saturated. Wait for a peer to release rather than aborting the
+        # caller's whole tail (spec D2/D3) — but never past the budget the
+        # caller can afford to spend.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise NoConnectionSlot(
+                f"No Lotek connection slot available within "
+                f"{max_wait_seconds:.1f}s (limit {settings.LOTEK_MAX_CONNECTIONS})."
             )
-    if not acquired:
-        raise NoConnectionSlot(f"No Lotek connection slot available (limit {settings.LOTEK_MAX_CONNECTIONS}).")
+        pause = min(backoff + random.uniform(0, SLOT_WAIT_JITTER), remaining)
+        if pause > 0:
+            await asyncio.sleep(pause)
+        backoff = min(backoff * 2 or SLOT_WAIT_POLL_INITIAL, SLOT_WAIT_POLL_MAX)
     try:
         yield
     finally:

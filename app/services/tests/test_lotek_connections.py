@@ -116,6 +116,51 @@ async def test_reacquire_with_same_token_is_idempotent(fake_redis):
 
 
 @pytest.mark.asyncio
+async def test_slot_waits_then_acquires_when_capacity_frees(fake_redis, monkeypatch):
+    """Oversubscription must queue, not refuse: with shards x FETCH_CONCURRENCY
+    well above the ceiling, a caller that waits a moment gets a slot instead of
+    deferring its whole tail (spec D2)."""
+    monkeypatch.setattr(lc, "SLOT_WAIT_POLL_INITIAL", 0)
+    monkeypatch.setattr(lc, "SLOT_WAIT_POLL_MAX", 0)
+    monkeypatch.setattr(lc, "SLOT_WAIT_JITTER", 0)
+    # Refused twice (account saturated), then a peer releases.
+    fake_redis.eval = AsyncMock(side_effect=[0, 0, 1])
+
+    async with lotek_slot("user@example.com", max_wait_seconds=5.0):
+        pass
+
+    assert fake_redis.eval.await_count == 3
+    fake_redis.zrem.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_slot_gives_up_when_wait_budget_exhausted(fake_redis, monkeypatch):
+    """Waiting must never eat the caller's action deadline: once the budget is
+    spent the slot raises, and the caller defers as before."""
+    monkeypatch.setattr(lc, "SLOT_WAIT_POLL_INITIAL", 0)
+    monkeypatch.setattr(lc, "SLOT_WAIT_POLL_MAX", 0)
+    monkeypatch.setattr(lc, "SLOT_WAIT_JITTER", 0)
+    fake_redis.eval = AsyncMock(return_value=0)
+
+    with pytest.raises(NoConnectionSlot):
+        async with lotek_slot("user@example.com", max_wait_seconds=0.05):
+            pytest.fail("body must not run when the account stays saturated")
+
+    assert fake_redis.eval.await_count >= 1
+    fake_redis.zrem.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_slot_without_wait_budget_still_fails_fast(fake_redis):
+    """Default stays fail-fast for callers with no deadline to reason about."""
+    fake_redis.eval = AsyncMock(return_value=0)
+    with pytest.raises(NoConnectionSlot):
+        async with lotek_slot("user@example.com"):
+            pytest.fail("body must not run")
+    assert fake_redis.eval.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_close_connection_client_closes_and_resets(monkeypatch):
     # The FastAPI lifespan closes every other module-level client; without this
     # the pooled connections are reclaimed by __del__ after the loop is gone,
