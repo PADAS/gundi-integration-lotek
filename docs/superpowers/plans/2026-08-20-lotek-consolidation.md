@@ -613,6 +613,8 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock
 
+from gundi_core.events import LogLevel
+
 from app.actions.traversal import DeviceTraversal
 from app.actions.client import LotekUnauthorizedException
 from app.services.lotek_connections import NoConnectionSlot
@@ -668,7 +670,7 @@ async def test_per_device_failure_is_isolated_and_logged(integration, mocker):
     assert seen == [1, 3]              # device 2 did not stop its peers
     assert t.failed_devices == ["2"]
     assert log.await_count == 1
-    assert log.await_args.kwargs["level"].value == "ERROR"
+    assert log.await_args.kwargs["level"] is LogLevel.ERROR
 
 
 @pytest.mark.asyncio
@@ -1014,7 +1016,8 @@ async def test_zero_progress_backfill_reports_instead_of_raising(
 
     assert result["zero_progress"] is True
     # ERROR activity event carries the health signal...
-    assert try_log.await_args.args[3].value == "ERROR"
+    from gundi_core.events import LogLevel
+    assert try_log.await_args.args[3] is LogLevel.ERROR
     # ...and the cascade stays broken, exactly as the raise used to guarantee.
     trigger.assert_not_awaited()
 ```
@@ -1335,15 +1338,15 @@ Add to `IntegrationStateManager` in `app/services/state.py`, following the retry
         added to close — and an untimed key leaks for anything abandoned
         mid-streak.
         """
-        key = self._get_key(integration_id, action_id, source_id)
+        # state.py has no key-builder helper — every method inlines this exact
+        # f-string. Match the neighbours rather than introducing one here.
+        key = f"integration_state.{integration_id}.{action_id}.{source_id}"
         for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
                 value = await self.db_client.incr(key)
                 await self.db_client.expire(key, ttl_seconds)
         return int(value)
 ```
-
-If the private key builder is not named `_get_key`, use whatever the neighbouring methods use — match them exactly.
 
 Then replace `_bump_dispatcher_skip_streak` in `app/actions/handlers.py`:
 
