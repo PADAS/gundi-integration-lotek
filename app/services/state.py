@@ -135,6 +135,24 @@ class IntegrationStateManager:
                 deleted = await self.db_client.eval(_RELEASE_LEASE_SCRIPT, 1, key, json.dumps(token))
         return bool(deleted)
 
+    async def increment_counter(
+        self, integration_id: str, action_id: str, source_id: str = "no-source",
+        ttl_seconds: int = 3600,
+    ) -> int:
+        """Atomically increment a small counter and refresh its TTL.
+
+        Used for streak counters. A client-side get / int+1 / set loses
+        increments when two runs overlap — the same race merge_state_fields was
+        added to close — and an untimed key leaks for anything abandoned
+        mid-streak.
+        """
+        key = f"integration_state.{integration_id}.{action_id}.{source_id}"
+        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
+            with attempt:
+                value = await self.db_client.incr(key)
+                await self.db_client.expire(key, ttl_seconds)
+        return int(value)
+
     async def delete_state(self, integration_id: str, action_id: str, source_id: str = "no-source"):
         for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:

@@ -392,17 +392,14 @@ async def test_dispatcher_skip_streak_warns_after_consecutive_skips(
 
     streak_state = {}
 
-    async def get_state(integration_id, action_id, source_id="no-source"):
-        return streak_state.get(source_id)
-
-    async def set_state(integration_id, action_id, state, source_id="no-source", **kwargs):
-        streak_state[source_id] = state
+    async def increment_counter(integration_id, action_id, source_id="no-source", ttl_seconds=3600):
+        streak_state[source_id] = streak_state.get(source_id, 0) + 1
+        return streak_state[source_id]
 
     async def delete_state(integration_id, action_id, source_id="no-source"):
         streak_state.pop(source_id, None)
 
-    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(side_effect=get_state))
-    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(side_effect=set_state))
+    mocker.patch("app.services.state.IntegrationStateManager.increment_counter", new=AsyncMock(side_effect=increment_counter))
     mocker.patch("app.services.state.IntegrationStateManager.delete_state", new=AsyncMock(side_effect=delete_state))
 
     @asynccontextmanager

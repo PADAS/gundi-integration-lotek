@@ -468,17 +468,17 @@ async def action_pull_observations(integration, action_config: PullObservationsC
 
 
 async def _bump_dispatcher_skip_streak(integration_id):
-    """Best-effort consecutive-skip counter for the dispatcher's slot-starved
-    tick skips. A Redis blip must not turn a clean skip into a failure."""
+    """Count consecutive dispatcher runs that pulled nothing because the account
+    connection budget was saturated. Atomic INCR: two dispatcher runs in the
+    same window (schedule tick plus a redelivery or manual trigger) both
+    starving would lose an increment under a client-side read-modify-write, and
+    the counter would silently never reach DISPATCHER_SKIP_WARN_AFTER."""
     try:
-        saved = await state_manager.get_state(
-            integration_id, "pull_observations", DISPATCHER_SKIP_STREAK_SOURCE
+        return await state_manager.increment_counter(
+            integration_id, "pull_observations",
+            source_id=DISPATCHER_SKIP_STREAK_SOURCE,
+            ttl_seconds=24 * 3600,
         )
-        streak = int((saved or {}).get("streak", 0)) + 1
-        await state_manager.set_state(
-            integration_id, "pull_observations", {"streak": streak}, DISPATCHER_SKIP_STREAK_SOURCE
-        )
-        return streak
     except Exception as e:
         logger.warning(
             f"Could not track skip streak for integration {integration_id}: {describe_exception(e)}"

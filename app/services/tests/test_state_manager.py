@@ -235,3 +235,27 @@ async def test_delete_state_source_state(mocker, mock_redis, integration_v2, moc
     mock_redis.Redis.return_value.delete.assert_called_once_with(
         f"integration_state.{integration_id}.pull_observations.{source_id}"
     )
+
+
+@pytest.mark.asyncio
+async def test_increment_counter_is_atomic_and_expires(mocker, mock_redis, integration_v2):
+    """Client-side get/int+1/set loses increments under concurrency — the same
+    reason merge_state_fields exists. INCR is atomic; EXPIRE stops abandoned
+    counters leaking keys."""
+    mocker.patch("app.services.state.redis", mock_redis)
+    mock_redis.Redis.return_value.incr.return_value = async_return(3)
+    mock_redis.Redis.return_value.expire.return_value = async_return(True)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+
+    value = await state_manager.increment_counter(
+        integration_id, "pull_observations", source_id="slot_skip_streak", ttl_seconds=3600
+    )
+
+    assert value == 3
+    mock_redis.Redis.return_value.incr.assert_called_once_with(
+        f"integration_state.{integration_id}.pull_observations.slot_skip_streak"
+    )
+    mock_redis.Redis.return_value.expire.assert_called_once_with(
+        f"integration_state.{integration_id}.pull_observations.slot_skip_streak", 3600
+    )
