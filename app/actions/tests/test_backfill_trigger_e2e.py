@@ -5,7 +5,14 @@ from unittest.mock import AsyncMock
 
 from gundi_core.schemas.v2 import IntegrationActionConfiguration
 from app.actions.client import LotekDevice
-from app.actions.handlers import action_pull_observations
+from app.actions.configurations import PullObservationsShardConfig
+from app.actions.handlers import (
+    BACKFILL_TRIGGER_CLAIM_SOURCE,
+    action_pull_observations,
+    action_pull_observations_shard,
+)
+from app.services.state import IntegrationStateManager
+from .test_handlers import _setup_pull_mocks
 
 
 @pytest.mark.asyncio
@@ -66,3 +73,39 @@ async def test_pull_observations_trigger_actually_runs_backfill_end_to_end(mocke
         f"backfill_observations never ran — the trigger's config resolution "
         f"short-circuited it. pull_observations result: {result}"
     )
+
+
+@pytest.mark.asyncio
+async def test_claim_is_released_when_the_trigger_publish_fails(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """The claim (TTL 540s) is taken before the publish. If the publish fails,
+    a stale claim suppresses backfill for every other shard this tick AND the
+    next — pre-sharding a lost trigger self-healed on the next run. Roll back.
+
+    Setup mirrors test_sharding.py::test_only_one_shard_triggers_backfill_per_window
+    (a proven way to reach the any_open_gap-and-not-zero_progress branch: an
+    unsaved device on its first run opens a gap from the lookback floor, and a
+    quiet (positions=[]) fetch still counts as serviced, so zero_progress stays
+    False). The only difference here is that trigger_action raises."""
+    _setup_pull_mocks(mocker, mock_redis, [], saved_state=None)
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch(
+        "app.actions.handlers.trigger_action", side_effect=RuntimeError("pubsub down")
+    )
+    # set_if_absent is granted by an autouse fixture (conftest's
+    # _grant_backfill_trigger_claim) and get_state returns {} (falsy, i.e. no
+    # lease yet) via _setup_pull_mocks above, so the claim is won and the
+    # publish is attempted. delete_state is also autouse-stubbed
+    # (_stub_state_delete); re-patch it here so this test can assert on it.
+    delete_state = mocker.patch.object(
+        IntegrationStateManager, "delete_state", new=AsyncMock(return_value=None)
+    )
+
+    await action_pull_observations_shard(
+        lotek_integration, PullObservationsShardConfig(devices=["1"])
+    )
+
+    delete_state.assert_awaited_once()
+    assert delete_state.await_args.args[1] == "backfill_observations"
+    assert delete_state.await_args.kwargs["source_id"] == BACKFILL_TRIGGER_CLAIM_SOURCE

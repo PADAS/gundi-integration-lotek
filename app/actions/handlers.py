@@ -729,6 +729,8 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         )
 
     if any_open_gap and not zero_progress:
+        claimed = False
+        published = False
         try:
             # Atomic per-window claim first: concurrent shards all reach this
             # point within seconds of each other, and the lease below is only
@@ -760,11 +762,29 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
                         manual_run=action_config.manual_run,
                     )
                 )
+                published = True
         except Exception as e:
             # The shard succeeded; a failed trigger must not fail the run.
             logger.warning(
                 f"Could not trigger backfill for integration {integration.id}: {describe_exception(e)}"
             )
+        finally:
+            if claimed and not published:
+                # We consumed the per-window claim but never published, so no
+                # backfill command exists. Leaving the claim would suppress
+                # every other shard this tick AND the next (TTL is a full
+                # action budget); pre-sharding a lost trigger self-healed on
+                # the next run. Give the claim back (review finding).
+                try:
+                    await state_manager.delete_state(
+                        integration_id, "backfill_observations",
+                        source_id=BACKFILL_TRIGGER_CLAIM_SOURCE,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Could not release the backfill trigger claim for integration "
+                        f"{integration.id} (the TTL will expire it): {describe_exception(e)}"
+                    )
 
     result = {
         'observations_extracted': observations_extracted,
