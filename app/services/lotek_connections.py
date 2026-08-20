@@ -12,6 +12,15 @@ from app import settings
 logger = logging.getLogger(__name__)
 
 
+# The uniform Redis retry policy used by every IntegrationStateManager and
+# config-manager op (app/services/state.py). Kept identical on purpose: the
+# slot acquire previously used attempts=3/wait_initial=0.1/wait_max=2.0, so a
+# multi-second Redis brownout that every get_state around it survived exhausted
+# this budget and escaped as RedisError into the generic per-device handler —
+# a fabricated Lotek failure caused by our own Redis (review finding).
+SLOT_REDIS_RETRY = dict(attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0)
+
+
 class NoConnectionSlot(Exception):
     """Raised when the Lotek connection budget for a username is exhausted."""
 
@@ -102,9 +111,7 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300):
     # Retried like every IntegrationStateManager Redis op (review finding: an
     # unretried transient Redis error here escaped as a fake per-device
     # failure downstream — a blip in OUR Redis said nothing about Lotek).
-    async for attempt in stamina.retry_context(
-        on=redis.RedisError, attempts=3, wait_initial=0.1, wait_max=2.0
-    ):
+    async for attempt in stamina.retry_context(on=redis.RedisError, **SLOT_REDIS_RETRY):
         with attempt:
             now = time.time()
             acquired = await client.eval(

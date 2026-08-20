@@ -82,6 +82,19 @@ def test_connection_key_is_stable_and_username_scoped():
 
 
 @pytest.mark.asyncio
+async def test_slot_retry_policy_matches_state_manager(fake_redis):
+    """A Redis brownout that every IntegrationStateManager op survives must not
+    escape from the slot acquire as a fake per-device Lotek failure. The policy
+    here has to match state.py's, not undercut it.
+    """
+    from app.services.lotek_connections import SLOT_REDIS_RETRY
+
+    assert SLOT_REDIS_RETRY == {
+        "attempts": 5, "wait_initial": 1.0, "wait_max": 30, "wait_jitter": 3.0,
+    }
+
+
+@pytest.mark.asyncio
 async def test_reacquire_with_same_token_is_idempotent(fake_redis):
     """A lost reply on the acquire that took the last slot must not refuse the
     caller that already owns that slot. The Lua checks ZSCORE for the token
