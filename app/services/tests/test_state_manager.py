@@ -263,9 +263,10 @@ async def test_increment_counter_is_atomic_and_expires(mocker, mock_redis, integ
 
 @pytest.mark.asyncio
 async def test_increment_counter_expire_retry_does_not_reincrement(mocker, integration_v2, monkeypatch):
-    """INCR and EXPIRE must be retried as two separate attempt loops: retrying
-    them as one block means a RedisError on EXPIRE re-runs INCR too, silently
-    over-counting the streak (review finding M3)."""
+    """EXPIRE keeps its own retry loop, isolated from INCR (which is not
+    retried at all — see test_increment_counter_incr_is_never_retried):
+    retrying INCR+EXPIRE as one block means a RedisError on EXPIRE re-runs
+    INCR too, silently over-counting the streak (review finding M3)."""
     import stamina
     from redis.exceptions import RedisError
 
@@ -300,6 +301,30 @@ async def test_increment_counter_expire_retry_does_not_reincrement(mocker, integ
     assert state_manager.db_client.incr.await_count == 1
     assert state_manager.db_client.expire.await_count == 2
 
+
+@pytest.mark.asyncio
+async def test_increment_counter_incr_is_never_retried(mocker, integration_v2):
+    """INCR is a non-idempotent write: retrying it risks double-counting a
+    streak on a lost reply (the server applied it, the client never saw the
+    reply), and if every retry attempt fails that way EXPIRE is never reached,
+    leaving an inflated key with no TTL (review finding). A single unretried
+    INCR call accepts an occasional missed increment instead — the caller
+    already treats any failure as a safe default."""
+    from redis.exceptions import RedisError
+
+    state_manager = IntegrationStateManager()
+    state_manager.db_client = mocker.MagicMock()
+    state_manager.db_client.incr = mocker.AsyncMock(side_effect=RedisError("blip"))
+    state_manager.db_client.expire = mocker.AsyncMock(return_value=True)
+    integration_id = str(integration_v2.id)
+
+    with pytest.raises(RedisError):
+        await state_manager.increment_counter(
+            integration_id, "pull_observations", source_id="slot_skip_streak", ttl_seconds=3600
+        )
+
+    assert state_manager.db_client.incr.await_count == 1
+    state_manager.db_client.expire.assert_not_awaited()
 
 @pytest.mark.asyncio
 async def test_increment_counter_self_heals_a_legacy_json_value(mocker, integration_v2):
@@ -341,9 +366,9 @@ async def test_increment_counter_reraises_unrelated_response_error(mocker, integ
     import stamina
     from redis.exceptions import ResponseError
 
-    # ResponseError IS a RedisError, so it exhausts the real retry loop. Zero
-    # the waits or this single test costs ~22s of genuine backoff (same
-    # pattern as test_increment_counter_expire_retry_does_not_reincrement).
+    # INCR is not retried at all (see test_increment_counter_incr_is_never_
+    # retried), so this no longer needs the retry loop zeroed to run fast —
+    # kept anyway in case EXPIRE's own loop is ever reached on this path.
     real_retry_context = stamina.retry_context
 
     def fast_retry_context(*args, **kwargs):

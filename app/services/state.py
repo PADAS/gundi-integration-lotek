@@ -147,11 +147,17 @@ class IntegrationStateManager:
         added to close — and an untimed key leaks for anything abandoned
         mid-streak.
 
-        INCR and EXPIRE are retried as two separate attempt loops (not one
-        block): retrying INCR+EXPIRE together as a unit means a RedisError on
-        the EXPIRE call re-runs the INCR too, silently over-counting the
-        streak. Isolating EXPIRE in its own retry loop means a retry there can
-        only repeat the (idempotent) EXPIRE, never the increment.
+        INCR and EXPIRE are handled very differently. EXPIRE is idempotent, so
+        it keeps its own retry loop, isolated from INCR so a retry there can
+        never repeat the increment. INCR itself is NOT wrapped in a stamina
+        retry at all: a blind retry of a non-idempotent write risks
+        double-counting the streak when the server actually applied the
+        increment but the reply was lost, and if every retry attempt fails
+        that way the loop would raise without ever reaching EXPIRE, leaving an
+        inflated, never-expiring key behind (review finding). A single,
+        unretried INCR instead risks only an occasional missed increment on a
+        genuine Redis blip — an acceptable miss for a best-effort streak
+        counter whose callers already treat any failure as a safe default.
 
         Self-heals a legacy value: this key was previously written by
         set_state as a JSON blob (e.g. {"streak": 2}), with no TTL, so any
@@ -164,17 +170,18 @@ class IntegrationStateManager:
         on the saturated accounts it exists to diagnose (review finding). Only
         that specific message is treated as a legacy value; any other
         ResponseError (a genuine server-side problem) is re-raised untouched.
+        This one-time delete-and-retry is deterministic (keyed off the error
+        message, not a blind retry-on-any-failure), so it does not reintroduce
+        the double-count risk INCR's own retry was removed to avoid.
         """
         key = f"integration_state.{integration_id}.{action_id}.{source_id}"
-        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
-            with attempt:
-                try:
-                    value = await self.db_client.incr(key)
-                except ResponseError as e:
-                    if "not an integer" not in str(e).lower():
-                        raise
-                    await self.db_client.delete(key)
-                    value = await self.db_client.incr(key)
+        try:
+            value = await self.db_client.incr(key)
+        except ResponseError as e:
+            if "not an integer" not in str(e).lower():
+                raise
+            await self.db_client.delete(key)
+            value = await self.db_client.incr(key)
         for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
                 await self.db_client.expire(key, ttl_seconds)
