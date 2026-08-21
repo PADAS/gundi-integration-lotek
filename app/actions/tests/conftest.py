@@ -64,6 +64,22 @@ def _stub_state_delete(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _stub_state_increment_counter(monkeypatch):
+    # The dispatcher bumps its slot-skip streak with increment_counter on
+    # every no_connection_slot skip. Most handler tests mock get_state/
+    # set_state but not increment_counter, so without this it reaches a real
+    # Redis (slow stamina retries, and a leaked real key/client behind the
+    # closed test event loop — review finding I2). Tests exercising the
+    # streak itself patch increment_counter with mocker.patch, which — being
+    # applied inside the test body, after this fixture runs — takes
+    # precedence for the duration of that test.
+    from app.services.state import IntegrationStateManager
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(IntegrationStateManager, "increment_counter", AsyncMock(return_value=1))
+
+
+@pytest.fixture(autouse=True)
 def _grant_backfill_trigger_claim(monkeypatch):
     # set_if_absent is the atomic "one backfill trigger per window" claim. It
     # is not part of the class-level get_state/set_state mocking most tests do,
@@ -83,13 +99,22 @@ def _grant_connection_slots(monkeypatch):
     # every slot by default so handler tests don't need a Redis server; tests
     # exercising budget exhaustion patch app.actions.handlers.lotek_slot to
     # raise NoConnectionSlot themselves.
+    #
+    # Every call's (username, kwargs) is recorded in order so tests can assert
+    # on how a given handler actually invokes lotek_slot (e.g. that the
+    # per-device/backfill paths still pass max_wait_seconds) — a signature
+    # check alone proves nothing about the call sites (review finding I1).
     from contextlib import asynccontextmanager
+
+    calls = []
 
     @asynccontextmanager
     async def granted_slot(username, **kwargs):
+        calls.append({"username": username, **kwargs})
         yield
 
     monkeypatch.setattr("app.actions.handlers.lotek_slot", granted_slot)
+    return calls
 
 
 @pytest.fixture(autouse=True)

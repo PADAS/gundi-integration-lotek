@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -5,13 +6,19 @@ from unittest.mock import AsyncMock
 
 from gundi_core.schemas.v2 import LogLevel
 from app.actions.configurations import PullObservationsShardConfig
+from app.actions.device_state import DeviceState
 from app.actions.handlers import (
     SHARD_SIZE,
+    STATE_READ_CONCURRENCY,
     action_pull_observations,
     action_pull_observations_shard,
 )
 from app.services.lotek_connections import NoConnectionSlot
 from .test_handlers import _devices, _setup_pull_mocks
+
+
+def _plain_state():
+    return DeviceState(high_water=datetime.now(tz=timezone.utc))
 
 
 # --- Parent dispatcher -------------------------------------------------------
@@ -103,12 +110,45 @@ def _shard_config(*device_ids):
 
 
 @pytest.mark.asyncio
-async def test_shard_defers_and_retriggers_on_slot_starvation(
+async def test_shard_loads_device_states_concurrently(
     mocker, lotek_integration, pull_config, mock_redis
 ):
-    # Mid-shard budget exhaustion defers the starved device plus the untouched
-    # tail into a re-triggered shard (the pubsub round trip is the backoff) —
-    # no device failures, no ERROR-level noise, no zero-progress raise.
+    """The following .sort() forces every state eager, so these reads are a
+    serial startup tax with no network I/O to hide behind — paid again on every
+    re-trigger hop. The dispatcher's identical pattern was batched in PR #20."""
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+
+    in_flight = 0
+    peak = 0
+
+    async def slow_load(*args, **kwargs):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        return (_plain_state(), False)
+
+    mocker.patch("app.actions.handlers._load_device_state", side_effect=slow_load)
+    mocker.patch("app.actions.handlers._head_pass_device", return_value=(0, False, False))
+
+    await action_pull_observations_shard(
+        lotek_integration, _shard_config(*(f"dev{i}" for i in range(10)))
+    )
+
+    assert peak > 1, "state reads must overlap, not run one-at-a-time"
+
+
+@pytest.mark.asyncio
+async def test_shard_defers_starved_devices_without_retriggering(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # A fully saturated budget defers every starved device (spec D3: narrow
+    # deferral, not the whole tail — here they happen to be the same set
+    # because every device starves) and does NOT immediately re-trigger a
+    # shard for them; they wait for the next scheduled tick. No device
+    # failures, no ERROR-level noise, no zero-progress raise.
     _setup_pull_mocks(mocker, mock_redis, [])
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
@@ -128,9 +168,72 @@ async def test_shard_defers_and_retriggers_on_slot_starvation(
     assert result["devices_failed"] == []
     assert sorted(result["devices_deferred"], key=int) == [str(i) for i in range(1, 9)]
     shard_calls = [c for c in trigger.await_args_list if c.args[1] == "pull_observations_shard"]
-    assert len(shard_calls) == 1
-    assert sorted(shard_calls[0].kwargs["config"].devices, key=int) == [str(i) for i in range(1, 9)]
+    assert shard_calls == []
     assert LogLevel.ERROR not in [c.kwargs.get("level") for c in log.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_starved_device_does_not_abort_the_whole_shard(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """One device losing the slot race must defer THAT device, not the shard's
+    entire remaining tail (spec D3). Its in-chunk peers keep their results and
+    the loop carries on to later chunks."""
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+
+    devices = [f"dev{i}" for i in range(10)]
+    calls = []
+
+    async def fake_head_pass(device_id, *args, **kwargs):
+        calls.append(device_id)
+        if device_id == "dev0":
+            raise NoConnectionSlot("saturated")
+        return (5, False, False)
+
+    mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
+    mocker.patch("app.actions.handlers._retrigger_shard", return_value="handed_off")
+
+    result = await action_pull_observations_shard(
+        lotek_integration, _shard_config(*devices)
+    )
+
+    # Every device was attempted, not just the first chunk.
+    assert len(calls) == 10
+    # Only the starved one is deferred.
+    assert result["devices_deferred"] == ["dev0"]
+    # The other nine still delivered.
+    assert result["observations_extracted"] == 45
+
+
+@pytest.mark.asyncio
+async def test_quiet_success_beside_a_failed_device_is_not_zero_progress(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """A device serviced with nothing new to send is still progress, even when
+    a peer failed. serviced_devices must therefore discount only the devices
+    the CALLER marked failed — the ones the traversal already logged never
+    yielded a result, so subtracting them too would double-count and fire the
+    zero-progress ERROR that the cdip health metric counts on a healthy run.
+    """
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+    mocker.patch("app.actions.traversal.log_action_activity", new=AsyncMock())
+
+    async def fake_head_pass(device_id, *args, **kwargs):
+        if device_id == "boom":
+            raise ValueError("delivery rejected")
+        return (0, False, False)  # serviced, but nothing new to send
+
+    mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
+
+    result = await action_pull_observations_shard(
+        lotek_integration, _shard_config("boom", "quiet")
+    )
+
+    assert result["devices_failed"] == ["boom"]
+    assert "zero_progress" not in result
 
 
 @pytest.mark.asyncio
@@ -249,12 +352,15 @@ async def test_retrigger_increments_generation(mocker, lotek_integration, pull_c
 
 
 @pytest.mark.asyncio
-async def test_retrigger_cap_falls_back_to_next_tick_with_error(
+async def test_slot_starvation_at_retrigger_cap_still_defers_without_error(
     mocker, lotek_integration, pull_config, mock_redis
 ):
-    # At the cap the tail is NOT re-triggered (next scheduled tick picks it
-    # up) and the exhaustion is surfaced at ERROR — an ungoverned chain under
-    # sustained starvation was an invisible busy-loop (review blocker).
+    # Slot starvation no longer attempts a re-trigger at all (spec D3: it
+    # defers only the starved devices to the next scheduled tick), so the
+    # generation being at the re-trigger cap must not matter to it — no
+    # cap-reached ERROR, just the ordinary WARNING deferral. The cap's ERROR
+    # path is still exercised via the deadline cut (see
+    # test_retrigger_cap_does_not_also_emit_zero_progress).
     from app.actions.handlers import SHARD_RETRIGGER_CAP
     _setup_pull_mocks(mocker, mock_redis, [])
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
@@ -274,23 +380,22 @@ async def test_retrigger_cap_falls_back_to_next_tick_with_error(
     assert result["devices_deferred"] == ["1", "2"]
     shard_calls = [c for c in trigger.await_args_list if c.args[1] == "pull_observations_shard"]
     assert shard_calls == []
-    cap_errors = [
-        c for c in log.await_args_list
-        if c.kwargs.get("level") == LogLevel.ERROR and "re-trigger cap" in c.kwargs.get("title", "")
-    ]
-    assert len(cap_errors) == 1
+    assert LogLevel.ERROR not in [c.kwargs.get("level") for c in log.await_args_list]
 
 
 @pytest.mark.asyncio
-async def test_slot_starvation_never_raises_even_when_retrigger_fails(
+async def test_slot_starvation_never_raises_and_does_not_retrigger(
     mocker, lotek_integration, pull_config, mock_redis
 ):
-    # Starvation + a failed re-trigger publish is a clean back-off plus a
-    # pubsub blip — NOT systemic degradation. The old condition raised the
-    # zero-progress LotekException here (review blocker, both directions).
+    # Starvation is a clean back-off to the next scheduled tick — NOT systemic
+    # degradation, and (spec D3) not even an attempt to re-trigger, so a dead
+    # pubsub can't turn a starved shard into a raise either (review blocker,
+    # both directions; the old condition raised the zero-progress
+    # LotekException here when the re-trigger publish it used to attempt
+    # also failed).
     _setup_pull_mocks(mocker, mock_redis, [])
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
-    mocker.patch(
+    trigger = mocker.patch(
         "app.actions.handlers.trigger_action",
         new=AsyncMock(side_effect=Exception("pubsub down")),
     )
@@ -308,6 +413,8 @@ async def test_slot_starvation_never_raises_even_when_retrigger_fails(
 
     assert sorted(result["devices_deferred"], key=int) == ["1", "2"]
     assert result["devices_failed"] == []
+    shard_calls = [c for c in trigger.await_args_list if c.args[1] == "pull_observations_shard"]
+    assert shard_calls == []
 
 
 @pytest.mark.asyncio
@@ -323,17 +430,14 @@ async def test_dispatcher_skip_streak_warns_after_consecutive_skips(
 
     streak_state = {}
 
-    async def get_state(integration_id, action_id, source_id="no-source"):
-        return streak_state.get(source_id)
-
-    async def set_state(integration_id, action_id, state, source_id="no-source", **kwargs):
-        streak_state[source_id] = state
+    async def increment_counter(integration_id, action_id, source_id="no-source", ttl_seconds=3600):
+        streak_state[source_id] = streak_state.get(source_id, 0) + 1
+        return streak_state[source_id]
 
     async def delete_state(integration_id, action_id, source_id="no-source"):
         streak_state.pop(source_id, None)
 
-    mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(side_effect=get_state))
-    mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(side_effect=set_state))
+    mocker.patch("app.services.state.IntegrationStateManager.increment_counter", new=AsyncMock(side_effect=increment_counter))
     mocker.patch("app.services.state.IntegrationStateManager.delete_state", new=AsyncMock(side_effect=delete_state))
 
     @asynccontextmanager
@@ -434,6 +538,13 @@ async def test_only_one_shard_triggers_backfill_per_window(
     _setup_pull_mocks(mocker, mock_redis, [], saved_state=None)
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    # delete_state is autouse-stubbed to a no-op elsewhere in this test package
+    # (conftest's _stub_state_delete), which would hide a regression on this
+    # exact path (a losing shard erroneously releasing the winner's claim) —
+    # re-patch it here, escaping the autouse stub, so it is observable.
+    delete_state = mocker.patch.object(
+        IntegrationStateManager, "delete_state", new=AsyncMock()
+    )
 
     claims = {"count": 0}
 
@@ -448,6 +559,12 @@ async def test_only_one_shard_triggers_backfill_per_window(
 
     backfill_calls = [c for c in trigger.await_args_list if c.args[1] == "backfill_observations"]
     assert len(backfill_calls) == 1
+    # The two shards that lost the claim (claimed=False) must NOT release it —
+    # doing so would delete the winner's claim and hand a second shard a
+    # licence to publish the same window (the most dangerous regression on
+    # this code path, per the review). The winner published successfully, so
+    # it doesn't release either: delete_state must be untouched altogether.
+    delete_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -517,3 +634,44 @@ async def test_backfill_honors_manual_run_on_a_paused_integration(
         lotek_integration, BackfillObservationsConfig(manual_run=True)
     )
     assert manual["reason"] != "integration_paused"
+
+
+@pytest.mark.asyncio
+async def test_shard_fetch_requests_a_bounded_wait_on_the_slot(
+    mocker, lotek_integration, pull_config, mock_redis, _grant_connection_slots
+):
+    """The headline behaviour change (spec D2): the per-device fetch's
+    lotek_slot acquire in _fetch_window must pass max_wait_seconds, not just
+    have a parameter for it. A signature check alone (as the old guard here
+    did) cannot catch that wiring being deleted from the call site — this
+    drives an actual device through the shard so the recorded call is
+    inspected end to end."""
+    from app.actions.handlers import DEADLINE_FRACTION
+    from app import settings as app_settings
+
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+
+    await action_pull_observations_shard(lotek_integration, _shard_config("1"))
+
+    assert len(_grant_connection_slots) == 1
+    recorded = _grant_connection_slots[0]
+    assert 0 < recorded["max_wait_seconds"] <= DEADLINE_FRACTION * app_settings.MAX_ACTION_EXECUTION_TIME
+
+
+def test_partitioning_constants_may_oversubscribe_the_budget():
+    """Guards the spec-D1 contract: SHARD_SIZE and FETCH_CONCURRENCY are
+    work-partitioning parameters, NOT concurrency limits, so they are ALLOWED
+    to exceed the account budget — the budget applies backpressure (Task 3).
+
+    This test exists so nobody 'fixes' the arithmetic by shrinking the
+    partitioning constants: that would reintroduce the coupling spec D1
+    removed. If you need to bound concurrency, change LOTEK_MAX_CONNECTIONS.
+    """
+    from app.actions.handlers import FETCH_CONCURRENCY, SHARD_SIZE
+    from app.services.lotek_connections import lotek_slot
+    import inspect
+
+    assert FETCH_CONCURRENCY > 0 and SHARD_SIZE > 0
+    # The budget must be a WAITING primitive for oversubscription to be safe.
+    assert "max_wait_seconds" in inspect.signature(lotek_slot).parameters

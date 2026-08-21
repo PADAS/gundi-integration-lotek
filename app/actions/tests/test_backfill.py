@@ -9,7 +9,7 @@ from app.actions.handlers import (
     BACKFILL_MAX_WINDOWS_PER_DEVICE,
     action_backfill_observations,
 )
-from app.actions.client import LotekDevice, LotekException
+from app.actions.client import LotekDevice
 from app.actions.configurations import BackfillObservationsConfig, PullObservationsConfig
 
 
@@ -248,8 +248,12 @@ async def test_backfill_malformed_data_failure_logs_error_not_warning(
         mocker, mock_redis, _devices("1"), {"1": _gap_state()}
     )
     get_positions.return_value = None  # blows up in filter_and_transform_positions
-    with pytest.raises(LotekException):  # single device, zero progress
-        await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+    # Single device, so this is also a zero-progress run — reported on the
+    # result now instead of raised (spec D7).
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result["zero_progress"] is True
     device_logs = [c for c in log.await_args_list if "Device: 1" in c.kwargs.get("title", "")]
     assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
 
@@ -338,8 +342,10 @@ async def test_backfill_does_not_retrigger_when_all_gaps_closed(
 async def test_backfill_does_not_retrigger_on_zero_progress(
     mocker, lotek_integration, mock_redis
 ):
-    # Zero progress raises — the raise is the cascade's natural chain-breaker,
-    # otherwise a wholly-failing backfill would re-trigger itself forever.
+    # Zero progress breaks the cascade: the raise used to be its natural
+    # chain-breaker, and `not zero_progress` on the gaps_remaining gate now
+    # carries that explicitly (spec D7). A wholly-failing backfill must not
+    # re-trigger itself forever.
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     get_positions, _, _, _, _ = _setup_backfill_mocks(
@@ -347,23 +353,36 @@ async def test_backfill_does_not_retrigger_on_zero_progress(
     )
     get_positions.side_effect = httpx.ReadTimeout("")
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
-    with pytest.raises(LotekException):
-        await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result["zero_progress"] is True
     trigger.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_backfill_zero_progress_raises(
+async def test_backfill_zero_progress_reports_and_still_releases_the_lease(
     mocker, lotek_integration, mock_redis
 ):
+    # Was test_backfill_zero_progress_raises: the ERROR activity event replaced
+    # the raise (spec D7), so the lease release now happens on a normal return
+    # through the finally rather than while an exception unwinds.
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
-    get_positions, _, _, release, _ = _setup_backfill_mocks(
+    get_positions, _, _, release, log = _setup_backfill_mocks(
         mocker, mock_redis, _devices("1"), {"1": _gap_state()}
     )
     get_positions.side_effect = httpx.ReadTimeout("")
-    with pytest.raises(LotekException, match="No devices could be backfilled"):
-        await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result["zero_progress"] is True
+    zero_progress_errors = [
+        c for c in log.await_args_list
+        if c.kwargs.get("level") == LogLevel.ERROR
+        and "No devices could be backfilled" in c.kwargs.get("title", "")
+    ]
+    assert zero_progress_errors, "the health signal must still reach the activity feed"
     release.assert_awaited_once()
 
 
@@ -435,3 +454,150 @@ async def test_backfill_skips_quietly_when_config_is_missing(
     get_positions.assert_not_awaited()
     error_logs = [c for c in log.await_args_list if c.kwargs.get("level") == LogLevel.ERROR]
     assert not error_logs
+
+
+# --- spec D7: zero progress reports instead of raising -----------------------
+
+
+@pytest.mark.asyncio
+async def test_zero_progress_backfill_reports_instead_of_raising(
+    mocker, lotek_integration, mock_redis
+):
+    """Raising routed through the runner's generic _handle_error, which
+    publishes config_data containing the integration's plaintext auth
+    (GUNDI-5628). Backfill adopts the head pass's ERROR-event + result-flag
+    contract instead (spec D7), and must still suppress the self-retrigger."""
+    _setup_backfill_mocks(mocker, mock_redis, _devices("1"), {"1": _gap_state()})
+    mocker.patch(
+        "app.actions.handlers._backfill_device",
+        new=AsyncMock(side_effect=ValueError("boom")),
+    )
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig(triggered_by="test")
+    )
+
+    assert result["zero_progress"] is True
+    # ERROR activity event carries the health signal...
+    assert try_log.await_args.args[3] is LogLevel.ERROR
+    # ...and the cascade stays broken, exactly as the raise used to guarantee.
+    trigger.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_zero_progress_backfill_breaks_the_cascade_after_a_window_advanced(
+    mocker, lotek_integration, mock_redis
+):
+    # The removed raise broke the cascade implicitly by unwinding before the
+    # re-trigger. A run that advanced an empty window and then failed satisfies
+    # every other gaps_remaining conjunct, so `not zero_progress` has to be
+    # explicit or a wholly-failing backfill would re-trigger itself forever.
+    get_positions, _, _, _, _ = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {"1": _gap_state(days_back_start=14)}
+    )
+    # Window 1 delivers nothing but advances the gap; window 2's fetch fails.
+    get_positions.side_effect = [[]] + [httpx.ReadTimeout("")] * 4
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+
+    assert result["observations_extracted"] == 0
+    assert result["devices_failed"] == ["1"]
+    assert result["zero_progress"] is True
+    trigger.assert_not_awaited()
+
+
+def _zero_progress_errors(log):
+    return [
+        c for c in log.await_args_list
+        if c.kwargs.get("level") == LogLevel.ERROR
+        and "No devices could be backfilled" in c.kwargs.get("title", "")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_breaker_stop_still_publishes_the_zero_progress_error(
+    mocker, lotek_integration, mock_redis
+):
+    # Pins backfill's suppression policy (spec criterion 8: alerting unchanged).
+    # ONLY connection-budget starvation excuses a no-progress backfill run. A
+    # hot circuit breaker must NOT: a Lotek-wide outage is exactly when a
+    # breaker stop and zero progress co-occur, and the cdip health metric counts
+    # ERROR activity events — suppressing here would make the outage look
+    # healthy. The shard's expression deliberately differs; unifying the two
+    # (an earlier draft hoisted a shared `deferred_cleanly` onto the traversal)
+    # would silently break this, so assert it rather than trust the expression.
+    get_positions, _, _, _, log = _setup_backfill_mocks(
+        mocker, mock_redis,
+        _devices("1", "2", "3", "4", "5", "6"),
+        {d: _gap_state() for d in ("1", "2", "3", "4", "5", "6")},
+    )
+    # Every fetch times out: chunk 1 (FETCH_CONCURRENCY=5) records 5 consecutive
+    # transport failures, so should_stop() before chunk 2 returns
+    # "circuit breaker" and defers device 6.
+    get_positions.side_effect = httpx.ReadTimeout("")
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    assert result["devices_failed"] == ["1", "2", "3", "4", "5"]
+    assert result["devices_deferred"] == ["6"]  # the breaker really did stop it
+    breaker_deferrals = [
+        c for c in log.await_args_list
+        if c.kwargs.get("level") == LogLevel.WARNING
+        and "circuit breaker" in c.kwargs.get("title", "")
+    ]
+    assert breaker_deferrals, "the breaker stop must be the reason the tail deferred"
+    assert result["zero_progress"] is True
+    assert _zero_progress_errors(log), (
+        "a breaker stop must NOT suppress the zero-progress ERROR"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deadline_stop_still_publishes_the_zero_progress_error(
+    mocker, lotek_integration, mock_redis
+):
+    # Same policy, other stop reason: a deadline cut is not a clean back-off for
+    # backfill (unlike the shard, it hands nothing off to a fresh budget), so it
+    # must keep alerting too.
+    get_positions, _, _, _, log = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1", "2"), {"1": _gap_state(), "2": _gap_state()}
+    )
+    mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig()
+    )
+    get_positions.assert_not_awaited()  # stopped before the first chunk
+    assert result["devices_deferred"] == ["1", "2"]
+    assert result["zero_progress"] is True
+    assert _zero_progress_errors(log), (
+        "a deadline stop must NOT suppress the zero-progress ERROR"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_device_listing_requests_a_bounded_wait_on_the_slot(
+    mocker, lotek_integration, mock_redis, _grant_connection_slots
+):
+    """Same headline wiring as the shard's per-device fetch (review finding
+    I1), but for the backfill's own device-listing lotek_slot acquire. A
+    gap-less device means no per-device fetch happens at all, so the only
+    lotek_slot call in this run is the device-listing one — isolating it."""
+    from app.actions.handlers import DEADLINE_FRACTION
+    from app import settings as app_settings
+
+    now = datetime.now(timezone.utc)
+    get_positions, _, _, _, _ = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"), {"1": {"high_water": now.isoformat()}}
+    )
+
+    await action_backfill_observations(lotek_integration, BackfillObservationsConfig())
+
+    get_positions.assert_not_awaited()  # no gap, so no per-device fetch
+    assert len(_grant_connection_slots) == 1
+    recorded = _grant_connection_slots[0]
+    assert 0 < recorded["max_wait_seconds"] <= DEADLINE_FRACTION * app_settings.MAX_ACTION_EXECUTION_TIME
