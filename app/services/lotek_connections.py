@@ -50,15 +50,17 @@ class NoConnectionSlot(Exception):
 # the longest-lived member, so it can never expire a key with live holders.
 _ACQUIRE_LUA = """
 redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
-redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
 if redis.call('ZSCORE', KEYS[1], ARGV[4]) then
     redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
     return 1
 end
 if redis.call('ZCARD', KEYS[1]) < tonumber(ARGV[3]) then
     redis.call('ZADD', KEYS[1], ARGV[2], ARGV[4])
+    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
     return 1
 end
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[5]))
 return 0
 """
 

@@ -299,3 +299,74 @@ async def test_increment_counter_expire_retry_does_not_reincrement(mocker, integ
     # EXPIRE's own retry must not re-run INCR.
     assert state_manager.db_client.incr.await_count == 1
     assert state_manager.db_client.expire.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_increment_counter_self_heals_a_legacy_json_value(mocker, integration_v2):
+    """Before this counter existed, _bump_dispatcher_skip_streak stored the
+    same key as a JSON blob via set_state (e.g. {"streak": 2}), with no TTL —
+    so that key is permanent, and post-deploy INCR against it always raises
+    "value is not an integer or out of range" (review finding: this made
+    DISPATCHER_SKIP_WARN_AFTER permanently unreachable for any integration
+    carrying one). The first INCR to hit a legacy value must self-heal: drop
+    the stale value and increment once more so the call still returns 1."""
+    from redis.exceptions import ResponseError
+
+    state_manager = IntegrationStateManager()
+    state_manager.db_client = mocker.MagicMock()
+    state_manager.db_client.incr = mocker.AsyncMock(
+        side_effect=[ResponseError("value is not an integer or out of range"), 1]
+    )
+    state_manager.db_client.delete = mocker.AsyncMock(return_value=1)
+    state_manager.db_client.expire = mocker.AsyncMock(return_value=True)
+    integration_id = str(integration_v2.id)
+    key = f"integration_state.{integration_id}.pull_observations.slot_skip_streak"
+
+    value = await state_manager.increment_counter(
+        integration_id, "pull_observations", source_id="slot_skip_streak", ttl_seconds=3600
+    )
+
+    assert value == 1
+    state_manager.db_client.delete.assert_awaited_once_with(key)
+    assert state_manager.db_client.incr.await_count == 2
+    state_manager.db_client.expire.assert_awaited_once_with(key, 3600)
+
+
+@pytest.mark.asyncio
+async def test_increment_counter_reraises_unrelated_response_error(mocker, integration_v2, monkeypatch):
+    """Catching ResponseError must not swallow a genuine server-side problem
+    that happens to share the exception class — only the specific
+    not-an-integer message identifies a legacy value; anything else must
+    surface untouched rather than be silently treated as a migration."""
+    import stamina
+    from redis.exceptions import ResponseError
+
+    # ResponseError IS a RedisError, so it exhausts the real retry loop. Zero
+    # the waits or this single test costs ~22s of genuine backoff (same
+    # pattern as test_increment_counter_expire_retry_does_not_reincrement).
+    real_retry_context = stamina.retry_context
+
+    def fast_retry_context(*args, **kwargs):
+        kwargs["wait_initial"] = 0
+        kwargs["wait_max"] = 0
+        kwargs["wait_jitter"] = 0
+        return real_retry_context(*args, **kwargs)
+
+    monkeypatch.setattr(stamina, "retry_context", fast_retry_context)
+
+    state_manager = IntegrationStateManager()
+    state_manager.db_client = mocker.MagicMock()
+    state_manager.db_client.incr = mocker.AsyncMock(
+        side_effect=ResponseError("ERR some unrelated server problem")
+    )
+    state_manager.db_client.delete = mocker.AsyncMock()
+    state_manager.db_client.expire = mocker.AsyncMock(return_value=True)
+    integration_id = str(integration_v2.id)
+
+    with pytest.raises(ResponseError):
+        await state_manager.increment_counter(
+            integration_id, "pull_observations", source_id="slot_skip_streak", ttl_seconds=3600
+        )
+
+    state_manager.db_client.delete.assert_not_awaited()
+    state_manager.db_client.expire.assert_not_awaited()

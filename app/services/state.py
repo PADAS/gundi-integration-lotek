@@ -5,6 +5,7 @@ from typing import Optional
 import stamina
 import httpx
 import redis.asyncio as redis
+from redis.exceptions import ResponseError
 from app import settings
 
 
@@ -151,11 +152,29 @@ class IntegrationStateManager:
         the EXPIRE call re-runs the INCR too, silently over-counting the
         streak. Isolating EXPIRE in its own retry loop means a retry there can
         only repeat the (idempotent) EXPIRE, never the increment.
+
+        Self-heals a legacy value: this key was previously written by
+        set_state as a JSON blob (e.g. {"streak": 2}), with no TTL, so any
+        pre-existing key from before this counter was atomic is permanent and
+        INCR against it always raises "value is not an integer or out of
+        range". Rather than fail forever, the first INCR to hit one drops the
+        stale value and increments once more — otherwise the streak could
+        never advance for any integration carrying a legacy key, making the
+        DISPATCHER_SKIP_WARN_AFTER diagnostic permanently unreachable exactly
+        on the saturated accounts it exists to diagnose (review finding). Only
+        that specific message is treated as a legacy value; any other
+        ResponseError (a genuine server-side problem) is re-raised untouched.
         """
         key = f"integration_state.{integration_id}.{action_id}.{source_id}"
         for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
-                value = await self.db_client.incr(key)
+                try:
+                    value = await self.db_client.incr(key)
+                except ResponseError as e:
+                    if "not an integer" not in str(e).lower():
+                        raise
+                    await self.db_client.delete(key)
+                    value = await self.db_client.incr(key)
         for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
                 await self.db_client.expire(key, ttl_seconds)

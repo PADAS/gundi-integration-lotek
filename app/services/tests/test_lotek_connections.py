@@ -119,6 +119,40 @@ async def test_reacquire_with_same_token_is_idempotent(fake_redis):
     assert "ZADD" in _ACQUIRE_LUA[zscore_at:zcard_at]
 
 
+def test_expire_runs_after_every_zadd_and_before_every_return():
+    """A key this script's own ZADD just created, or that a concurrent
+    holder's ZADD created and this call merely found at capacity, must get a
+    TTL before the script returns 0 or 1 — otherwise the very first acquire
+    on a brand-new account key leaves a persistent zset with no TTL at all,
+    only fixed up whenever some later acquire happens to run EXPIRE (review
+    finding: EXPIRE used to run once, before either branch, so it covered the
+    at-capacity return-0 path but missed the TTL-less key its own ZADD had
+    just created on the create path).
+
+    The `fake_redis` AsyncMock can't model key creation, so this pins the
+    guarantee at the script-text level, in the style of
+    test_reacquire_with_same_token_is_idempotent: scanning top to bottom,
+    every `return` must be preceded by an EXPIRE since the most recent ZADD
+    (or since the start of the script, for the return that has no ZADD at
+    all on its path).
+    """
+    from app.services.lotek_connections import _ACQUIRE_LUA
+
+    lines = [ln.strip() for ln in _ACQUIRE_LUA.strip().splitlines()]
+    expired_since_last_zadd = True  # true at the top, before any ZADD
+    for line in lines:
+        if line.startswith("redis.call('ZADD'"):
+            expired_since_last_zadd = False
+        if line.startswith("redis.call('EXPIRE'"):
+            expired_since_last_zadd = True
+        if line.startswith("return"):
+            assert expired_since_last_zadd, (
+                f"{line!r} is reachable without an EXPIRE since the last "
+                f"ZADD (or since the start of the script) — the key can be "
+                f"left with no TTL."
+            )
+
+
 @pytest.mark.asyncio
 async def test_slot_waits_then_acquires_when_capacity_frees(fake_redis, monkeypatch):
     """Oversubscription must queue, not refuse: with shards x FETCH_CONCURRENCY
