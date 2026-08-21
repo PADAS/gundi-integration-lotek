@@ -1,3 +1,5 @@
+import time
+
 import pytest
 from unittest.mock import AsyncMock
 
@@ -234,6 +236,46 @@ async def test_slot_without_wait_budget_still_fails_fast(fake_redis):
         async with lotek_slot("user@example.com"):
             pytest.fail("body must not run")
     assert fake_redis.eval.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_slot_retry_is_bounded_by_the_wait_deadline_not_the_retry_budget(fake_redis, monkeypatch):
+    """A Redis brownout must not let stamina's own retry/backoff (attempts=5,
+    wait_max=30) run to completion regardless of the caller's wait budget: a
+    slow-but-eventually-successful retry could grant the slot well after the
+    caller's deadline had already passed, entering the protected section late
+    (review finding). The retry/backoff itself must be bounded by the
+    monotonic deadline, giving up close to the caller's actual budget instead
+    of stamina's own worst case."""
+    from redis.exceptions import RedisError
+    fake_redis.eval = AsyncMock(side_effect=RedisError("brownout"))
+
+    start = time.monotonic()
+    with pytest.raises(NoConnectionSlot):
+        async with lotek_slot("user@example.com", max_wait_seconds=0.05):
+            pytest.fail("body must not run")
+    elapsed = time.monotonic() - start
+
+    # stamina's own policy alone (wait_initial=1.0s before a 2nd attempt)
+    # would blow this 0.05s budget by 20x+ if unbounded.
+    assert elapsed < 1.0
+    fake_redis.zrem.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_slot_retry_still_gets_one_immediate_attempt_with_zero_budget(fake_redis):
+    """A caller with no wait budget at all (the common default) must still
+    get one immediate, unretried attempt on a Redis error — not zero — the
+    same "always at least one try" guarantee the happy path already had."""
+    from redis.exceptions import RedisError
+    fake_redis.eval = AsyncMock(side_effect=RedisError("brownout"))
+
+    with pytest.raises(NoConnectionSlot):
+        async with lotek_slot("user@example.com"):
+            pytest.fail("body must not run")
+
+    assert fake_redis.eval.await_count == 1
+    fake_redis.zrem.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -129,14 +129,59 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds:
     deadline = time.monotonic() + max(0.0, max_wait_seconds)
     backoff = SLOT_WAIT_POLL_INITIAL
     acquired = 0
+
+    async def _acquire_once():
+        now = time.time()
+        return await client.eval(
+            _ACQUIRE_LUA, 1, key, now, now + ttl_seconds,
+            settings.LOTEK_MAX_CONNECTIONS, token, ttl_seconds * 2,
+        )
+
+    async def _give_up(reason):
+        # Shared give-up path: if the Lua actually granted this token on an
+        # attempt whose reply we never saw (lost reply on the last try), no
+        # one else will ever release it. Best-effort zrem so a lost-reply
+        # slot isn't stranded for the full TTL; failure here must not mask
+        # the NoConnectionSlot we're about to raise.
+        try:
+            await client.zrem(key, token)
+        except Exception as exc:
+            logger.warning(
+                f"Failed to release Lotek connection slot on {reason} "
+                f"(will expire via TTL): {exc}"
+            )
+        raise NoConnectionSlot(
+            f"No Lotek connection slot available within "
+            f"{max_wait_seconds:.1f}s (limit {settings.LOTEK_MAX_CONNECTIONS})."
+        )
+
     while True:
-        async for attempt in stamina.retry_context(on=redis.RedisError, **SLOT_REDIS_RETRY):
-            with attempt:
-                now = time.time()
-                acquired = await client.eval(
-                    _ACQUIRE_LUA, 1, key, now, now + ttl_seconds,
-                    settings.LOTEK_MAX_CONNECTIONS, token, ttl_seconds * 2,
-                )
+        # Bound the retry/backoff itself by the caller's remaining wait
+        # budget: letting stamina's own attempts=5/wait_max=30 run unbounded
+        # on a Redis brownout could burn well past `deadline` before this
+        # loop ever rechecks it, entering the protected section late (review
+        # finding). A caller with no wait budget left (including a
+        # max_wait_seconds=0 caller on its very first pass) still gets one
+        # immediate, unretried attempt rather than none at all.
+        remaining_before_attempt = deadline - time.monotonic()
+        if remaining_before_attempt <= 0:
+            try:
+                acquired = await _acquire_once()
+            except redis.RedisError:
+                # No budget left to retry a Redis brownout.
+                await _give_up("retry give-up")
+        else:
+            try:
+                async def _bounded_retry():
+                    async for attempt in stamina.retry_context(on=redis.RedisError, **SLOT_REDIS_RETRY):
+                        with attempt:
+                            return await _acquire_once()
+                acquired = await asyncio.wait_for(_bounded_retry(), timeout=remaining_before_attempt)
+            except (redis.RedisError, asyncio.TimeoutError):
+                # Either the retry budget itself ran past what the caller can
+                # afford to wait, or the last attempt before the deadline
+                # failed outright.
+                await _give_up("retry give-up")
         if acquired:
             break
         # Saturated. Wait for a peer to release rather than aborting the
@@ -144,22 +189,7 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds:
         # caller can afford to spend.
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            # Give-up path: if the Lua actually granted this token on a poll
-            # whose reply we never saw (lost reply on the final attempt), no
-            # one else will ever release it. Best-effort zrem so a lost-reply
-            # slot isn't stranded for the full TTL; failure here must not mask
-            # the NoConnectionSlot we're about to raise.
-            try:
-                await client.zrem(key, token)
-            except Exception as exc:
-                logger.warning(
-                    f"Failed to release Lotek connection slot on give-up "
-                    f"(will expire via TTL): {exc}"
-                )
-            raise NoConnectionSlot(
-                f"No Lotek connection slot available within "
-                f"{max_wait_seconds:.1f}s (limit {settings.LOTEK_MAX_CONNECTIONS})."
-            )
+            await _give_up("give-up")
         pause = min(backoff + random.uniform(0, SLOT_WAIT_JITTER), remaining)
         if pause > 0:
             await asyncio.sleep(pause)
