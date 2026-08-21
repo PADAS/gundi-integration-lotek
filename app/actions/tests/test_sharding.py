@@ -659,6 +659,62 @@ async def test_shard_fetch_requests_a_bounded_wait_on_the_slot(
     assert 0 < recorded["max_wait_seconds"] <= DEADLINE_FRACTION * app_settings.MAX_ACTION_EXECUTION_TIME
 
 
+@pytest.mark.asyncio
+async def test_shard_keeps_slot_starved_and_guard_stopped_devices_disjoint(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """`140abfb` split one combined `deferred_devices` list into
+    `guard_stopped_devices` (the untouched deadline/breaker tail) and
+    `slot_starved_devices` (a per-device NoConnectionSlot within an attempted
+    chunk) so a device covered by both conditions in the same run isn't
+    re-triggered/logged under the wrong reason, or double-reported (see
+    traversal.py). Exercise both in one run: a device starves on the slot
+    inside chunk 1 (FETCH_CONCURRENCY=5), then a deadline cut stops the run
+    right at the start of chunk 2."""
+    import itertools
+    from app.actions.handlers import RETRIGGER_HANDED_OFF
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    retrigger = mocker.patch(
+        "app.actions.handlers._retrigger_shard",
+        new=AsyncMock(return_value=RETRIGGER_HANDED_OFF),
+    )
+    log_deferral = mocker.patch("app.actions.handlers._log_deferral", new=AsyncMock())
+    mocker.patch(
+        "app.actions.handlers._deadline_exceeded",
+        # False for chunk 1's should_stop() check, True from chunk 2 onward.
+        side_effect=itertools.chain([False], itertools.repeat(True)),
+    )
+
+    devices = [str(i) for i in range(1, 11)]  # two chunks of 5
+
+    async def fake_head_pass(device_id, *args, **kwargs):
+        if device_id == "3":
+            raise NoConnectionSlot("saturated")
+        return (1, False, False)
+
+    mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
+
+    result = await action_pull_observations_shard(
+        lotek_integration, _shard_config(*devices)
+    )
+
+    # The retrigger carries only the guard-stopped tail (chunk 2), never the
+    # slot-starved device from chunk 1.
+    retrigger.assert_awaited_once()
+    assert sorted(retrigger.await_args.args[1], key=int) == ["6", "7", "8", "9", "10"]
+
+    # The two deferral logs name disjoint device sets, each under its own
+    # reason — not the combined `deferred_devices` union.
+    logged = {c.args[2]: list(c.args[3]) for c in log_deferral.await_args_list}
+    assert sorted(logged["deadline"], key=int) == ["6", "7", "8", "9", "10"]
+    assert logged["connection budget exhausted"] == ["3"]
+    assert set(logged["deadline"]).isdisjoint(logged["connection budget exhausted"])
+
+    # The reported total is the union of both.
+    assert sorted(result["devices_deferred"], key=int) == ["3", "6", "7", "8", "9", "10"]
+
+
 def test_partitioning_constants_may_oversubscribe_the_budget():
     """Guards the spec-D1 contract: SHARD_SIZE and FETCH_CONCURRENCY are
     work-partitioning parameters, NOT concurrency limits, so they are ALLOWED

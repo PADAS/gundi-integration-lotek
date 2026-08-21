@@ -1,3 +1,4 @@
+import logging
 import time
 
 import pytest
@@ -238,16 +239,38 @@ async def test_slot_without_wait_budget_still_fails_fast(fake_redis):
     assert fake_redis.eval.await_count == 1
 
 
+def _fast_stamina(monkeypatch):
+    """Zero the (real) stamina retry loop's waits, per the fast_retry_context
+    idiom in test_state_manager.py — keeps a persistently-failing retry policy
+    from actually sleeping through SLOT_REDIS_RETRY's wait_initial/wait_max
+    while still exercising the real retry_context (`on=redis.RedisError` must
+    match a real RedisError instance, not a mock)."""
+    import stamina
+
+    real_retry_context = stamina.retry_context
+
+    def fast_retry_context(*args, **kwargs):
+        kwargs["wait_initial"] = 0
+        kwargs["wait_max"] = 0
+        kwargs["wait_jitter"] = 0
+        return real_retry_context(*args, **kwargs)
+
+    monkeypatch.setattr(stamina, "retry_context", fast_retry_context)
+
+
 @pytest.mark.asyncio
-async def test_slot_retry_is_bounded_by_the_wait_deadline_not_the_retry_budget(fake_redis, monkeypatch):
-    """A Redis brownout must not let stamina's own retry/backoff (attempts=5,
-    wait_max=30) run to completion regardless of the caller's wait budget: a
-    slow-but-eventually-successful retry could grant the slot well after the
-    caller's deadline had already passed, entering the protected section late
-    (review finding). The retry/backoff itself must be bounded by the
-    monotonic deadline, giving up close to the caller's actual budget instead
-    of stamina's own worst case."""
+async def test_slot_retry_window_is_floored_not_the_wait_deadline_on_first_pass(
+    fake_redis, monkeypatch
+):
+    """max_wait_seconds is the SATURATION-queueing budget, not a Redis-error
+    budget (Fix 1): a Redis brownout on the first acquire pass must not be cut
+    short to the caller's tiny queueing deadline — it floors to
+    SLOT_REDIS_RETRY_FLOOR so the caller still gets the full SLOT_REDIS_RETRY
+    policy instead of losing it to a budget it was never meant to share with."""
     from redis.exceptions import RedisError
+    from app.services.lotek_connections import SLOT_REDIS_RETRY
+
+    _fast_stamina(monkeypatch)
     fake_redis.eval = AsyncMock(side_effect=RedisError("brownout"))
 
     start = time.monotonic()
@@ -256,26 +279,94 @@ async def test_slot_retry_is_bounded_by_the_wait_deadline_not_the_retry_budget(f
             pytest.fail("body must not run")
     elapsed = time.monotonic() - start
 
-    # stamina's own policy alone (wait_initial=1.0s before a 2nd attempt)
-    # would blow this 0.05s budget by 20x+ if unbounded.
+    assert fake_redis.eval.await_count == SLOT_REDIS_RETRY["attempts"]
+    # Waits are zeroed above, so this pins the test's own speed, not a
+    # production bound (the floor itself is ~20s of *allowance*, not sleep).
     assert elapsed < 1.0
     fake_redis.zrem.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_slot_retry_still_gets_one_immediate_attempt_with_zero_budget(fake_redis):
-    """A caller with no wait budget at all (the common default) must still
-    get one immediate, unretried attempt on a Redis error — not zero — the
-    same "always at least one try" guarantee the happy path already had."""
+async def test_slot_retry_gets_the_full_retry_policy_with_zero_wait_budget(
+    fake_redis, monkeypatch
+):
+    """A caller with no wait budget at all (the common default — the fail-fast
+    dispatcher) must still get the full SLOT_REDIS_RETRY policy on a Redis
+    error, not one unretried attempt: losing the shared retry policy here is
+    exactly how a Redis brownout escaped as a fabricated per-device Lotek
+    failure (D5, Fix 1)."""
     from redis.exceptions import RedisError
+    from app.services.lotek_connections import SLOT_REDIS_RETRY
+
+    _fast_stamina(monkeypatch)
     fake_redis.eval = AsyncMock(side_effect=RedisError("brownout"))
 
     with pytest.raises(NoConnectionSlot):
         async with lotek_slot("user@example.com"):
             pytest.fail("body must not run")
 
-    assert fake_redis.eval.await_count == 1
+    assert fake_redis.eval.await_count == SLOT_REDIS_RETRY["attempts"]
     fake_redis.zrem.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fail_fast_caller_is_actually_retried_on_a_redis_brownout(
+    fake_redis, monkeypatch
+):
+    """The D5 sentinel test above only pins SLOT_REDIS_RETRY's value, so it
+    stayed green while the dispatcher's fail-fast caller silently lost its
+    retries to the queueing-budget bound (Fix 1's regression) — the constant
+    was untouched. Pin the retry actually helping: two transient RedisErrors
+    then a grant, with max_wait_seconds=0 (the dispatcher's own default),
+    must still succeed via more than one eval attempt."""
+    from redis.exceptions import RedisError
+
+    _fast_stamina(monkeypatch)
+    fake_redis.eval = AsyncMock(side_effect=[RedisError("blip"), RedisError("blip"), 1])
+
+    async with lotek_slot("user@example.com"):
+        pass  # must not raise: the third attempt granted the slot
+
+    assert fake_redis.eval.await_count > 1
+
+
+@pytest.mark.asyncio
+async def test_give_up_on_redis_error_chains_the_cause_and_warns(fake_redis, monkeypatch, caplog):
+    """Converting a Redis failure into NoConnectionSlot is correct (it keeps
+    per-device deferral and the config_data credential-leak route closed), but
+    it must stay diagnosable: the original RedisError is chained (`raise ...
+    from exc`) and named at WARNING, so a Redis-caused give-up is never
+    mistaken for the "connection budget exhausted" diagnosis genuine
+    saturation gets (Fix 2)."""
+    from redis.exceptions import RedisError
+    _fast_stamina(monkeypatch)
+    fake_redis.eval = AsyncMock(side_effect=RedisError("brownout"))
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(NoConnectionSlot) as exc_info:
+            async with lotek_slot("user@example.com"):
+                pytest.fail("body must not run")
+
+    assert isinstance(exc_info.value.__cause__, RedisError)
+    assert any("Redis" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_give_up_on_genuine_saturation_has_no_chained_cause(fake_redis, monkeypatch):
+    """The other side of Fix 2: give-up on ordinary account saturation (the
+    server said "no slot", no Redis exception at all) must NOT get a chained
+    cause or the Redis-blamed warning — that diagnosis is reserved for an
+    actual Redis-side failure."""
+    monkeypatch.setattr(lc, "SLOT_WAIT_POLL_INITIAL", 0)
+    monkeypatch.setattr(lc, "SLOT_WAIT_POLL_MAX", 0)
+    monkeypatch.setattr(lc, "SLOT_WAIT_JITTER", 0)
+    fake_redis.eval = AsyncMock(return_value=0)
+
+    with pytest.raises(NoConnectionSlot) as exc_info:
+        async with lotek_slot("user@example.com", max_wait_seconds=0.05):
+            pytest.fail("body must not run")
+
+    assert exc_info.value.__cause__ is None
 
 
 @pytest.mark.asyncio
