@@ -35,11 +35,29 @@ class DeviceTraversal:
         # default of 1 just means "one device per chunk".
         self.concurrency = concurrency
         self.failed_devices = []
-        self.deferred_devices = []
+        # Two reason-specific lists, not one combined `deferred_devices`:
+        # guard_stopped_devices is the unreached tail cut short by
+        # should_stop() (deadline/breaker/cap); slot_starved_devices is
+        # per-device NoConnectionSlot within an attempted chunk. Callers used
+        # to share one list for both, so a chunk that starved on slots right
+        # before a deadline cut got its starved devices re-triggered/logged as
+        # the deadline tail, and the untouched tail got mislabeled as slot
+        # starvation — devices reported under the wrong reason, and reported
+        # twice when both conditions applied to the same run (review finding).
+        self.guard_stopped_devices = []
+        self.slot_starved_devices = []
         self.stop_reason: Optional[str] = None
         self.budget_starved = False
         self._yielded = 0
         self._marked_failed = 0
+
+    @property
+    def deferred_devices(self):
+        """Union of every deferred device, for the overall reported count and
+        result only. Stop-reason and budget-starved handling must use
+        guard_stopped_devices / slot_starved_devices directly instead of this
+        union — see the constructor comment."""
+        return self.guard_stopped_devices + self.slot_starved_devices
 
     @property
     def serviced_devices(self):
@@ -62,7 +80,7 @@ class DeviceTraversal:
         for chunk_start in range(0, len(work), self.concurrency):
             if reason := self.guards.should_stop():
                 self.stop_reason = reason
-                self.deferred_devices.extend(key(item) for item in work[chunk_start:])
+                self.guard_stopped_devices.extend(key(item) for item in work[chunk_start:])
                 return
             chunk = work[chunk_start:chunk_start + self.concurrency]
             results = await asyncio.gather(
@@ -85,7 +103,7 @@ class DeviceTraversal:
                     # Account budget saturated for longer than this run can wait:
                     # not a device failure and not evidence about Lotek. Defer
                     # THIS device only; peers and later chunks continue (D3).
-                    self.deferred_devices.append(device_id)
+                    self.slot_starved_devices.append(device_id)
                     self.budget_starved = True
                     continue
                 if isinstance(res, BaseException):

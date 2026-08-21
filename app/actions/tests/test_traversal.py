@@ -139,3 +139,29 @@ async def test_clean_completion_records_no_stop_and_no_starvation(integration):
     assert t.stop_reason is None
     assert t.budget_starved is False
     assert t.deferred_devices == []
+
+
+@pytest.mark.asyncio
+async def test_slot_starvation_and_guard_stop_stay_in_separate_lists(integration):
+    # A chunk that starves on slots can itself burn enough wall-clock time
+    # (queueing for a peer to release) that the deadline guard trips on the
+    # very next chunk. Both used to land in one shared deferred_devices list,
+    # so a caller retriggering/logging "deadline" devices picked up the
+    # starved one too, and the budget-starved log picked up the untouched
+    # tail — each device reported under the wrong reason, and reported twice
+    # overall (review finding). They must stay in disjoint, reason-specific
+    # lists, with `deferred_devices` only their union.
+    async def process(i):
+        if i == 1:
+            raise NoConnectionSlot("saturated")
+        return f"r{i}"
+
+    t = DeviceTraversal(integration, "act", FakeGuards(stop_after=1), concurrency=2)
+    seen = [item async for item, _ in t.run([1, 2, 3, 4], key=str, process=process)]
+
+    assert seen == [2]                               # device 1 starved, chunk 1 processed
+    assert t.slot_starved_devices == ["1"]
+    assert t.guard_stopped_devices == ["3", "4"]      # unreached tail only
+    assert sorted(t.deferred_devices) == ["1", "3", "4"]  # union
+    assert t.budget_starved is True
+    assert t.stop_reason == "deadline"

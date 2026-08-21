@@ -650,6 +650,11 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             traversal.mark_failed(device_id)
 
     failed_devices = traversal.failed_devices
+    # Union, for the overall count/result only (below). The retrigger and the
+    # two deferral logs each use their own reason-specific list — sharing one
+    # combined list here re-triggered/logged slot-starved devices under a
+    # "deadline" tail and vice versa, and double-reported any device covered
+    # by both conditions in the same run (review finding).
     deferred_devices = traversal.deferred_devices
 
     # Policy, deliberately NOT in the traversal (spec D6): a deadline cut gets a
@@ -657,15 +662,15 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
     # defeat the pause the breaker exists to buy. Its devices wait for the next
     # scheduled tick.
     retrigger_outcome = None
-    if traversal.stop_reason == "deadline" and deferred_devices:
+    if traversal.stop_reason == "deadline" and traversal.guard_stopped_devices:
         retrigger_outcome = await _retrigger_shard(
-            integration, deferred_devices, action_config.generation,
+            integration, traversal.guard_stopped_devices, action_config.generation,
             manual_run=action_config.manual_run,
         )
     if traversal.stop_reason:
         await _log_deferral(
             integration, "pull_observations_shard", traversal.stop_reason,
-            deferred_devices,
+            traversal.guard_stopped_devices,
             disposition=(
                 "to an immediately re-triggered shard"
                 if retrigger_outcome == RETRIGGER_HANDED_OFF
@@ -677,7 +682,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         # not park with zero portal visibility (review finding).
         await _log_deferral(
             integration, "pull_observations_shard", "connection budget exhausted",
-            deferred_devices, disposition="to the next scheduled run",
+            traversal.slot_starved_devices, disposition="to the next scheduled run",
         )
 
     if failed_devices:
@@ -1300,6 +1305,10 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 traversal.mark_failed(device.nDeviceID)
 
         failed_devices = traversal.failed_devices
+        # Union, for the overall count/result only (below); the two deferral
+        # logs each use their own reason-specific list so a slot-starved
+        # device is never logged under the stop_reason tail or vice versa
+        # (review finding — see traversal.py).
         deferred_devices = traversal.deferred_devices
 
         # Policy, deliberately NOT in the traversal (spec D6): unlike the shard,
@@ -1308,12 +1317,12 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         if traversal.stop_reason:
             await _log_deferral(
                 integration, "backfill_observations", traversal.stop_reason,
-                deferred_devices,
+                traversal.guard_stopped_devices,
             )
         if traversal.budget_starved:
             await _log_deferral(
                 integration, "backfill_observations", "connection budget exhausted",
-                deferred_devices, disposition="to the next backfill trigger",
+                traversal.slot_starved_devices, disposition="to the next backfill trigger",
             )
 
         if failed_devices:
