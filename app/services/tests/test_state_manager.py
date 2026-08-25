@@ -1,6 +1,8 @@
 import datetime
 import json
 
+import fakeredis
+import fakeredis.commands_mixins.scripting_mixin as _fakeredis_scripting_mixin
 import pytest
 import stamina
 from app.conftest import async_return
@@ -11,7 +13,44 @@ from app.services.state import (
     _MERGE_STATE_SCRIPT,
     _RELEASE_LEASE_SCRIPT,
 )
-from ._lua_lite import FakeRedis, LuaError, run_script
+
+
+@pytest.fixture
+def real_lua_redis(monkeypatch):
+    """A fakeredis client with real Lua script execution (fakeredis[lua],
+    backed by the lupa Lua engine), for running the actual
+    _INCREMENT_COUNTER_SCRIPT / _ACQUIRE_LEASE_SCRIPT text below -- not a
+    hand-rolled reimplementation of Lua semantics.
+
+    Also works around a real fakeredis bug so the genuine script text can run
+    unmodified: fakeredis's own redis.pcall() error path
+    (ScriptingCommandsMixin._lua_redis_pcall) boxes the exception message as
+    a plain Python `str` into a Lua table, but the LuaRuntime backing it is
+    constructed with encoding=None, under which a raw (non-bytes) Python str
+    is not auto-coerced into a Lua string -- it comes back into the script as
+    opaque userdata rather than a string. Real Redis always hands pcall's
+    `err` field back as a genuine Lua string (fakeredis's own
+    redis.error_reply gets this right by contrast). Unpatched, that mismatch
+    makes `string.lower(result.err)` -- a line in the real production script
+    -- raise a spurious "bad argument #1 to 'lower' (string expected, got
+    userdata)" on ANY redis.pcall failure, regardless of what a test is
+    trying to exercise. Confirmed present in fakeredis 2.37.1 (the version
+    pinned here) and still present on fakeredis's master branch. Encoding the
+    message as bytes before boxing it -- matching how error_reply already
+    behaves -- is the minimal fix to make the emulation match real Redis.
+    """
+    def _fixed_lua_redis_pcall(self, lua_runtime, expected_globals, op, *args):
+        try:
+            return self._lua_redis_call(lua_runtime, expected_globals, op, *args)
+        except Exception as ex:
+            return lua_runtime.table_from({b"err": str(ex).encode()})
+
+    monkeypatch.setattr(
+        _fakeredis_scripting_mixin.ScriptingCommandsMixin,
+        "_lua_redis_pcall",
+        _fixed_lua_redis_pcall,
+    )
+    return fakeredis.FakeRedis()
 
 
 def _fast_stamina(monkeypatch):
@@ -337,60 +376,52 @@ def test_increment_counter_script_self_heals_before_expiring():
     assert script.rstrip().splitlines()[-2].strip().startswith("redis.call('EXPIRE'")
 
 
-def test_increment_counter_script_self_heals_a_legacy_value_when_actually_run():
+def test_increment_counter_script_self_heals_a_legacy_value_when_actually_run(real_lua_redis):
     """Behavioral counterpart to the text-pin above, executing the real
-    script (not a hand-copied transliteration of it) via the tiny Lua-subset
-    interpreter in ._lua_lite — no Lua runtime is available in this suite
-    without adding a new project dependency (see the module docstring in
-    _lua_lite.py for why fakeredis[lua]/lupa were ruled out here). A legacy
-    JSON value must self-heal into 1, not raise, and the key must come out
-    with the caller's TTL — this is exactly the guarantee the deleted
+    script (not a hand-copied transliteration of it) against a real Lua
+    engine (fakeredis[lua], backed by lupa). A legacy JSON value must
+    self-heal into 1, not raise, and the key must come out with the caller's
+    TTL — this is exactly the guarantee the deleted
     test_increment_counter_self_heals_a_legacy_json_value covered before the
     self-heal moved server-side into this script (review finding: `redis.
     pcall` regressing to `redis.call` here would make the self-heal dead and
     the DISPATCHER_SKIP_WARN_AFTER diagnostic permanently unreachable)."""
-    fake = FakeRedis()
-    fake.store["k"] = '{"streak": 2}'
+    real_lua_redis.set("k", '{"streak": 2}')
 
-    value = run_script(_INCREMENT_COUNTER_SCRIPT, fake, ["k"], [3600])
+    value = real_lua_redis.eval(_INCREMENT_COUNTER_SCRIPT, 1, "k", 3600)
 
     assert value == 1
-    assert fake.ttls["k"] == 3600
+    assert real_lua_redis.ttl("k") == 3600
 
 
-def test_increment_counter_script_expires_with_the_given_ttl_when_actually_run():
+def test_increment_counter_script_expires_with_the_given_ttl_when_actually_run(real_lua_redis):
     """The EXPIRE call must use the caller's ttl_seconds (ARGV[1]), not a
     hardcoded literal — a streak counter TTL'd out after a fixed 1 second
     could never accumulate past 1 (review finding). Executed via the real
     script, as above."""
-    fake = FakeRedis()
-
-    value = run_script(_INCREMENT_COUNTER_SCRIPT, fake, ["k"], [3600])
+    value = real_lua_redis.eval(_INCREMENT_COUNTER_SCRIPT, 1, "k", 3600)
 
     assert value == 1
-    assert fake.ttls["k"] == 3600
+    assert real_lua_redis.ttl("k") == 3600
 
 
-def test_increment_counter_script_rejects_an_unrelated_error_when_actually_run():
+def test_increment_counter_script_rejects_an_unrelated_error_when_actually_run(real_lua_redis):
     """Only the specific "not an integer" legacy-value error self-heals; any
     other INCR failure must surface untouched (as redis.error_reply, which
     redis-py raises as a ResponseError) rather than being treated as a
-    legacy value and silently dropped."""
+    legacy value and silently dropped. INCR against a list key is a genuine,
+    reproducible INCR failure (WRONGTYPE) whose message does not mention
+    "not an integer"."""
+    from redis.exceptions import ResponseError
 
-    class _UnrelatedFailureRedis(FakeRedis):
-        def _dispatch(self, cmd, args):
-            if cmd.upper() == "INCR":
-                raise LuaError("ERR unrelated server problem")
-            return super()._dispatch(cmd, args)
+    real_lua_redis.rpush("k", "x")
 
-    fake = _UnrelatedFailureRedis()
-    fake.store["k"] = "5"
-
-    with pytest.raises(LuaError, match="unrelated server problem"):
-        run_script(_INCREMENT_COUNTER_SCRIPT, fake, ["k"], [3600])
+    with pytest.raises(ResponseError, match="WRONGTYPE"):
+        real_lua_redis.eval(_INCREMENT_COUNTER_SCRIPT, 1, "k", 3600)
 
     # The self-heal must not have fired: the original value is untouched.
-    assert fake.store["k"] == "5"
+    assert real_lua_redis.type("k") == b"list"
+    assert real_lua_redis.lrange("k", 0, -1) == [b"x"]
 
 
 @pytest.mark.asyncio
@@ -478,47 +509,41 @@ def test_acquire_lease_script_recognizes_its_own_token_before_the_generic_refusa
     assert script.count("return 1") == 2
 
 
-def test_acquire_lease_script_sets_ttl_from_argv_when_actually_run():
+def test_acquire_lease_script_sets_ttl_from_argv_when_actually_run(real_lua_redis):
     """Behavioral counterpart to the text-pin above, executing the real
-    script via the tiny Lua-subset interpreter in ._lua_lite (see that
-    module's docstring for why no Lua runtime dependency was added). The
-    fresh-acquire branch's SET must carry an expiry from ARGV[2] — dropping
-    'EX', ARGV[2] would leave the claim permanently set, permanently
-    suppressing the backfill trigger for that integration (review
-    finding)."""
-    fake = FakeRedis()
-
-    value = run_script(_ACQUIRE_LEASE_SCRIPT, fake, ["k"], ["tok-a", 540])
+    script against a real Lua engine (fakeredis[lua]). The fresh-acquire
+    branch's SET must carry an expiry from ARGV[2] — dropping 'EX', ARGV[2]
+    would leave the claim permanently set, permanently suppressing the
+    backfill trigger for that integration (review finding)."""
+    value = real_lua_redis.eval(_ACQUIRE_LEASE_SCRIPT, 1, "k", "tok-a", 540)
 
     assert value == 1
-    assert fake.store["k"] == "tok-a"
-    assert fake.ttls.get("k") == 540
+    assert real_lua_redis.get("k") == b"tok-a"
+    assert real_lua_redis.ttl("k") == 540
 
 
-def test_acquire_lease_script_recognizes_its_own_token_when_actually_run():
+def test_acquire_lease_script_recognizes_its_own_token_when_actually_run(real_lua_redis):
     """A retry that presents the SAME token as the key's current holder must
     succeed (and refresh the TTL from ARGV[2]) rather than falling through to
     the generic refusal — the same-token fast path this whole script exists
     to add. Executed via the real script, as above."""
-    fake = FakeRedis()
-    fake.store["k"] = "tok-a"
-    fake.ttls["k"] = 1
+    real_lua_redis.set("k", "tok-a", ex=1)
 
-    value = run_script(_ACQUIRE_LEASE_SCRIPT, fake, ["k"], ["tok-a", 540])
+    value = real_lua_redis.eval(_ACQUIRE_LEASE_SCRIPT, 1, "k", "tok-a", 540)
 
     assert value == 1
-    assert fake.ttls["k"] == 540
+    assert real_lua_redis.ttl("k") == 540
 
 
-def test_acquire_lease_script_refuses_a_different_token_when_actually_run():
+def test_acquire_lease_script_refuses_a_different_token_when_actually_run(real_lua_redis):
     """A different caller's token against an already-held key must be
     refused (0), not silently granted."""
-    fake = FakeRedis()
-    fake.store["k"] = "tok-other"
+    real_lua_redis.set("k", "tok-other")
 
-    value = run_script(_ACQUIRE_LEASE_SCRIPT, fake, ["k"], ["tok-a", 540])
+    value = real_lua_redis.eval(_ACQUIRE_LEASE_SCRIPT, 1, "k", "tok-a", 540)
 
     assert value == 0
+    assert real_lua_redis.get("k") == b"tok-other"
 
 
 @pytest.mark.asyncio
