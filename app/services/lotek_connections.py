@@ -49,6 +49,17 @@ class NoConnectionSlot(Exception):
     """Raised when the Lotek connection budget for a username is exhausted."""
 
 
+class SlotBackendUnavailable(NoConnectionSlot):
+    """Raised when the slot could not be acquired because REDIS failed, not
+    because the account is saturated. Subclasses NoConnectionSlot so a caller
+    that does not distinguish the two still degrades to the safe non-raising
+    capacity-deferral path — but callers that report health MUST distinguish
+    them (Copilot review, round 5): during a persistent Redis outage every
+    pull otherwise reports as a clean capacity deferral, `budget_starved`
+    suppresses the zero-progress ERROR, and the portal health signal never
+    moves while no data flows."""
+
+
 # Atomic acquire: purge expired slots, re-grant to an existing holder, then add
 # a new slot only if under the ceiling. KEYS[1]=zset key.
 # ARGV: now, expiry, ceiling, token, key_ttl.
@@ -183,7 +194,7 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds:
                 f"Giving up on a Lotek connection slot for {username} because "
                 f"of a Redis error, not account saturation ({reason}): {exc}"
             )
-            raise NoConnectionSlot(message) from exc
+            raise SlotBackendUnavailable(message) from exc
         raise NoConnectionSlot(message)
 
     first_pass = True

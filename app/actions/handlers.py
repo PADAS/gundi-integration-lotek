@@ -24,7 +24,7 @@ from app.actions.core import action_title, describe_exception
 from app.actions.device_state import DeviceState
 from app.actions.traversal import DeviceTraversal
 from app.services.action_scheduler import trigger_action
-from app.services.lotek_connections import lotek_slot, NoConnectionSlot
+from app.services.lotek_connections import lotek_slot, NoConnectionSlot, SlotBackendUnavailable
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.state import IntegrationStateManager
 from gundi_core.schemas.v2.gundi import LogLevel
@@ -333,6 +333,24 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 # damper. Do not add max_wait_seconds to this call.
                 async with lotek_slot(auth.username):
                     device_list = await client.get_devices(integration, auth)
+    except SlotBackendUnavailable as e:
+        # REDIS failed to answer, which is not account saturation (Copilot
+        # review, round 5): the quiet capacity-skip below (INFO + streak) left
+        # a persistent Redis outage invisible to the portal health signal —
+        # pulls stopped while everything reported clean deferrals. ERROR
+        # immediately (pre-consolidation, a dispatcher Redis failure was an
+        # ERROR too — via the raise into _handle_error this branch exists to
+        # avoid), skip the Redis-backed streak counter, and return a distinct
+        # reason. Ordered BEFORE NoConnectionSlot — it is a subclass.
+        message = (
+            f"Skipping pull for integration {integration_id}: could not reach Redis "
+            f"to acquire a Lotek connection slot: {describe_exception(e)}"
+        )
+        logger.error(message)
+        await _try_log_activity(
+            integration_id, "pull_observations", message, LogLevel.ERROR
+        )
+        return {"skipped": True, "reason": "redis_unavailable"}
     except NoConnectionSlot:
         # Account budget saturated (shards/backfills from a previous tick are
         # still draining). Scheduled tick — skip cleanly and let the next one
@@ -1243,6 +1261,21 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                         auth.username, max_wait_seconds=_slot_wait_budget(run_started)
                     ):
                         device_list = await client.get_devices(integration, auth)
+        except SlotBackendUnavailable as e:
+            # REDIS failed, not the account budget (Copilot review, round 5) —
+            # the quiet skip below hid a persistent Redis outage from the
+            # portal health signal. ERROR + distinct reason; the lease still
+            # releases via the finally, and open gaps re-trigger on the next
+            # scheduled head pass. Ordered BEFORE NoConnectionSlot (subclass).
+            message = (
+                f"Skipping backfill for integration {integration_id}: could not reach "
+                f"Redis to acquire a Lotek connection slot: {describe_exception(e)}"
+            )
+            logger.error(message)
+            await _try_log_activity(
+                integration_id, "backfill_observations", message, LogLevel.ERROR
+            )
+            return {"skipped": True, "reason": "redis_unavailable"}
         except NoConnectionSlot:
             # Account budget saturated by head-pass shards: back off quietly.
             # The lease releases via the finally; open gaps re-trigger on the

@@ -78,6 +78,38 @@ async def test_backfill_skips_whole_run_when_lease_is_held(
 
 
 @pytest.mark.asyncio
+async def test_backfill_reports_redis_unavailable_as_an_error_and_releases_the_lease(
+    mocker, lotek_integration, mock_redis
+):
+    """A Redis-caused acquire failure on the device listing is NOT account
+    saturation (Copilot review, round 5): the quiet no_connection_slot skip
+    (INFO only) left a persistent Redis outage invisible to the portal health
+    signal. It must publish an ERROR, return a distinct reason, and still
+    release the execution lease via the finally."""
+    from contextlib import asynccontextmanager
+    from app.services.lotek_connections import SlotBackendUnavailable
+
+    _, _, _, release, _ = _setup_backfill_mocks(mocker, mock_redis, [], {})
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+
+    @asynccontextmanager
+    async def backend_down_slot(username, **kwargs):
+        raise SlotBackendUnavailable("redis down")
+        yield
+
+    mocker.patch("app.actions.handlers.lotek_slot", backend_down_slot)
+
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig(triggered_by="test")
+    )
+
+    assert result == {"skipped": True, "reason": "redis_unavailable"}
+    assert try_log.await_count == 1
+    assert try_log.await_args.args[3] is LogLevel.ERROR
+    release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_backfill_skips_when_integration_is_paused(
     mocker, lotek_integration, mock_redis
 ):

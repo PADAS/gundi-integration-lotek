@@ -7,7 +7,7 @@ from gundi_core.events import LogLevel
 from app.actions.client import LotekUnauthorizedException
 from app.actions.core import describe_exception
 from app.services.activity_logger import log_action_activity
-from app.services.lotek_connections import NoConnectionSlot
+from app.services.lotek_connections import NoConnectionSlot, SlotBackendUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,18 @@ class DeviceTraversal:
                     raise res
             for item, res in zip(chunk, results):
                 device_id = key(item)
-                if isinstance(res, NoConnectionSlot):
+                if isinstance(res, SlotBackendUnavailable):
+                    # REDIS failed to answer, which says nothing about the
+                    # Lotek account budget. Classifying this as starvation set
+                    # budget_starved, which suppresses the caller's
+                    # zero-progress ERROR — so a persistent Redis outage
+                    # looked like a clean capacity deferral and never moved
+                    # the portal health signal (Copilot review, round 5).
+                    # Fall through to the failure branch below: ERROR-logged,
+                    # counted failed, retried next run. Ordered BEFORE the
+                    # NoConnectionSlot check — it is a subclass.
+                    pass
+                elif isinstance(res, NoConnectionSlot):
                     # Account budget saturated for longer than this run can wait:
                     # not a device failure and not evidence about Lotek. Defer
                     # THIS device only; peers and later chunks continue (D3).

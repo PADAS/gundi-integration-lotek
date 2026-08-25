@@ -123,6 +123,34 @@ async def test_slot_starvation_records_narrowly(integration):
 
 
 @pytest.mark.asyncio
+async def test_backend_unavailable_is_a_failure_not_starvation(integration, mocker):
+    """SlotBackendUnavailable means REDIS failed, not that the account is
+    saturated (Copilot review, round 5). Classifying it as starvation set
+    budget_starved, which suppresses the zero-progress ERROR — so a persistent
+    Redis outage looked like a clean capacity deferral and never moved the
+    portal health signal. It must take the per-device FAILURE branch instead:
+    ERROR-logged, counted failed, budget_starved untouched."""
+    from app.services.lotek_connections import SlotBackendUnavailable
+
+    log = mocker.patch("app.actions.traversal.log_action_activity", new=AsyncMock())
+
+    async def process(i):
+        if i == 1:
+            raise SlotBackendUnavailable("redis down")
+        return f"r{i}"
+
+    t = DeviceTraversal(integration, "act", FakeGuards(), concurrency=3)
+    seen = [item async for item, _ in t.run([1, 2, 3], key=str, process=process)]
+
+    assert seen == [2, 3]                     # peers unaffected
+    assert t.failed_devices == ["1"]          # a FAILURE, visible to zero-progress
+    assert t.budget_starved is False          # must NOT suppress the ERROR path
+    assert t.slot_starved_devices == []
+    assert log.await_count == 1
+    assert log.await_args.kwargs["level"] is LogLevel.ERROR
+
+
+@pytest.mark.asyncio
 async def test_guard_stop_defers_the_unreached_tail(integration):
     t = DeviceTraversal(integration, "act", FakeGuards(stop_after=1), concurrency=2)
     seen = [item async for item, _ in t.run([1, 2, 3, 4], key=str, process=_ok)]

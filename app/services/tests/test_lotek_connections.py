@@ -401,6 +401,46 @@ async def test_budget_expiry_during_the_final_sleep_is_still_plain_saturation(
 
 
 @pytest.mark.asyncio
+async def test_redis_caused_give_up_raises_the_distinct_backend_type(
+    fake_redis, monkeypatch
+):
+    """Redis retry exhaustion must be distinguishable BY TYPE from account
+    saturation (Copilot review, round 5): every caller treated NoConnectionSlot
+    as genuine saturation, so during a persistent Redis outage pulls reported
+    as clean capacity deferrals and never moved the portal health signal.
+    SlotBackendUnavailable subclasses NoConnectionSlot so an unaware caller
+    still degrades to the safe non-raising path rather than crashing."""
+    from redis.exceptions import RedisError
+    from app.services.lotek_connections import SlotBackendUnavailable
+
+    _fast_stamina(monkeypatch)
+    fake_redis.eval = AsyncMock(side_effect=RedisError("brownout"))
+
+    with pytest.raises(SlotBackendUnavailable) as exc_info:
+        async with lotek_slot("user@example.com"):
+            pytest.fail("body must not run")
+
+    assert isinstance(exc_info.value, NoConnectionSlot)  # safe-fallback contract
+    assert isinstance(exc_info.value.__cause__, RedisError)
+
+
+@pytest.mark.asyncio
+async def test_genuine_saturation_is_never_the_backend_type(fake_redis, monkeypatch):
+    """The server answering "at capacity" is saturation, not a backend
+    failure — it must stay the plain NoConnectionSlot so callers keep the
+    quiet capacity-deferral path."""
+    from app.services.lotek_connections import SlotBackendUnavailable
+
+    fake_redis.eval = AsyncMock(return_value=0)
+
+    with pytest.raises(NoConnectionSlot) as exc_info:
+        async with lotek_slot("user@example.com"):
+            pytest.fail("body must not run")
+
+    assert not isinstance(exc_info.value, SlotBackendUnavailable)
+
+
+@pytest.mark.asyncio
 async def test_close_connection_client_closes_and_resets(monkeypatch):
     # The FastAPI lifespan closes every other module-level client; without this
     # the pooled connections are reclaimed by __del__ after the loop is gone,

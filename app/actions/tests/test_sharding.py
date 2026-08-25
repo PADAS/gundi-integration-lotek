@@ -92,6 +92,40 @@ async def test_pull_observations_skips_cleanly_when_connection_budget_exhausted(
 
 
 @pytest.mark.asyncio
+async def test_pull_observations_reports_redis_unavailable_as_an_error(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """A Redis-caused acquire failure is NOT account saturation (Copilot
+    review, round 5): the quiet capacity-skip path (INFO + streak counter)
+    left a persistent Redis outage invisible to the portal health signal.
+    It must publish an ERROR immediately and not touch the (Redis-backed,
+    semantically wrong) capacity skip-streak."""
+    from app.services.lotek_connections import SlotBackendUnavailable
+
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+    streak = mocker.patch(
+        "app.actions.handlers._bump_dispatcher_skip_streak", new=AsyncMock(return_value=1)
+    )
+
+    @asynccontextmanager
+    async def backend_down_slot(username, **kwargs):
+        raise SlotBackendUnavailable("redis down")
+        yield
+
+    mocker.patch("app.actions.handlers.lotek_slot", backend_down_slot)
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert result == {"skipped": True, "reason": "redis_unavailable"}
+    trigger.assert_not_awaited()
+    streak.assert_not_awaited()
+    assert try_log.await_count == 1
+    assert try_log.await_args.args[3] is LogLevel.ERROR
+
+
+@pytest.mark.asyncio
 async def test_pull_observations_dispatches_nothing_for_empty_device_list(
     mocker, lotek_integration, pull_config, mock_redis
 ):
