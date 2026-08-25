@@ -440,6 +440,38 @@ async def test_genuine_saturation_is_never_the_backend_type(fake_redis, monkeypa
     assert not isinstance(exc_info.value, SlotBackendUnavailable)
 
 
+def test_slot_client_is_socket_bounded(monkeypatch):
+    """Every op on this client runs precisely when Redis may be misbehaving:
+    _give_up's best-effort zrem, the expired-window final attempt, and the
+    release zrem in the finally. redis-py's defaults (socket_timeout=None,
+    socket_connect_timeout=None) let a HUNG Redis park any of them until the
+    outer 540s action timeout — defeating retry_window and the caller's
+    budget, and converting a diagnosable NoConnectionSlot skip into a full
+    action timeout through _handle_error (Copilot review, round 6). A hung op
+    must instead surface as redis.TimeoutError, a RedisError subclass that
+    takes the existing classification paths."""
+    from app.services.lotek_connections import SLOT_REDIS_SOCKET_TIMEOUT
+
+    captured = {}
+
+    class FakeRedis:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(lc, "_shared_client", None)
+    monkeypatch.setattr(lc.redis, "Redis", FakeRedis)
+    try:
+        lc._client()
+    finally:
+        monkeypatch.setattr(lc, "_shared_client", None)
+
+    assert captured["socket_timeout"] == SLOT_REDIS_SOCKET_TIMEOUT
+    assert captured["socket_connect_timeout"] == SLOT_REDIS_SOCKET_TIMEOUT
+    # Bounded means bounded: far below the deadline fraction of the 540s
+    # action budget, or the cleanup can still eat a caller's whole run.
+    assert 0 < SLOT_REDIS_SOCKET_TIMEOUT <= 10.0
+
+
 @pytest.mark.asyncio
 async def test_close_connection_client_closes_and_resets(monkeypatch):
     # The FastAPI lifespan closes every other module-level client; without this

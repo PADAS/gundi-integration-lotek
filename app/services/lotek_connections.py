@@ -44,6 +44,17 @@ SLOT_WAIT_POLL_INITIAL = 0.25
 SLOT_WAIT_POLL_MAX = 2.0
 SLOT_WAIT_JITTER = 0.25
 
+# Socket-level bound on every op this client performs. The give-up zrem, the
+# expired-window final attempt, and the release zrem all run precisely when
+# Redis may be misbehaving, and redis-py's unbounded defaults
+# (socket_timeout=None) let a HUNG Redis park any of them until the outer
+# 540s action timeout — defeating retry_window and the caller's remaining
+# budget, and converting a diagnosable NoConnectionSlot skip into a full
+# action timeout through _handle_error's config_data publish (Copilot
+# review, round 6). A hung op now surfaces as redis.TimeoutError, a
+# RedisError subclass, so it takes the existing retry/classification paths.
+SLOT_REDIS_SOCKET_TIMEOUT = 5.0
+
 
 class NoConnectionSlot(Exception):
     """Raised when the Lotek connection budget for a username is exhausted."""
@@ -104,7 +115,9 @@ def _client() -> redis.Redis:
     global _shared_client
     if _shared_client is None:
         _shared_client = redis.Redis(
-            host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=settings.REDIS_STATE_DB
+            host=settings.REDIS_HOST, port=settings.REDIS_PORT, db=settings.REDIS_STATE_DB,
+            socket_timeout=SLOT_REDIS_SOCKET_TIMEOUT,
+            socket_connect_timeout=SLOT_REDIS_SOCKET_TIMEOUT,
         )
     return _shared_client
 
