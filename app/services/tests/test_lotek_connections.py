@@ -370,6 +370,37 @@ async def test_give_up_on_genuine_saturation_has_no_chained_cause(fake_redis, mo
 
 
 @pytest.mark.asyncio
+async def test_budget_expiry_during_the_final_sleep_is_still_plain_saturation(
+    fake_redis, monkeypatch
+):
+    """The saturation sleep is bounded by `remaining`, so the final sleep can
+    consume the whole queueing budget. The next pass then computed
+    wait_for(timeout<=0), which raises TimeoutError before any Redis call runs
+    — misreporting ordinary saturation as a Redis failure with a chained cause
+    (Copilot review, round 4). An expired window must instead make one last
+    unretried attempt (the sleep existed to wait for a peer to release) and
+    then give up cause-free."""
+    # Real (small) pause constants so expiry happens via the sleep, exactly
+    # as in production — NOT zeroed, which would busy-spin instead.
+    monkeypatch.setattr(lc, "SLOT_WAIT_POLL_INITIAL", 0.05)
+    monkeypatch.setattr(lc, "SLOT_WAIT_POLL_MAX", 0.05)
+    monkeypatch.setattr(lc, "SLOT_WAIT_JITTER", 0)
+    fake_redis.eval = AsyncMock(return_value=0)
+
+    with pytest.raises(NoConnectionSlot) as exc_info:
+        async with lotek_slot("user@example.com", max_wait_seconds=0.02):
+            pytest.fail("body must not run")
+
+    # Cause-free: the server answered "at capacity" every time; no Redis call
+    # failed, so nothing may be chained or blamed on Redis.
+    assert exc_info.value.__cause__ is None
+    # The post-sleep final attempt actually happened: first pass plus one
+    # last check after the budget-consuming sleep.
+    assert fake_redis.eval.await_count == 2
+    fake_redis.zrem.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_close_connection_client_closes_and_resets(monkeypatch):
     # The FastAPI lifespan closes every other module-level client; without this
     # the pooled connections are reclaimed by __del__ after the loop is gone,

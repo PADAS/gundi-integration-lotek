@@ -200,6 +200,21 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds:
         floor = SLOT_REDIS_RETRY_FLOOR if first_pass else 0.0
         first_pass = False
         retry_window = max(deadline - time.monotonic(), floor)
+        if retry_window <= 0:
+            # Only reachable on a non-first pass (the first pass is floored):
+            # the final saturation sleep consumed the whole queueing budget.
+            # wait_for(timeout<=0) would raise TimeoutError before any Redis
+            # call ran, sending ordinary saturation down the Redis-blamed
+            # give-up path with a chained cause (Copilot review). The sleep
+            # existed to wait for a peer to release a slot, so make one last
+            # unretried attempt, then give up under the correct diagnosis.
+            try:
+                acquired = await _acquire_once()
+            except redis.RedisError as exc:
+                await _give_up("final-attempt give-up", exc)
+            if acquired:
+                break
+            await _give_up("give-up")
         try:
             async def _bounded_retry():
                 async for attempt in stamina.retry_context(on=redis.RedisError, **SLOT_REDIS_RETRY):
