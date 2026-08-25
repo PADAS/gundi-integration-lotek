@@ -2,6 +2,7 @@ import datetime
 import json
 
 import pytest
+import stamina
 from app.conftest import async_return
 from app.services.state import (
     IntegrationStateManager,
@@ -10,6 +11,24 @@ from app.services.state import (
     _MERGE_STATE_SCRIPT,
     _RELEASE_LEASE_SCRIPT,
 )
+from ._lua_lite import FakeRedis, LuaError, run_script
+
+
+def _fast_stamina(monkeypatch):
+    """Zero the (real) stamina retry loop's waits, per the fast_retry_context
+    idiom this module lends its name to (see test_lotek_connections.py) —
+    keeps a real retry_context from actually sleeping through
+    wait_initial/wait_max while still exercising it for real (`on=redis.
+    RedisError` must match a real RedisError instance, not a mock)."""
+    real_retry_context = stamina.retry_context
+
+    def fast_retry_context(*args, **kwargs):
+        kwargs["wait_initial"] = 0
+        kwargs["wait_max"] = 0
+        kwargs["wait_jitter"] = 0
+        return real_retry_context(*args, **kwargs)
+
+    monkeypatch.setattr(stamina, "retry_context", fast_retry_context)
 
 
 @pytest.mark.asyncio
@@ -318,6 +337,62 @@ def test_increment_counter_script_self_heals_before_expiring():
     assert script.rstrip().splitlines()[-2].strip().startswith("redis.call('EXPIRE'")
 
 
+def test_increment_counter_script_self_heals_a_legacy_value_when_actually_run():
+    """Behavioral counterpart to the text-pin above, executing the real
+    script (not a hand-copied transliteration of it) via the tiny Lua-subset
+    interpreter in ._lua_lite — no Lua runtime is available in this suite
+    without adding a new project dependency (see the module docstring in
+    _lua_lite.py for why fakeredis[lua]/lupa were ruled out here). A legacy
+    JSON value must self-heal into 1, not raise, and the key must come out
+    with the caller's TTL — this is exactly the guarantee the deleted
+    test_increment_counter_self_heals_a_legacy_json_value covered before the
+    self-heal moved server-side into this script (review finding: `redis.
+    pcall` regressing to `redis.call` here would make the self-heal dead and
+    the DISPATCHER_SKIP_WARN_AFTER diagnostic permanently unreachable)."""
+    fake = FakeRedis()
+    fake.store["k"] = '{"streak": 2}'
+
+    value = run_script(_INCREMENT_COUNTER_SCRIPT, fake, ["k"], [3600])
+
+    assert value == 1
+    assert fake.ttls["k"] == 3600
+
+
+def test_increment_counter_script_expires_with_the_given_ttl_when_actually_run():
+    """The EXPIRE call must use the caller's ttl_seconds (ARGV[1]), not a
+    hardcoded literal — a streak counter TTL'd out after a fixed 1 second
+    could never accumulate past 1 (review finding). Executed via the real
+    script, as above."""
+    fake = FakeRedis()
+
+    value = run_script(_INCREMENT_COUNTER_SCRIPT, fake, ["k"], [3600])
+
+    assert value == 1
+    assert fake.ttls["k"] == 3600
+
+
+def test_increment_counter_script_rejects_an_unrelated_error_when_actually_run():
+    """Only the specific "not an integer" legacy-value error self-heals; any
+    other INCR failure must surface untouched (as redis.error_reply, which
+    redis-py raises as a ResponseError) rather than being treated as a
+    legacy value and silently dropped."""
+
+    class _UnrelatedFailureRedis(FakeRedis):
+        def _dispatch(self, cmd, args):
+            if cmd.upper() == "INCR":
+                raise LuaError("ERR unrelated server problem")
+            return super()._dispatch(cmd, args)
+
+    fake = _UnrelatedFailureRedis()
+    fake.store["k"] = "5"
+
+    with pytest.raises(LuaError, match="unrelated server problem"):
+        run_script(_INCREMENT_COUNTER_SCRIPT, fake, ["k"], [3600])
+
+    # The self-heal must not have fired: the original value is untouched.
+    assert fake.store["k"] == "5"
+
+
 @pytest.mark.asyncio
 async def test_increment_counter_reraises_unrelated_response_error(mocker, integration_v2):
     """A genuine server-side ResponseError (not the specific legacy-value
@@ -379,13 +454,17 @@ async def test_acquire_lease_returns_none_when_a_different_token_already_holds_i
     assert token is None
 
 
-def test_acquire_lease_script_recognizes_its_own_token_before_the_ceiling_check():
+def test_acquire_lease_script_recognizes_its_own_token_before_the_generic_refusal():
     """Script-text pin (no real Lua engine in this suite — same style as the
     other Lua tests): a lost reply on the attempt that actually won must not
     make a stamina retry of the SAME call see its own token and report
     "already held" by someone else (review finding). The same-token branch
     must be checked, and must return success (1), before falling through to
-    the generic "someone else holds it" refusal."""
+    the generic "someone else holds it" refusal.
+
+    (Renamed from ...before_the_ceiling_check: _ACQUIRE_LEASE_SCRIPT has no
+    ceiling check — that phrase was copy-pasted from the connection-slot
+    test — it only has the same-token fast path and a generic refusal.)"""
     script = _ACQUIRE_LEASE_SCRIPT
 
     absent_at = script.find("current == false")
@@ -397,6 +476,80 @@ def test_acquire_lease_script_recognizes_its_own_token_before_the_ceiling_check(
     assert refusal_at == "return 0"
     # Both the fresh-acquire and same-token branches return success.
     assert script.count("return 1") == 2
+
+
+def test_acquire_lease_script_sets_ttl_from_argv_when_actually_run():
+    """Behavioral counterpart to the text-pin above, executing the real
+    script via the tiny Lua-subset interpreter in ._lua_lite (see that
+    module's docstring for why no Lua runtime dependency was added). The
+    fresh-acquire branch's SET must carry an expiry from ARGV[2] — dropping
+    'EX', ARGV[2] would leave the claim permanently set, permanently
+    suppressing the backfill trigger for that integration (review
+    finding)."""
+    fake = FakeRedis()
+
+    value = run_script(_ACQUIRE_LEASE_SCRIPT, fake, ["k"], ["tok-a", 540])
+
+    assert value == 1
+    assert fake.store["k"] == "tok-a"
+    assert fake.ttls.get("k") == 540
+
+
+def test_acquire_lease_script_recognizes_its_own_token_when_actually_run():
+    """A retry that presents the SAME token as the key's current holder must
+    succeed (and refresh the TTL from ARGV[2]) rather than falling through to
+    the generic refusal — the same-token fast path this whole script exists
+    to add. Executed via the real script, as above."""
+    fake = FakeRedis()
+    fake.store["k"] = "tok-a"
+    fake.ttls["k"] = 1
+
+    value = run_script(_ACQUIRE_LEASE_SCRIPT, fake, ["k"], ["tok-a", 540])
+
+    assert value == 1
+    assert fake.ttls["k"] == 540
+
+
+def test_acquire_lease_script_refuses_a_different_token_when_actually_run():
+    """A different caller's token against an already-held key must be
+    refused (0), not silently granted."""
+    fake = FakeRedis()
+    fake.store["k"] = "tok-other"
+
+    value = run_script(_ACQUIRE_LEASE_SCRIPT, fake, ["k"], ["tok-a", 540])
+
+    assert value == 0
+
+
+@pytest.mark.asyncio
+async def test_acquire_lease_retries_present_the_identical_token_on_every_attempt(
+    mocker, integration_v2, monkeypatch
+):
+    """The token is generated once, before the retry loop (review finding):
+    moving `token = str(uuid.uuid4())` inside the loop would make a
+    lost-reply retry present a FRESH token on the second attempt, so the
+    script's same-token fast path no longer recognizes it as the same caller
+    and falsely reports "already held" by someone else — exactly the failure
+    the fast path exists to fix. A lost reply is simulated as a RedisError on
+    the first eval (the real call may have succeeded server-side; the client
+    just never saw the reply), then a real reply on the retry."""
+    from redis.exceptions import RedisError
+
+    _fast_stamina(monkeypatch)
+    state_manager = IntegrationStateManager()
+    state_manager.db_client = mocker.MagicMock()
+    state_manager.db_client.eval = mocker.AsyncMock(side_effect=[RedisError("blip"), 1])
+    integration_id = str(integration_v2.id)
+
+    token = await state_manager.acquire_lease(
+        integration_id, "backfill_observations", ttl_seconds=540, source_id="backfill_trigger_claim"
+    )
+
+    assert token is not None
+    assert state_manager.db_client.eval.await_count == 2
+    first_argv1 = state_manager.db_client.eval.await_args_list[0].args[3]
+    second_argv1 = state_manager.db_client.eval.await_args_list[1].args[3]
+    assert first_argv1 == second_argv1
 
 
 @pytest.mark.asyncio

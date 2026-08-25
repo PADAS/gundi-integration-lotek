@@ -7,6 +7,7 @@ from gundi_core.schemas.v2 import IntegrationActionConfiguration
 from app.actions.client import LotekDevice
 from app.actions.configurations import PullObservationsShardConfig
 from app.actions.handlers import (
+    BACKFILL_LEASE_SOURCE,
     BACKFILL_TRIGGER_CLAIM_SOURCE,
     action_pull_observations,
     action_pull_observations_shard,
@@ -63,17 +64,27 @@ async def test_pull_observations_trigger_actually_runs_backfill_end_to_end(mocke
     mocker.patch("app.services.state.IntegrationStateManager.get_state", new=AsyncMock(return_value={}))
     mocker.patch("app.services.state.IntegrationStateManager.set_state", new=AsyncMock(return_value=None))
     mocker.patch("app.services.state.IntegrationStateManager.release_lease", new=AsyncMock(return_value=True))
+
+    # acquire_lease is called twice end-to-end: once for the shard's
+    # backfill-trigger claim (BACKFILL_TRIGGER_CLAIM_SOURCE), once for
+    # backfill_observations' own execution lease (BACKFILL_LEASE_SOURCE).
+    # These must be DISTINCT tokens: acquire_lease's same-token fast path
+    # treats a repeated token as the caller re-acquiring its own lease, so a
+    # single shared "lease-token" for both calls would model the trigger
+    # claim and the execution lease as the same holder — masking exactly the
+    # collision the fast path exists to distinguish from a real re-attempt.
+    def _lease_token_for(*args, **kwargs):
+        if kwargs.get("source_id") == BACKFILL_TRIGGER_CLAIM_SOURCE:
+            return "trigger-claim-token"
+        return "execution-lease-token"
+
     lease = mocker.patch(
-        "app.services.state.IntegrationStateManager.acquire_lease", new=AsyncMock(return_value="lease-token")
+        "app.services.state.IntegrationStateManager.acquire_lease",
+        new=AsyncMock(side_effect=_lease_token_for),
     )
 
     result = await action_pull_observations(lotek_integration, pull_config)
 
-    # acquire_lease is now called twice end-to-end: once for the shard's
-    # backfill-trigger claim (BACKFILL_TRIGGER_CLAIM_SOURCE), once for
-    # backfill_observations' own execution lease (BACKFILL_LEASE_SOURCE) —
-    # the latter is what actually proves the handler ran.
-    from app.actions.handlers import BACKFILL_LEASE_SOURCE
     backfill_lease_calls = [
         c for c in lease.await_args_list if c.kwargs.get("source_id") == BACKFILL_LEASE_SOURCE
     ]
