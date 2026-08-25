@@ -161,29 +161,31 @@ replacement must keep that property explicitly — `zero_progress` suppresses `g
 Extracting shared mechanics into a new module **relocates** lines and adds a class scaffold,
 docstrings, and imports; it does not delete 200 of them. This plan also deliberately *adds*
 code (D1's comments, the per-caller suppression expressions, D8's claim-rollback `finally`).
-Measured after the head-pass conversion: `handlers.py` 1443 → 1398, with a new 107-line
-`traversal.py`, so combined lines went *up* by 62. The consolidation's value is that the
-loop logic exists **once** instead of twice — which shows up in the duplication greps and in
-the per-handler length, not in a whole-file total. Do not cut behaviour or move policy back
-into the traversal to chase a line count.
+Measured right after the head-pass conversion, `handlers.py` went from 1443 to 1398 lines with
+a new 107-line `traversal.py` — combined lines *up* by 62 at that snapshot. Both files kept
+moving after that point as later review rounds landed fixes on top of the consolidation itself
+(see the PR's commit history for the current counts, not this doc — a hardcoded snapshot here
+goes stale on the very next commit, exactly the anti-pattern this amendment replaced). The
+consolidation's value is that the loop logic exists **once** instead of twice — which shows up
+in the duplication greps and in the per-handler length, not in a whole-file total. Do not cut
+behaviour or move policy back into the traversal to chase a line count.
 
 1. The two duplication greps over `handlers.py` both return **0**: `return_exceptions=True`
    and `LotekUnauthorizedException, asyncio.CancelledError`. This is the binding criterion —
-   it is what proves the chunked-loop mechanics exist in exactly one place.
-2. Each of the two loop-bearing handlers drops by roughly **45-55 lines**:
-   `action_pull_observations_shard` 273 → ~225 (measured: 225), and
-   `action_backfill_observations` 274 → ~226.
-3. `handlers.py` lands near **1,350** lines (a ~6% reduction), and `handlers.py` +
-   `traversal.py` combined stays roughly flat against the 1,443 baseline.
-4. A test pins that oversubscribed fan-out (shards × `FETCH_CONCURRENCY` > `LOTEK_MAX_CONNECTIONS`)
+   it is what proves the chunked-loop mechanics exist in exactly one place, and unlike a line
+   count it does not drift as unrelated fixes land on either file.
+2. Each of the two loop-bearing handlers is meaningfully shorter than its 273/274-line
+   pre-consolidation baseline — not a moving exact figure, since later review-round fixes keep
+   changing both files; the duplication greps in (1) are what actually gates this.
+3. A test pins that oversubscribed fan-out (shards × `FETCH_CONCURRENCY` > `LOTEK_MAX_CONNECTIONS`)
    makes progress rather than mass-deferring.
-5. A test pins that a lost acquire reply does not strand a slot.
-6. No `raise` in either action's zero-progress path (`grep -n "raise LotekException"` over
+4. A test pins that a lost acquire reply does not strand a slot.
+5. No `raise` in either action's zero-progress path (`grep -n "raise LotekException"` over
    `handlers.py` returns nothing), and therefore no route from a zero-progress run into the
    runner's `_handle_error` `config_data` publish. Note the literal `config_data` string
    still appears in `handlers.py` inside explanatory comments that name the leak being
    avoided — the criterion is about the code path, not the token.
-7. Full suite green, under 3.0s, with no net loss of test count.
-8. **Alerting is unchanged.** Which runs emit a zero-progress ERROR must be identical
+6. Full suite green, under 3.0s, with no net loss of test count.
+7. **Alerting is unchanged.** Which runs emit a zero-progress ERROR must be identical
    before and after: the shard suppresses on hand-off / cap-reached / starvation but not on
    a breaker stop; the backfill suppresses on starvation only.

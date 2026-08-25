@@ -1506,15 +1506,21 @@ Expected: **≥ 263 tests** (PR #20's count) — Tasks 1-10 add roughly 15 and r
 - [ ] **Step 3: Confirm the success criteria from the spec**
 
 ```bash
-wc -l app/actions/handlers.py                    # expect ~1350 (was 1443); NOT a hard gate
+wc -l app/actions/handlers.py                    # diagnostic only, NOT a hard gate — see below
 grep -c "^[A-Z_]* = " app/actions/handlers.py    # constants: expect <= 20 (was 22)
 grep -n "raise LotekException" app/actions/handlers.py   # expect: no zero-progress hit
-grep -rn "config_data" app/actions/handlers.py   # expect: no matches
+grep -n "config_data" app/actions/handlers.py   # inspect the matches (see below), not a zero-match check
 ```
 
-Expected: the last three hold. The line count is a diagnostic, not a gate — see the spec's
-amended Success criteria. The two `grep`s for `raise LotekException` and `config_data` are
-the spec's criterion 6: no `raise`-based leak surface left in the file.
+Expected: the constants count and the `raise LotekException` search hold as written. The line
+count is a diagnostic, not a gate — see the spec's amended Success criteria; it will not match
+any hardcoded figure once later review rounds add fixes on top of the consolidation itself. The
+`config_data` grep cannot expect zero matches either: the design spec's criterion 5 (and its
+lines 183-187) deliberately keep the literal string in explanatory comments that NAME the leak
+this branch closed, so following this step literally would report a false failure. Read its
+matches instead: every hit should be inside a comment describing the avoided leak, never a live
+code path that reads, constructs, or publishes `config_data` from a zero-progress run. That is
+the actual criterion 5 — the code path, not the token.
 
 - [ ] **Step 4: Confirm the duplication is actually gone**
 
