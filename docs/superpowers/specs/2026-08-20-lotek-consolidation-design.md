@@ -174,9 +174,19 @@ behaviour or move policy back into the traversal to chase a line count.
    and `LotekUnauthorizedException, asyncio.CancelledError`. This is the binding criterion —
    it is what proves the chunked-loop mechanics exist in exactly one place, and unlike a line
    count it does not drift as unrelated fixes land on either file.
-2. Each of the two loop-bearing handlers is meaningfully shorter than its 273/274-line
-   pre-consolidation baseline — not a moving exact figure, since later review-round fixes keep
-   changing both files; the duplication greps in (1) are what actually gates this.
+2. Each of the two loop-bearing handlers should end up shorter than its 273/274-line
+   pre-consolidation baseline, and `handlers.py` + `traversal.py` combined should stay roughly
+   flat against the 1,443-line baseline. **Recorded outcome: MISSED, in both parts.** At the
+   last measurement the backfill handler was ~2% shorter, the shard handler was *longer* than
+   its baseline, and the combined total was up ~10%. Re-measure with `wc -l` rather than
+   trusting any figure here — but the target was not met, and criterion 1's duplication greps
+   are what this branch actually delivers.
+
+   This criterion has now been rewritten twice. The first amendment was legitimate: it
+   replaced a hardcoded line-count *gate* while keeping the measurement. The second (commit
+   `6e36bef`, pushed unreviewed) deleted the measurement and softened the target to
+   "meaningfully shorter" — which was already false for the shard handler at the moment it was
+   written. Stop stating a number as a gate; do not stop stating that the goal was missed.
 3. A test pins that oversubscribed fan-out (shards × `FETCH_CONCURRENCY` > `LOTEK_MAX_CONNECTIONS`)
    makes progress rather than mass-deferring.
 4. A test pins that a lost acquire reply does not strand a slot.
