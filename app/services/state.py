@@ -5,7 +5,6 @@ from typing import Optional
 import stamina
 import httpx
 import redis.asyncio as redis
-from redis.exceptions import ResponseError
 from app import settings
 
 
@@ -37,6 +36,27 @@ for k, v in pairs(cjson.decode(ARGV[2])) do
 end
 redis.call('SET', KEYS[1], cjson.encode(doc))
 return 1
+"""
+
+# Atomic increment-and-expire, with a self-heal for a legacy value. Doing
+# this client-side (INCR; on a specific error DELETE+INCR; then EXPIRE) is
+# not atomic: two callers racing the same legacy value can interleave so one
+# DELETE erases the other's fresh increment, and a crash/cancellation between
+# steps can leave the new key with no TTL (review finding). Redis executes a
+# script as one atomic unit, so all three steps (or the self-heal branch)
+# happen indivisibly — no interleaving between callers, and the key is never
+# observed with an increment applied but no TTL.
+_INCREMENT_COUNTER_SCRIPT = """
+local result = redis.pcall('INCR', KEYS[1])
+if type(result) == 'table' and result.err then
+    if string.find(string.lower(result.err), 'not an integer') == nil then
+        return redis.error_reply(result.err)
+    end
+    redis.call('DEL', KEYS[1])
+    result = redis.call('INCR', KEYS[1])
+end
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return result
 """
 
 
@@ -140,51 +160,42 @@ class IntegrationStateManager:
         self, integration_id: str, action_id: str, source_id: str = "no-source",
         ttl_seconds: int = 3600,
     ) -> int:
-        """Atomically increment a small counter and refresh its TTL.
+        """Atomically increment a small counter and refresh its TTL, in one
+        Redis-side script.
 
         Used for streak counters. A client-side get / int+1 / set loses
         increments when two runs overlap — the same race merge_state_fields was
         added to close — and an untimed key leaks for anything abandoned
         mid-streak.
 
-        INCR and EXPIRE are handled very differently. EXPIRE is idempotent, so
-        it keeps its own retry loop, isolated from INCR so a retry there can
-        never repeat the increment. INCR itself is NOT wrapped in a stamina
-        retry at all: a blind retry of a non-idempotent write risks
-        double-counting the streak when the server actually applied the
-        increment but the reply was lost, and if every retry attempt fails
-        that way the loop would raise without ever reaching EXPIRE, leaving an
-        inflated, never-expiring key behind (review finding). A single,
-        unretried INCR instead risks only an occasional missed increment on a
-        genuine Redis blip — an acceptable miss for a best-effort streak
-        counter whose callers already treat any failure as a safe default.
+        The whole operation (self-heal, increment, expire) is one atomic Lua
+        script, not wrapped in any stamina retry: a blind client-side retry of
+        a non-idempotent write risks double-counting the streak when the
+        server actually applied it but the reply was lost, and doing the
+        self-heal's delete-then-increment as separate client-side calls let
+        two callers racing the same legacy value interleave (one caller's
+        DELETE erasing the other's fresh increment), or leave the key
+        incremented with no TTL if the process died between steps (review
+        findings). A single, unretried script call instead risks only an
+        occasional missed increment on a genuine Redis blip — an acceptable
+        miss for a best-effort streak counter whose callers already treat any
+        failure as a safe default.
 
         Self-heals a legacy value: this key was previously written by
         set_state as a JSON blob (e.g. {"streak": 2}), with no TTL, so any
         pre-existing key from before this counter was atomic is permanent and
-        INCR against it always raises "value is not an integer or out of
+        INCR against it always fails with "value is not an integer or out of
         range". Rather than fail forever, the first INCR to hit one drops the
-        stale value and increments once more — otherwise the streak could
-        never advance for any integration carrying a legacy key, making the
-        DISPATCHER_SKIP_WARN_AFTER diagnostic permanently unreachable exactly
-        on the saturated accounts it exists to diagnose (review finding). Only
-        that specific message is treated as a legacy value; any other
-        ResponseError (a genuine server-side problem) is re-raised untouched.
-        This one-time delete-and-retry is deterministic (keyed off the error
-        message, not a blind retry-on-any-failure), so it does not reintroduce
-        the double-count risk INCR's own retry was removed to avoid.
+        stale value and increments once more, inside the same script — the
+        streak would otherwise never advance for any integration carrying a
+        legacy key, making the DISPATCHER_SKIP_WARN_AFTER diagnostic
+        permanently unreachable exactly on the saturated accounts it exists to
+        diagnose (review finding). Only that specific message is treated as a
+        legacy value; any other error (a genuine server-side problem) surfaces
+        as a ResponseError, untouched.
         """
         key = f"integration_state.{integration_id}.{action_id}.{source_id}"
-        try:
-            value = await self.db_client.incr(key)
-        except ResponseError as e:
-            if "not an integer" not in str(e).lower():
-                raise
-            await self.db_client.delete(key)
-            value = await self.db_client.incr(key)
-        for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
-            with attempt:
-                await self.db_client.expire(key, ttl_seconds)
+        value = await self.db_client.eval(_INCREMENT_COUNTER_SCRIPT, 1, key, ttl_seconds)
         return int(value)
 
     async def delete_state(self, integration_id: str, action_id: str, source_id: str = "no-source"):

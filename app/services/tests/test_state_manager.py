@@ -3,7 +3,7 @@ import json
 
 import pytest
 from app.conftest import async_return
-from app.services.state import IntegrationStateManager, _MERGE_STATE_SCRIPT
+from app.services.state import IntegrationStateManager, _INCREMENT_COUNTER_SCRIPT, _MERGE_STATE_SCRIPT
 
 
 @pytest.mark.asyncio
@@ -238,13 +238,17 @@ async def test_delete_state_source_state(mocker, mock_redis, integration_v2, moc
 
 
 @pytest.mark.asyncio
-async def test_increment_counter_is_atomic_and_expires(mocker, mock_redis, integration_v2):
-    """Client-side get/int+1/set loses increments under concurrency — the same
-    reason merge_state_fields exists. INCR is atomic; EXPIRE stops abandoned
-    counters leaking keys."""
+async def test_increment_counter_calls_the_atomic_script_and_returns_its_value(mocker, mock_redis, integration_v2):
+    """increment_counter is a single, unretried eval of _INCREMENT_COUNTER_SCRIPT
+    (self-heal + INCR + EXPIRE all inside one Redis-side script — review
+    finding: doing those steps as separate client-side calls let two callers
+    racing a legacy value interleave, and could leave a freshly-incremented
+    key with no TTL if the process died between steps). Not wrapped in a
+    stamina retry either: a lost reply after the script actually ran would
+    make a retry double-count the streak (same reasoning as every other
+    non-idempotent write in this module)."""
     mocker.patch("app.services.state.redis", mock_redis)
-    mock_redis.Redis.return_value.incr.return_value = async_return(3)
-    mock_redis.Redis.return_value.expire.return_value = async_return(True)
+    mock_redis.Redis.return_value.eval.return_value = async_return(3)
     state_manager = IntegrationStateManager()
     integration_id = str(integration_v2.id)
 
@@ -253,69 +257,25 @@ async def test_increment_counter_is_atomic_and_expires(mocker, mock_redis, integ
     )
 
     assert value == 3
-    mock_redis.Redis.return_value.incr.assert_called_once_with(
-        f"integration_state.{integration_id}.pull_observations.slot_skip_streak"
-    )
-    mock_redis.Redis.return_value.expire.assert_called_once_with(
-        f"integration_state.{integration_id}.pull_observations.slot_skip_streak", 3600
+    mock_redis.Redis.return_value.eval.assert_called_once_with(
+        _INCREMENT_COUNTER_SCRIPT,
+        1,
+        f"integration_state.{integration_id}.pull_observations.slot_skip_streak",
+        3600,
     )
 
 
 @pytest.mark.asyncio
-async def test_increment_counter_expire_retry_does_not_reincrement(mocker, integration_v2, monkeypatch):
-    """EXPIRE keeps its own retry loop, isolated from INCR (which is not
-    retried at all — see test_increment_counter_incr_is_never_retried):
-    retrying INCR+EXPIRE as one block means a RedisError on EXPIRE re-runs
-    INCR too, silently over-counting the streak (review finding M3)."""
-    import stamina
-    from redis.exceptions import RedisError
-
-    # Keep the (real) retry loop from sleeping between attempts; the `redis`
-    # name in app.services.state must stay the real module here (not a mock)
-    # so `on=redis.RedisError` in the retried block still matches a real
-    # RedisError instance.
-    real_retry_context = stamina.retry_context
-
-    def fast_retry_context(*args, **kwargs):
-        kwargs["wait_initial"] = 0
-        kwargs["wait_max"] = 0
-        kwargs["wait_jitter"] = 0
-        return real_retry_context(*args, **kwargs)
-
-    monkeypatch.setattr(stamina, "retry_context", fast_retry_context)
-
-    state_manager = IntegrationStateManager()
-    state_manager.db_client = mocker.MagicMock()
-    state_manager.db_client.incr = mocker.AsyncMock(return_value=5)
-    state_manager.db_client.expire = mocker.AsyncMock(
-        side_effect=[RedisError("blip"), True]
-    )
-    integration_id = str(integration_v2.id)
-
-    value = await state_manager.increment_counter(
-        integration_id, "pull_observations", source_id="slot_skip_streak", ttl_seconds=3600
-    )
-
-    assert value == 5
-    # EXPIRE's own retry must not re-run INCR.
-    assert state_manager.db_client.incr.await_count == 1
-    assert state_manager.db_client.expire.await_count == 2
-
-
-@pytest.mark.asyncio
-async def test_increment_counter_incr_is_never_retried(mocker, integration_v2):
-    """INCR is a non-idempotent write: retrying it risks double-counting a
-    streak on a lost reply (the server applied it, the client never saw the
-    reply), and if every retry attempt fails that way EXPIRE is never reached,
-    leaving an inflated key with no TTL (review finding). A single unretried
-    INCR call accepts an occasional missed increment instead — the caller
-    already treats any failure as a safe default."""
+async def test_increment_counter_script_is_never_retried(mocker, integration_v2):
+    """A Redis error from the script call must propagate immediately, with no
+    stamina retry: retrying a non-idempotent increment risks double-counting
+    the streak on a lost reply after the server actually applied it (review
+    finding)."""
     from redis.exceptions import RedisError
 
     state_manager = IntegrationStateManager()
     state_manager.db_client = mocker.MagicMock()
-    state_manager.db_client.incr = mocker.AsyncMock(side_effect=RedisError("blip"))
-    state_manager.db_client.expire = mocker.AsyncMock(return_value=True)
+    state_manager.db_client.eval = mocker.AsyncMock(side_effect=RedisError("blip"))
     integration_id = str(integration_v2.id)
 
     with pytest.raises(RedisError):
@@ -323,69 +283,49 @@ async def test_increment_counter_incr_is_never_retried(mocker, integration_v2):
             integration_id, "pull_observations", source_id="slot_skip_streak", ttl_seconds=3600
         )
 
-    assert state_manager.db_client.incr.await_count == 1
-    state_manager.db_client.expire.assert_not_awaited()
+    assert state_manager.db_client.eval.await_count == 1
+
+
+def test_increment_counter_script_self_heals_before_expiring():
+    """Script-text pin (fakeredis/a real Lua engine isn't available in this
+    suite, so — in the style of the lotek_connections.py Lua tests — this
+    pins the guarantee at the source level): the self-heal (DEL + re-INCR on
+    a "not an integer" legacy value) must happen before the unconditional
+    EXPIRE, and EXPIRE must run on every path (fresh INCR or self-healed),
+    so a key is never observed as incremented with no TTL (review finding).
+    An unrelated error must not trigger the self-heal — it returns an error
+    reply instead, surfacing as a ResponseError to the caller untouched."""
+    script = _INCREMENT_COUNTER_SCRIPT
+
+    not_an_integer_at = script.lower().find("not an integer")
+    del_at = script.find("redis.call('DEL'")
+    error_reply_at = script.find("redis.error_reply")
+    expire_at = script.find("redis.call('EXPIRE'")
+
+    assert -1 not in (not_an_integer_at, del_at, error_reply_at, expire_at)
+    # An unrelated error is rejected (error_reply) before the legacy value is
+    # ever assumed and dropped.
+    assert error_reply_at < del_at
+    # The self-heal runs before EXPIRE, and EXPIRE is unconditional (outside
+    # any per-branch guard) so it is reached on every path.
+    assert del_at < expire_at
+    assert script.rstrip().splitlines()[-2].strip().startswith("redis.call('EXPIRE'")
+
 
 @pytest.mark.asyncio
-async def test_increment_counter_self_heals_a_legacy_json_value(mocker, integration_v2):
-    """Before this counter existed, _bump_dispatcher_skip_streak stored the
-    same key as a JSON blob via set_state (e.g. {"streak": 2}), with no TTL —
-    so that key is permanent, and post-deploy INCR against it always raises
-    "value is not an integer or out of range" (review finding: this made
-    DISPATCHER_SKIP_WARN_AFTER permanently unreachable for any integration
-    carrying one). The first INCR to hit a legacy value must self-heal: drop
-    the stale value and increment once more so the call still returns 1."""
+async def test_increment_counter_reraises_unrelated_response_error(mocker, integration_v2):
+    """A genuine server-side ResponseError (not the specific legacy-value
+    message) must surface to the caller untouched — the real Lua script does
+    this via redis.error_reply, which redis-py raises as a ResponseError;
+    simulated here directly against the client since the script itself only
+    has coverage-by-inspection above."""
     from redis.exceptions import ResponseError
 
     state_manager = IntegrationStateManager()
     state_manager.db_client = mocker.MagicMock()
-    state_manager.db_client.incr = mocker.AsyncMock(
-        side_effect=[ResponseError("value is not an integer or out of range"), 1]
-    )
-    state_manager.db_client.delete = mocker.AsyncMock(return_value=1)
-    state_manager.db_client.expire = mocker.AsyncMock(return_value=True)
-    integration_id = str(integration_v2.id)
-    key = f"integration_state.{integration_id}.pull_observations.slot_skip_streak"
-
-    value = await state_manager.increment_counter(
-        integration_id, "pull_observations", source_id="slot_skip_streak", ttl_seconds=3600
-    )
-
-    assert value == 1
-    state_manager.db_client.delete.assert_awaited_once_with(key)
-    assert state_manager.db_client.incr.await_count == 2
-    state_manager.db_client.expire.assert_awaited_once_with(key, 3600)
-
-
-@pytest.mark.asyncio
-async def test_increment_counter_reraises_unrelated_response_error(mocker, integration_v2, monkeypatch):
-    """Catching ResponseError must not swallow a genuine server-side problem
-    that happens to share the exception class — only the specific
-    not-an-integer message identifies a legacy value; anything else must
-    surface untouched rather than be silently treated as a migration."""
-    import stamina
-    from redis.exceptions import ResponseError
-
-    # INCR is not retried at all (see test_increment_counter_incr_is_never_
-    # retried), so this no longer needs the retry loop zeroed to run fast —
-    # kept anyway in case EXPIRE's own loop is ever reached on this path.
-    real_retry_context = stamina.retry_context
-
-    def fast_retry_context(*args, **kwargs):
-        kwargs["wait_initial"] = 0
-        kwargs["wait_max"] = 0
-        kwargs["wait_jitter"] = 0
-        return real_retry_context(*args, **kwargs)
-
-    monkeypatch.setattr(stamina, "retry_context", fast_retry_context)
-
-    state_manager = IntegrationStateManager()
-    state_manager.db_client = mocker.MagicMock()
-    state_manager.db_client.incr = mocker.AsyncMock(
+    state_manager.db_client.eval = mocker.AsyncMock(
         side_effect=ResponseError("ERR some unrelated server problem")
     )
-    state_manager.db_client.delete = mocker.AsyncMock()
-    state_manager.db_client.expire = mocker.AsyncMock(return_value=True)
     integration_id = str(integration_v2.id)
 
     with pytest.raises(ResponseError):
@@ -393,5 +333,4 @@ async def test_increment_counter_reraises_unrelated_response_error(mocker, integ
             integration_id, "pull_observations", source_id="slot_skip_streak", ttl_seconds=3600
         )
 
-    state_manager.db_client.delete.assert_not_awaited()
-    state_manager.db_client.expire.assert_not_awaited()
+    assert state_manager.db_client.eval.await_count == 1
