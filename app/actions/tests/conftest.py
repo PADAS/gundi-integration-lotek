@@ -81,16 +81,34 @@ def _stub_state_increment_counter(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _grant_backfill_trigger_claim(monkeypatch):
-    # set_if_absent is the atomic "one backfill trigger per window" claim. It
-    # is not part of the class-level get_state/set_state mocking most tests do,
-    # so without this it reaches a real Redis (slow stamina retries). Granted
-    # by default; the duplicate-suppression test overrides it.
+    # The backfill-trigger claim (a token-based lease via acquire_lease, not
+    # a plain boolean set_if_absent — a same-token retry of a raw SET NX
+    # could falsely report "already held", review finding) is not part of
+    # the class-level get_state/set_state mocking most tests do, so without
+    # this it reaches a real Redis (slow stamina retries). Granted by
+    # default with a fresh token per call; the duplicate-suppression test
+    # overrides it. set_if_absent is also granted here for any other caller
+    # (e.g. action_runner.py's throttle window) exercised incidentally by
+    # these handler tests.
+    import uuid
     from app.services.state import IntegrationStateManager
 
     async def granted(self, integration_id, action_id, *, ttl_seconds, source_id="no-source"):
         return True
 
+    async def lease_granted(self, integration_id, action_id, *, ttl_seconds, source_id="no-source"):
+        return str(uuid.uuid4())
+
+    async def lease_released(self, integration_id, action_id, token, source_id="no-source"):
+        return True
+
     monkeypatch.setattr(IntegrationStateManager, "set_if_absent", granted)
+    monkeypatch.setattr(IntegrationStateManager, "acquire_lease", lease_granted)
+    # release_lease is the corresponding release for the same claim (and for
+    # the pre-existing backfill execution lease at BACKFILL_LEASE_SOURCE);
+    # stub it here too for the same reason delete_state is stubbed above —
+    # tests exercising a specific release outcome patch it themselves.
+    monkeypatch.setattr(IntegrationStateManager, "release_lease", lease_released)
 
 
 @pytest.fixture(autouse=True)

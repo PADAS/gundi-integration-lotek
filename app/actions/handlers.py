@@ -758,7 +758,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         )
 
     if any_open_gap and not zero_progress:
-        claimed = False
+        claim_token = None
         published = False
         try:
             # Atomic per-window claim first: concurrent shards all reach this
@@ -766,7 +766,16 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             # created a pubsub hop later (when the backfill handler runs), so a
             # plain lease read let every shard publish its own command (review
             # finding). Exactly one shard wins the claim per window.
-            claimed = await state_manager.set_if_absent(
+            #
+            # A token-based lease, not set_if_absent's plain boolean: tracking
+            # ownership as a boolean is not reliable across a retried claim —
+            # set_if_absent's own stamina retry can win the SET NX, lose the
+            # reply, and then have its retry see the key it just created and
+            # report "already held", leaving `claimed` false with the claim
+            # still consumed and never released below (review finding).
+            # acquire_lease's same-token fast path makes a retry of the exact
+            # same call recognize its own win instead.
+            claim_token = await state_manager.acquire_lease(
                 integration_id, "backfill_observations",
                 ttl_seconds=app_settings.MAX_ACTION_EXECUTION_TIME,
                 source_id=BACKFILL_TRIGGER_CLAIM_SOURCE,
@@ -774,7 +783,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             lease = await state_manager.get_state(
                 integration_id, "backfill_observations", BACKFILL_LEASE_SOURCE
             )
-            if claimed and not lease:
+            if claim_token and not lease:
                 # backfill_observations is an InternalActionConfiguration with no
                 # persisted portal config, so this MUST carry a non-empty config
                 # override — a bare trigger_action(..., "backfill_observations")
@@ -798,15 +807,22 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
                 f"Could not trigger backfill for integration {integration.id}: {describe_exception(e)}"
             )
         finally:
-            if claimed and not published:
+            if claim_token and not published:
                 # We consumed the per-window claim but never published, so no
                 # backfill command exists. Leaving the claim would suppress
                 # every other shard this tick AND the next (TTL is a full
                 # action budget); pre-sharding a lost trigger self-healed on
                 # the next run. Give the claim back (review finding).
+                #
+                # release_lease is compare-and-delete on claim_token: an
+                # unconditional delete-by-key could remove a SUCCESSOR's
+                # claim if this claim's own TTL expired and was re-acquired by
+                # another shard before this finally ran, permitting duplicate
+                # publication (review finding) — release_lease can never
+                # delete a lease it does not still hold the token for.
                 try:
-                    await state_manager.delete_state(
-                        integration_id, "backfill_observations",
+                    await state_manager.release_lease(
+                        integration_id, "backfill_observations", claim_token,
                         source_id=BACKFILL_TRIGGER_CLAIM_SOURCE,
                     )
                 except Exception as e:

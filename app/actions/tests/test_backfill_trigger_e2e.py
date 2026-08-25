@@ -69,7 +69,15 @@ async def test_pull_observations_trigger_actually_runs_backfill_end_to_end(mocke
 
     result = await action_pull_observations(lotek_integration, pull_config)
 
-    assert lease.await_count == 1, (
+    # acquire_lease is now called twice end-to-end: once for the shard's
+    # backfill-trigger claim (BACKFILL_TRIGGER_CLAIM_SOURCE), once for
+    # backfill_observations' own execution lease (BACKFILL_LEASE_SOURCE) —
+    # the latter is what actually proves the handler ran.
+    from app.actions.handlers import BACKFILL_LEASE_SOURCE
+    backfill_lease_calls = [
+        c for c in lease.await_args_list if c.kwargs.get("source_id") == BACKFILL_LEASE_SOURCE
+    ]
+    assert len(backfill_lease_calls) == 1, (
         f"backfill_observations never ran — the trigger's config resolution "
         f"short-circuited it. pull_observations result: {result}"
     )
@@ -93,19 +101,25 @@ async def test_claim_is_released_when_the_trigger_publish_fails(
     mocker.patch(
         "app.actions.handlers.trigger_action", side_effect=RuntimeError("pubsub down")
     )
-    # set_if_absent is granted by an autouse fixture (conftest's
-    # _grant_backfill_trigger_claim) and get_state returns {} (falsy, i.e. no
+    # acquire_lease is granted a fresh token by an autouse fixture (conftest's
+    # _grant_backfill_trigger_claim), but we need a KNOWN token here to assert
+    # release_lease is called with the SAME one (compare-and-delete — review
+    # finding), so pin it explicitly. get_state returns {} (falsy, i.e. no
     # lease yet) via _setup_pull_mocks above, so the claim is won and the
-    # publish is attempted. delete_state is also autouse-stubbed
-    # (_stub_state_delete); re-patch it here so this test can assert on it.
-    delete_state = mocker.patch.object(
-        IntegrationStateManager, "delete_state", new=AsyncMock(return_value=None)
+    # publish is attempted. release_lease is also autouse-stubbed; re-patch
+    # it here so this test can assert on it.
+    mocker.patch.object(
+        IntegrationStateManager, "acquire_lease", new=AsyncMock(return_value="claim-token")
+    )
+    release_lease = mocker.patch.object(
+        IntegrationStateManager, "release_lease", new=AsyncMock(return_value=True)
     )
 
     await action_pull_observations_shard(
         lotek_integration, PullObservationsShardConfig(devices=["1"])
     )
 
-    delete_state.assert_awaited_once()
-    assert delete_state.await_args.args[1] == "backfill_observations"
-    assert delete_state.await_args.kwargs["source_id"] == BACKFILL_TRIGGER_CLAIM_SOURCE
+    release_lease.assert_awaited_once()
+    assert release_lease.await_args.args[1] == "backfill_observations"
+    assert release_lease.await_args.args[2] == "claim-token"
+    assert release_lease.await_args.kwargs["source_id"] == BACKFILL_TRIGGER_CLAIM_SOURCE

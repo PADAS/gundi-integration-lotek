@@ -16,6 +16,26 @@ _RELEASE_LEASE_SCRIPT = (
     "return redis.call('del', KEYS[1]) else return 0 end"
 )
 
+# Same-token fast path: SET NX succeeds only when the key is absent, so a
+# lost reply on the attempt that actually won retries into a false refusal —
+# the retry's own SET NX sees the key it just created and reports "someone
+# else has it" (review finding). Recognizing the caller's own token as an
+# already-held lease (not just "absent") makes a retry of the exact same
+# acquire call idempotent, the same way _ACQUIRE_LUA's ZSCORE fast-path does
+# for the Lotek connection slot.
+_ACQUIRE_LEASE_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if current == false then
+    redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+    return 1
+end
+if current == ARGV[1] then
+    redis.call('EXPIRE', KEYS[1], ARGV[2])
+    return 1
+end
+return 0
+"""
+
 # Atomic field merge into a JSON-blob state key: decode the current document
 # (or start empty), overwrite only the fields in ARGV[1], re-encode. Redis
 # runs scripts atomically, so two writers updating disjoint fields can never
@@ -130,16 +150,23 @@ class IntegrationStateManager:
         self, integration_id: str, action_id: str, *, ttl_seconds: int, source_id: str = "no-source"
     ) -> Optional[str]:
         """Atomically acquire an ownership lease: SET NX of a unique token with
-        a TTL. Returns the token when acquired (pass it to release_lease), or
-        None when another holder already has the lease. Unlike set_if_absent,
-        the token lets the holder release without racing a successor that
-        acquired after the TTL expired.
+        a TTL, via a script with a same-token fast path (see
+        _ACQUIRE_LEASE_SCRIPT). Returns the token when acquired (pass it to
+        release_lease), or None when another holder already has the lease.
+        Unlike set_if_absent, the token lets the holder release without racing
+        a successor that acquired after the TTL expired.
+
+        The token is generated once, before the retry loop, and the fast path
+        makes a retry of this exact call safe: a lost reply on the attempt
+        that actually won no longer makes a retry see its own token and
+        falsely report "already held" (review finding) — the script
+        recognizes the caller's own token and reports success again.
         """
         token = str(uuid.uuid4())
         key = f"integration_state.{integration_id}.{action_id}.{source_id}"
         for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
-                was_set = await self.db_client.set(key, json.dumps(token), ex=ttl_seconds, nx=True)
+                was_set = await self.db_client.eval(_ACQUIRE_LEASE_SCRIPT, 1, key, json.dumps(token), ttl_seconds)
         return token if was_set else None
 
     async def release_lease(

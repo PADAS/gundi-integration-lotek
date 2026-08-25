@@ -3,7 +3,13 @@ import json
 
 import pytest
 from app.conftest import async_return
-from app.services.state import IntegrationStateManager, _INCREMENT_COUNTER_SCRIPT, _MERGE_STATE_SCRIPT
+from app.services.state import (
+    IntegrationStateManager,
+    _ACQUIRE_LEASE_SCRIPT,
+    _INCREMENT_COUNTER_SCRIPT,
+    _MERGE_STATE_SCRIPT,
+    _RELEASE_LEASE_SCRIPT,
+)
 
 
 @pytest.mark.asyncio
@@ -334,3 +340,97 @@ async def test_increment_counter_reraises_unrelated_response_error(mocker, integ
         )
 
     assert state_manager.db_client.eval.await_count == 1
+
+
+
+@pytest.mark.asyncio
+async def test_acquire_lease_calls_the_atomic_script(mocker, mock_redis, integration_v2):
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.state.uuid.uuid4", return_value="fixed-token")
+    mock_redis.Redis.return_value.eval.return_value = async_return(1)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+
+    token = await state_manager.acquire_lease(
+        integration_id, "backfill_observations", ttl_seconds=540, source_id="backfill_trigger_claim"
+    )
+
+    assert token == "fixed-token"
+    mock_redis.Redis.return_value.eval.assert_called_once_with(
+        _ACQUIRE_LEASE_SCRIPT,
+        1,
+        f"integration_state.{integration_id}.backfill_observations.backfill_trigger_claim",
+        json.dumps("fixed-token"),
+        540,
+    )
+
+
+@pytest.mark.asyncio
+async def test_acquire_lease_returns_none_when_a_different_token_already_holds_it(mocker, mock_redis, integration_v2):
+    mocker.patch("app.services.state.redis", mock_redis)
+    mock_redis.Redis.return_value.eval.return_value = async_return(0)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+
+    token = await state_manager.acquire_lease(
+        integration_id, "backfill_observations", ttl_seconds=540, source_id="backfill_trigger_claim"
+    )
+
+    assert token is None
+
+
+def test_acquire_lease_script_recognizes_its_own_token_before_the_ceiling_check():
+    """Script-text pin (no real Lua engine in this suite — same style as the
+    other Lua tests): a lost reply on the attempt that actually won must not
+    make a stamina retry of the SAME call see its own token and report
+    "already held" by someone else (review finding). The same-token branch
+    must be checked, and must return success (1), before falling through to
+    the generic "someone else holds it" refusal."""
+    script = _ACQUIRE_LEASE_SCRIPT
+
+    absent_at = script.find("current == false")
+    same_token_at = script.find("current == ARGV[1]")
+    refusal_at = script.rstrip().splitlines()[-1].strip()
+
+    assert -1 not in (absent_at, same_token_at)
+    assert absent_at < same_token_at
+    assert refusal_at == "return 0"
+    # Both the fresh-acquire and same-token branches return success.
+    assert script.count("return 1") == 2
+
+
+@pytest.mark.asyncio
+async def test_release_lease_is_compare_and_delete(mocker, mock_redis, integration_v2):
+    mocker.patch("app.services.state.redis", mock_redis)
+    mock_redis.Redis.return_value.eval.return_value = async_return(1)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+
+    deleted = await state_manager.release_lease(
+        integration_id, "backfill_observations", "my-token", source_id="backfill_trigger_claim"
+    )
+
+    assert deleted is True
+    mock_redis.Redis.return_value.eval.assert_called_once_with(
+        _RELEASE_LEASE_SCRIPT,
+        1,
+        f"integration_state.{integration_id}.backfill_observations.backfill_trigger_claim",
+        json.dumps("my-token"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_lease_does_not_delete_a_successors_lease(mocker, mock_redis, integration_v2):
+    """A stale releaser (its own lease already expired and re-acquired by
+    someone else) must not delete the new holder's lease — the script only
+    deletes when the stored token still matches the caller's."""
+    mocker.patch("app.services.state.redis", mock_redis)
+    mock_redis.Redis.return_value.eval.return_value = async_return(0)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+
+    deleted = await state_manager.release_lease(
+        integration_id, "backfill_observations", "stale-token", source_id="backfill_trigger_claim"
+    )
+
+    assert deleted is False
