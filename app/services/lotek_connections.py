@@ -31,9 +31,12 @@ SLOT_REDIS_RETRY = dict(attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3
 # finding). This floors the retry window on the first acquire pass only, so
 # every caller keeps the full 5-attempt policy on a brownout; the overrun is
 # bounded and only happens while Redis itself is unhealthy, where the action
-# is failing regardless. Value approximates SLOT_REDIS_RETRY's own worst case
-# (measured ~19.7s at attempts=5/wait_initial=1.0/wait_max=30/wait_jitter=3.0).
-SLOT_REDIS_RETRY_FLOOR = 20.0
+# is failing regardless. Value covers SLOT_REDIS_RETRY's worst case, derived
+# rather than sampled (Copilot review: a 20.0 floor taken from one ~19.7s
+# measurement could cut attempt 5 short on unlucky jitter): exponential waits
+# between attempts 1..5 are 1+2+4+8 = 15s, plus wait_jitter up to 3s on each
+# of the four waits = up to 27s of backoff, plus the eval calls themselves.
+SLOT_REDIS_RETRY_FLOOR = 30.0
 
 # Backpressure poll schedule for a saturated account budget. Jittered so that
 # N shards refused in the same millisecond do not retry in lockstep.

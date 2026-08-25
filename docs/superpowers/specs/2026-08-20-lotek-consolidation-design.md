@@ -120,9 +120,13 @@ healthier than it is. Alerting behaviour must be unchanged by this refactor.
 through the runner's generic `_handle_error`, which publishes `config_data` containing every
 integration configuration — the auth action's plaintext Lotek password included (see
 **GUNDI-5628**). The head pass already replaced this with an ERROR activity event plus a
-machine-readable result flag; backfill adopts the same form. This removes the last credential-
-leak-by-`raise` in the file and makes the two handlers' zero-progress contract identical,
-which is a precondition for them sharing the traversal cleanly.
+machine-readable result flag; backfill adopts the same form. This removes the last
+*zero-progress* raise path into that publish and makes the two handlers' zero-progress
+contract identical, which is a precondition for them sharing the traversal cleanly. It does
+NOT remove every leak-by-`raise` in the file: other raise paths (device-listing failures, the
+re-raised `LotekUnauthorizedException`, and the runner's own timeout) still route into
+`_handle_error`'s `config_data` publish and are tracked under **GUNDI-5628** (Copilot review:
+the earlier wording overclaimed).
 
 Behaviour change to note: the raise previously also broke the self-retrigger cascade. The
 replacement must keep that property explicitly — `zero_progress` suppresses `gaps_remaining`.
