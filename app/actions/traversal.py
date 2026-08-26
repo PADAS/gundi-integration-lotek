@@ -203,7 +203,7 @@ class DeviceTraversal:
                 # own members already got honest per-device outcomes above;
                 # grinding the remaining chunks through the same dead Redis
                 # would add nothing but noise and wasted budget.
-                self.stop_reason = self.stop_reason or "redis unavailable"
+                self.stop_reason = "redis unavailable"
                 self.guard_stopped_devices.extend(
                     key(item) for item in work[chunk_start + self.concurrency:]
                 )
