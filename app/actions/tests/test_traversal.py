@@ -202,6 +202,25 @@ async def test_mark_slot_starved_registers_caller_detected_starvation(integratio
 
 
 @pytest.mark.asyncio
+async def test_mark_deadline_cut_registers_caller_detected_deadline(integration):
+    """Copilot round 12: the deadline twin of mark_slot_starved. A backfill
+    device that advances a window and then hits the soft deadline on a later
+    acquire RETURNS partial progress — in a last/only chunk no boundary check
+    follows, so without caller registration the device vanished from
+    devices_deferred, no deadline deferral was logged, and stop_reason stayed
+    unset while its gap was unfinished."""
+    t = DeviceTraversal(integration, "act", FakeGuards(), concurrency=2)
+    _ = [item async for item, _ in t.run([1], key=str, process=_ok)]
+
+    t.mark_deadline_cut("1")
+
+    assert t.guard_stopped_devices == ["1"]
+    assert t.stop_reason == "deadline"
+    assert t.budget_starved is False          # deadline, not saturation
+    assert t.deferred_devices == ["1"]
+
+
+@pytest.mark.asyncio
 async def test_guard_stop_defers_the_unreached_tail(integration):
     t = DeviceTraversal(integration, "act", FakeGuards(stop_after=1), concurrency=2)
     seen = [item async for item, _ in t.run([1, 2, 3, 4], key=str, process=_ok)]

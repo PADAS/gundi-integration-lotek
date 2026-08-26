@@ -83,6 +83,17 @@ class DeviceTraversal:
         self.slot_starved_devices.append(device_id)
         self.budget_starved = True
 
+    def mark_deadline_cut(self, device_id):
+        """Caller-side deadline detection: the deadline twin of
+        mark_slot_starved (Copilot round 12). A device that made partial
+        progress and then crossed the soft deadline returns a result, so the
+        traversal never sees SlotWaitBudgetExhausted — and in a last/only
+        chunk no boundary check follows to set stop_reason. Registers the
+        device with the guard-stopped cohort and records the reason (never
+        overwriting one already set)."""
+        self.guard_stopped_devices.append(device_id)
+        self.stop_reason = self.stop_reason or "deadline"
+
     def mark_failed(self, device_id):
         """Caller-side failure: the device produced a result, but the result
         says it failed (e.g. delivery rejected)."""

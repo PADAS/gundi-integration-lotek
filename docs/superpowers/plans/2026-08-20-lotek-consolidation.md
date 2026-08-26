@@ -6,7 +6,7 @@
 
 **Architecture:** Per the approved spec `docs/superpowers/specs/2026-08-20-lotek-consolidation-design.md` (source of truth). `lotek_slot` becomes a bounded, deadline-aware wait so the Redis connection budget applies *backpressure* instead of *refusal*, making `LOTEK_MAX_CONNECTIONS` the only concurrency limit and demoting `FETCH_CONCURRENCY` / `SHARD_SIZE` to work-partitioning parameters. A new `DeviceTraversal` helper owns the chunked-loop mechanics shared by the head pass and the backfill; policy (re-trigger, deferral wording, zero-progress) stays in each handler.
 
-**Tech Stack:** Python 3.11, pydantic v1, httpx, stamina, redis.asyncio, pytest + pytest-asyncio + pytest-mock. Suite runs with `./venv/bin/python -m pytest app -q`.
+**Tech Stack:** Python 3.10 (pinned by `docker/Dockerfile` and CI's `_tests.yml`; this header originally said 3.11 and was corrected during execution — see the ledger's Ruling 3), pydantic v1, httpx, stamina, redis.asyncio, pytest + pytest-asyncio + pytest-mock. Suite runs with `.venv/bin/python -m pytest app -q` (the repo's `venv/` is a broken pyenv symlink; `.venv/` is the live one — Ruling 2).
 
 **Spec:** `docs/superpowers/specs/2026-08-20-lotek-consolidation-design.md`
 

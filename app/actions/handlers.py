@@ -1168,20 +1168,22 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     counts those actually-delivered windows: the caller only keeps the
     self-retrigger cascade going while some gap is really shrinking.
 
-    slot_starved marks a device that advanced at least one window and THEN
-    hit account saturation on a later window's acquire. Letting that
-    exception escape discarded the whole result — the run reported zero
-    progress for observations that were already delivered and checkpointed,
-    and skipped the last_backfilled fairness save (Copilot review, round
-    10). Saturation (or a mid-run deadline crossing) with NO progress still
-    raises, keeping the traversal's narrow-deferral contract.
+    cut_reason is None, "starved", or "deadline": a device that advanced at
+    least one window and THEN hit account saturation (or crossed the soft
+    deadline) on a later window's acquire. Letting those exceptions escape
+    discarded the whole result — the run reported zero progress for
+    observations already delivered and checkpointed, and skipped the
+    last_backfilled fairness save (Copilot rounds 10 and 12). Either cause
+    with NO progress still raises, keeping the traversal's narrow-deferral
+    contract. One field, not two booleans: the causes are mutually
+    exclusive and a reader should not have to check that both are not set.
     """
     integration_id = str(integration.id)
     observations_sent = 0
     device_failed = False
     transport_failure = False
     windows_advanced = 0
-    slot_starved = False
+    cut_reason = None
     for _ in range(BACKFILL_MAX_WINDOWS_PER_DEVICE):
         if not state.has_gap:
             break
@@ -1200,11 +1202,12 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
         except SlotWaitBudgetExhausted:
             if windows_advanced == 0:
                 raise
-            break  # deadline mid-device: keep the progress; the run stops at the next boundary
+            cut_reason = "deadline"
+            break  # deadline mid-device: keep the progress; caller records the stop
         except NoConnectionSlot:
             if windows_advanced == 0:
                 raise
-            slot_starved = True
+            cut_reason = "starved"
             break  # saturated mid-device: keep the progress, tell the caller to throttle
         if cdip_positions is None:
             device_failed = True
@@ -1237,7 +1240,7 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     await _save_device_state_fields(
         integration_id, device.nDeviceID, {"last_backfilled": state.last_backfilled}
     )
-    return observations_sent, device_failed, transport_failure, not state.has_gap, windows_advanced, slot_starved
+    return observations_sent, device_failed, transport_failure, not state.has_gap, windows_advanced, cut_reason
 
 
 @action_title("Backfill Observations")
@@ -1400,8 +1403,8 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 pair[0], pair[1], integration, auth, pull_config, guards
             ),
         ):
-            sent, device_failed, transport_failure, gap_closed, windows_advanced, dev_slot_starved = res
-            if dev_slot_starved:
+            sent, device_failed, transport_failure, gap_closed, windows_advanced, cut_reason = res
+            if cut_reason == "starved":
                 # Partial progress then saturation: the device returned a
                 # result instead of raising, so the traversal never saw the
                 # exception. Register it through the traversal's own
@@ -1410,6 +1413,15 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 # devices_deferred and the connection-budget WARNING —
                 # instead of the throttle being silent.
                 traversal.mark_slot_starved(device.nDeviceID)
+            elif cut_reason == "deadline":
+                # Partial progress then a soft-deadline crossing (Copilot
+                # round 12): register with the guard-stopped cohort so the
+                # device is reported deferred and the stop reason is
+                # recorded even when this was the last chunk. Deliberately
+                # does NOT touch budget_starved: a deadline is the
+                # fresh-budget continuation case, and the cascade must stay
+                # unthrottled.
+                traversal.mark_deadline_cut(device.nDeviceID)
             # Single recording site, mirroring the head pass.
             guards.record(transport_failure=transport_failure)
             observations_extracted += sent

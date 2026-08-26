@@ -139,8 +139,8 @@ async def test_backfill_device_keeps_window_one_progress_when_window_two_starves
 
     result = await _backfill_device(device, state, lotek_integration, object(), object(), object())
 
-    sent, device_failed, transport_failure, gap_closed, windows_advanced, slot_starved = result
-    assert (sent, windows_advanced, slot_starved) == (7, 1, True)
+    sent, device_failed, transport_failure, gap_closed, windows_advanced, cut_reason = result
+    assert (sent, windows_advanced, cut_reason) == (7, 1, "starved")
     assert device_failed is False
     # Window 1's checkpoint AND the fairness save both happened.
     saved_fields = [c.args[2] for c in save.await_args_list]
@@ -192,7 +192,7 @@ async def test_partial_starvation_still_throttles_the_cascade(
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
     mocker.patch(
         "app.actions.handlers._backfill_device",
-        new=AsyncMock(return_value=(7, False, False, False, 1, True)),  # partial + starved
+        new=AsyncMock(return_value=(7, False, False, False, 1, "starved")),  # partial + starved
     )
 
     result = await action_backfill_observations(
@@ -206,6 +206,36 @@ async def test_partial_starvation_still_throttles_the_cascade(
     # remaining windows were genuinely deferred by saturation, so it belongs
     # in devices_deferred and in the connection-budget deferral WARNING.
     assert result["devices_deferred"] == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_partial_deadline_cut_is_reported_as_deferred(
+    mocker, lotek_integration, mock_redis
+):
+    """Copilot round 12: a device that advances window 1 and then crosses the
+    soft deadline acquiring window 2's slot returns partial progress with
+    cut_reason="deadline". The handler must register it with the traversal so
+    it appears in devices_deferred with a recorded deadline stop — while the
+    cascade stays UNthrottled (a deadline is the movebank fresh-budget case,
+    unlike saturation)."""
+    _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"),
+        {"1": _gap_state(days_back_start=20, days_back_end=1)},
+    )
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    mocker.patch(
+        "app.actions.handlers._backfill_device",
+        new=AsyncMock(return_value=(7, False, False, False, 1, "deadline")),
+    )
+
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig(triggered_by="test")
+    )
+
+    assert result["devices_deferred"] == ["1"]
+    assert result["observations_extracted"] == 7
+    # Deadline does not suppress the cascade: fresh budget continues the drain.
+    trigger.assert_awaited_once()
 
 
 @pytest.mark.asyncio
