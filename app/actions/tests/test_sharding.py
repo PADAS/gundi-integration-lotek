@@ -169,6 +169,143 @@ async def test_shard_backend_outage_defers_tail_and_alerts_once(
 
 
 @pytest.mark.asyncio
+async def test_mixed_breaker_and_starvation_still_alerts(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """PR #20 review: a mixed run bypassed the outage alert the comment above
+    deferred_cleanly explicitly promises. Four devices time out (transport
+    failures, tripping the breaker) and one loses the slot race: the breaker
+    stop does not re-trigger, but budget_starved alone made deferred_cleanly
+    true, so a run whose failures were overwhelmingly Lotek transport errors
+    published no zero-progress ERROR. Starvation only explains a no-progress
+    run when nothing actually FAILED."""
+    from app.services.lotek_connections import NoConnectionSlot
+    from app.actions.handlers import action_pull_observations_shard
+
+    devices = [f"dev{i}" for i in range(5)]        # one chunk at FETCH_CONCURRENCY=5
+
+    async def fake_head_pass(device_id, *args, **kwargs):
+        if device_id == "dev4":
+            raise NoConnectionSlot("saturated")
+        # dev0-dev3: how a real Lotek timeout arrives — _fetch_window catches
+        # it internally and returns (None, True), so _head_pass_device reports
+        # (sent=0, device_failed=True, transport_failure=True). That last flag
+        # is what feeds the breaker; a RAISED timeout would be recorded as
+        # transport_failure=False and never trip it.
+        return (0, True, True)
+
+    _setup_pull_mocks(mocker, mock_redis, _devices(*devices))
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
+    mocker.patch("app.actions.handlers._retrigger_shard", new=AsyncMock(return_value="handed_off"))
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+
+    result = await action_pull_observations_shard(
+        lotek_integration, PullObservationsShardConfig(devices=devices)
+    )
+
+    assert result["devices_failed"]                 # real Lotek failures happened
+    assert result.get("zero_progress") is True      # must NOT be suppressed
+    error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
+    assert any("No devices could be serviced" in c.args[2] for c in error_calls)
+
+
+@pytest.mark.asyncio
+async def test_pure_starvation_with_no_failures_still_suppresses(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """The other side of the same fix: genuine pure starvation — nothing
+    failed, the account was simply saturated — remains a clean back-off and
+    must stay quiet, or every busy tick would page someone."""
+    from app.services.lotek_connections import NoConnectionSlot
+    from app.actions.handlers import action_pull_observations_shard
+
+    devices = ["dev0", "dev1"]
+
+    async def fake_head_pass(device_id, *args, **kwargs):
+        raise NoConnectionSlot("saturated")
+
+    _setup_pull_mocks(mocker, mock_redis, _devices(*devices))
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+
+    result = await action_pull_observations_shard(
+        lotek_integration, PullObservationsShardConfig(devices=devices)
+    )
+
+    assert result["devices_failed"] == []
+    assert "zero_progress" not in result            # suppressed, as designed
+    error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
+    assert not any("No devices could be serviced" in c.args[2] for c in error_calls)
+
+
+@pytest.mark.asyncio
+async def test_shard_dispatch_publishes_with_bounded_concurrency(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """PR #20 review: shard publishes were awaited serially, so a
+    commands-topic outage (publish_event burns ~36s before failing) could
+    exceed the 540s action budget before the loop reached every shard on a
+    616-device account (25 shards) — aborting the fan-out through the generic
+    failure path, contrary to the per-shard isolation contract. Publishes now
+    overlap within a bounded window."""
+    from app.actions.handlers import action_pull_observations, DISPATCH_CONCURRENCY
+
+    devices = [f"dev{i}" for i in range(75)]        # 3 shards at SHARD_SIZE=25
+    _setup_pull_mocks(mocker, mock_redis, _devices(*devices))
+
+    in_flight = 0
+    peak = 0
+
+    async def slow_trigger(*args, **kwargs):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+
+    mocker.patch("app.actions.handlers.trigger_action", side_effect=slow_trigger)
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert result["shards_triggered"] == 3
+    assert peak > 1                                  # genuinely overlapping
+    assert peak <= DISPATCH_CONCURRENCY              # and bounded
+
+
+@pytest.mark.asyncio
+async def test_shard_dispatch_failure_stays_isolated_under_concurrency(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """The isolation contract must survive the concurrency change: one
+    failing publish costs only its own shard's devices, and the rest still
+    dispatch."""
+    from app.actions.handlers import action_pull_observations
+
+    devices = [f"dev{i}" for i in range(75)]
+    _setup_pull_mocks(mocker, mock_redis, _devices(*devices))
+
+    calls = []
+
+    async def flaky_trigger(integration_id, action_id, config=None):
+        calls.append(config.devices)
+        if len(calls) == 2:
+            raise RuntimeError("pubsub down")
+
+    mocker.patch("app.actions.handlers.trigger_action", side_effect=flaky_trigger)
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert result["shards_triggered"] == 2
+    assert len(result["devices_undispatched"]) == 25
+    assert len(calls) == 3                           # every shard attempted
+    warn_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.WARNING]
+    assert warn_calls
+
+
+@pytest.mark.asyncio
 async def test_shard_zero_progress_without_backend_outage_still_alerts(
     mocker, lotek_integration, pull_config, mock_redis
 ):

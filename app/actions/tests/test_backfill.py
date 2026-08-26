@@ -386,6 +386,41 @@ async def test_backfill_zero_progress_backend_outage_alerts_exactly_once(
 
 
 @pytest.mark.asyncio
+async def test_backfill_mixed_failure_and_starvation_still_alerts(
+    mocker, lotek_integration, mock_redis
+):
+    """PR #20 review, the backfill twin: starvation was the only clean
+    explanation here, so one starved device silenced the zero-progress ERROR
+    for a run whose other devices genuinely failed."""
+    _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1", "2"),
+        {"1": _gap_state(days_back_start=20, days_back_end=1),
+         "2": _gap_state(days_back_start=20, days_back_end=1)},
+    )
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+
+    async def fake_backfill_device(device, *args, **kwargs):
+        if device.nDeviceID == "1":
+            return (0, True, True, False, 0, None)    # failed, no progress
+        # Zero-progress starvation RAISES (the round-10 contract); only
+        # partial progress returns a "starved" cut_reason. The traversal
+        # catches this and sets budget_starved.
+        from app.services.lotek_connections import NoConnectionSlot
+        raise NoConnectionSlot("saturated")
+
+    mocker.patch("app.actions.handlers._backfill_device", side_effect=fake_backfill_device)
+
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig(triggered_by="test")
+    )
+
+    assert result["devices_failed"] == ["1"]
+    assert result.get("zero_progress") is True
+    error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
+    assert any("No devices could be backfilled" in c.args[2] for c in error_calls)
+
+
+@pytest.mark.asyncio
 async def test_backfill_listing_deadline_exhaustion_is_not_a_capacity_skip(
     mocker, lotek_integration, mock_redis
 ):

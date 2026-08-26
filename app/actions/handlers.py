@@ -82,6 +82,16 @@ DISPATCHER_SKIP_STREAK_SOURCE = "slot_skip_streak"
 # fleet. Independent of SHARD_SIZE (this bounds Redis fan-out, not action
 # budget) — named so tuning one does not silently look like it covers the other.
 STATE_READ_CONCURRENCY = 25
+
+# How many shard commands the dispatcher publishes at once. Serial publishes
+# meant a commands-topic outage (publish_event burns ~36s of retries before
+# failing) could exceed the whole action budget before the loop reached every
+# shard on a large fleet — 25 shards x 36s far exceeds 540s — aborting the
+# fan-out through the runner's generic failure path and breaking the
+# per-shard isolation contract (PR #20 review). Bounded, not unbounded: the
+# publish path is the one GUNDI-5620 blamed for congestion, so this overlaps
+# enough to keep the worst case inside the budget without recreating it.
+DISPATCH_CONCURRENCY = 5
 # Outcomes of a deferred-tail re-trigger attempt (see _retrigger_shard).
 RETRIGGER_HANDED_OFF = "handed_off"
 RETRIGGER_CAP_REACHED = "cap_reached"
@@ -468,7 +478,10 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     shards = list(generate_batches(device_ids, SHARD_SIZE))
     dispatched = 0
     undispatched_devices = []
-    for shard in shards:
+
+    async def _dispatch_one(shard):
+        # Returns the shard on failure, None on success, so the caller can
+        # keep per-shard isolation while the publishes overlap.
         try:
             await trigger_action(
                 integration_id, "pull_observations_shard",
@@ -476,13 +489,32 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                     devices=shard, triggered_by="pull_observations", manual_run=manual_run
                 )
             )
-            dispatched += 1
+            return None
         except Exception as e:
-            undispatched_devices.extend(shard)
             logger.warning(
                 f"Could not dispatch a shard of {len(shard)} device(s) for integration "
                 f"{integration_id}: {describe_exception(e)}"
             )
+            return shard
+
+    for batch in generate_batches(shards, DISPATCH_CONCURRENCY):
+        # return_exceptions so an unexpected error in one publish cannot abort
+        # the batch — the same isolation the serial loop's try/except gave,
+        # preserved under concurrency.
+        outcomes = await asyncio.gather(
+            *(_dispatch_one(shard) for shard in batch), return_exceptions=True
+        )
+        for shard, outcome in zip(batch, outcomes):
+            if outcome is None:
+                dispatched += 1
+            elif isinstance(outcome, BaseException):
+                undispatched_devices.extend(shard)
+                logger.warning(
+                    f"Could not dispatch a shard of {len(shard)} device(s) for integration "
+                    f"{integration_id}: {describe_exception(outcome)}"
+                )
+            else:
+                undispatched_devices.extend(outcome)
     if undispatched_devices:
         message = (
             f"Dispatched {dispatched} of {len(shards)} shard(s) for integration "
@@ -755,7 +787,13 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
     # metric counts.
     deferred_cleanly = (
         retrigger_outcome in (RETRIGGER_HANDED_OFF, RETRIGGER_CAP_REACHED)
-        or traversal.budget_starved
+        # Starvation explains a no-progress run only when nothing actually
+        # FAILED (PR #20 review). A mixed run — four devices timing out on
+        # Lotek, tripping the breaker, plus one losing the slot race — used
+        # to be silenced by budget_starved alone, contradicting the comment
+        # above: a breaker stop must still alert. Failures mean the run has a
+        # real cause that is not capacity.
+        or (traversal.budget_starved and not failed_devices)
     )
     if traversal.backend_unavailable:
         # One action-level ERROR per run for a shared-backend outage (Copilot
@@ -1513,10 +1551,14 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         # Backfill's suppression policy differs from the shard's and is
         # preserved exactly: ONLY starvation explains a no-progress run here (a
         # budget-starved run is a clean back-off, not degradation). Deadline and
-        # breaker stops must still alert.
+        # breaker stops must still alert. And as in the shard, starvation
+        # explains the run only when nothing FAILED (PR #20 review): one
+        # starved device used to silence the alert for a run whose other
+        # devices genuinely failed.
         zero_progress = (
             gapped and traversal.serviced_devices == 0
-            and observations_extracted == 0 and not traversal.budget_starved
+            and observations_extracted == 0
+            and not (traversal.budget_starved and not failed_devices)
         )
         if zero_progress and not traversal.backend_unavailable:
             # See the head pass's twin: the dedicated Redis ERROR above is the
