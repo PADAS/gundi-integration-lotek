@@ -50,6 +50,7 @@ class DeviceTraversal:
         self.slot_starved_devices = []
         self.stop_reason: Optional[str] = None
         self.budget_starved = False
+        self.backend_unavailable = False
         self._yielded = 0
         self._marked_failed = 0
 
@@ -82,6 +83,17 @@ class DeviceTraversal:
         caller."""
         self.slot_starved_devices.append(device_id)
         self.budget_starved = True
+
+    def mark_backend_cut(self, device_id):
+        """The backend twin of mark_deadline_cut (Copilot round 13): a device
+        that made partial progress and then hit a Redis failure returns a
+        result, so the traversal never sees SlotBackendUnavailable. Registers
+        the remaining work as deferred and records the backend stop; the
+        caller decides the alerting (partial progress suppresses the
+        zero-progress ERROR, so the caller emits the backend ERROR itself)."""
+        self.guard_stopped_devices.append(device_id)
+        self.stop_reason = self.stop_reason or "redis unavailable"
+        self.backend_unavailable = True
 
     def mark_deadline_cut(self, device_id):
         """Caller-side deadline detection: the deadline twin of
@@ -133,8 +145,14 @@ class DeviceTraversal:
                     # the portal health signal (Copilot review, round 5).
                     # Fall through to the failure branch below: ERROR-logged,
                     # counted failed, retried next run. Ordered BEFORE the
-                    # NoConnectionSlot check — it is a subclass.
-                    pass
+                    # NoConnectionSlot check — it is a subclass. This is also
+                    # an ACCOUNT-WIDE backend failure, not device evidence
+                    # (Copilot round 13): the flag below stops the traversal
+                    # after this chunk, so a persistent outage costs one
+                    # chunk's per-device ERRORs plus the caller's action-level
+                    # one — not an ERROR and a full bounded acquire for every
+                    # remaining device in the fan-out.
+                    self.backend_unavailable = True
                 elif isinstance(res, SlotWaitBudgetExhausted):
                     # The run crossed its soft deadline mid-chunk: DEADLINE
                     # policy, not starvation. budget_starved must stay clear
@@ -180,3 +198,13 @@ class DeviceTraversal:
                     continue
                 self._yielded += 1
                 yield item, res
+            if self.backend_unavailable:
+                # Shared-backend failure: stop after this chunk. The chunk's
+                # own members already got honest per-device outcomes above;
+                # grinding the remaining chunks through the same dead Redis
+                # would add nothing but noise and wasted budget.
+                self.stop_reason = self.stop_reason or "redis unavailable"
+                self.guard_stopped_devices.extend(
+                    key(item) for item in work[chunk_start + self.concurrency:]
+                )
+                return

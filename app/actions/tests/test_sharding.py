@@ -126,6 +126,42 @@ async def test_pull_observations_reports_redis_unavailable_as_an_error(
 
 
 @pytest.mark.asyncio
+async def test_shard_backend_outage_defers_tail_and_alerts_once(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """Copilot round 13: a Redis outage mid-shard used to publish one ERROR
+    per remaining device. The traversal now stops after the chunk that hit
+    it, the untouched tail defers, and the shard adds ONE action-level
+    ERROR — bounded noise (chunk's per-device ERRORs + one) instead of
+    hundreds across the fan-out."""
+    from app.services.lotek_connections import SlotBackendUnavailable
+    from app.actions.handlers import action_pull_observations_shard
+
+    devices = [f"dev{i}" for i in range(10)]
+    attempted = []
+
+    async def fake_head_pass(device_id, *args, **kwargs):
+        attempted.append(device_id)
+        raise SlotBackendUnavailable("redis down")
+
+    _setup_pull_mocks(mocker, mock_redis, _devices(*devices))
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
+    mocker.patch("app.actions.handlers._retrigger_shard", new=AsyncMock(return_value="handed_off"))
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+
+    result = await action_pull_observations_shard(
+        lotek_integration, PullObservationsShardConfig(devices=devices)
+    )
+
+    # Only the first chunk was attempted; the tail deferred without grinding.
+    assert len(attempted) == 5
+    assert len(result["devices_deferred"]) == 5
+    error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
+    assert any("edis" in c.args[2] for c in error_calls)  # action-level Redis ERROR present
+
+
+@pytest.mark.asyncio
 async def test_pull_observations_dispatches_nothing_for_empty_device_list(
     mocker, lotek_integration, pull_config, mock_redis
 ):

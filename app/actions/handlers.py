@@ -757,6 +757,18 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         retrigger_outcome in (RETRIGGER_HANDED_OFF, RETRIGGER_CAP_REACHED)
         or traversal.budget_starved
     )
+    if traversal.backend_unavailable:
+        # One action-level ERROR per run for a shared-backend outage (Copilot
+        # round 13); see the backfill handler's twin for the rationale.
+        message = (
+            f"Redis unavailable during shard for integration {integration.id}: "
+            f"stopped after the current chunk; {len(traversal.deferred_devices)} device(s) deferred."
+        )
+        logger.error(message)
+        await _try_log_activity(
+            integration_id, "pull_observations_shard", message, LogLevel.ERROR
+        )
+
     zero_progress = (
         device_states and traversal.serviced_devices == 0
         and observations_extracted == 0 and not deferred_cleanly
@@ -1162,13 +1174,13 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     device's gap.
 
     Returns (observations_sent, device_failed, transport_failure, gap_closed,
-    windows_advanced, slot_starved). gap_start advances only past windows that
+    windows_advanced, cut_reason). gap_start advances only past windows that
     were actually delivered, so a failure re-fetches the same window next
     trigger (re-sends are tolerated, silent skips are not). windows_advanced
     counts those actually-delivered windows: the caller only keeps the
     self-retrigger cascade going while some gap is really shrinking.
 
-    cut_reason is None, "starved", or "deadline": a device that advanced at
+    cut_reason is None, "starved", "deadline", or "backend": a device that advanced at
     least one window and THEN hit account saturation (or crossed the soft
     deadline) on a later window's acquire. Letting those exceptions escape
     discarded the whole result — the run reported zero progress for
@@ -1195,10 +1207,16 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
                 device.nDeviceID, integration, auth, pull_config, window_start, upper_date, guards, "backfill_observations"
             )
         except SlotBackendUnavailable:
-            # Redis-down is loud by design; and progress requires a
-            # successful checkpoint save, so this after progress is
-            # near-impossible anyway.
-            raise
+            # Redis-down after progress is reachable: the window-1 checkpoint
+            # save and window-2's acquire are not simultaneous, and a
+            # brownout can start in between (Copilot round 13 — the earlier
+            # "progress requires a successful save" rationale assumed they
+            # were). Zero progress still raises; partial progress is kept
+            # and reported as a backend cut.
+            if windows_advanced == 0:
+                raise
+            cut_reason = "backend"
+            break
         except SlotWaitBudgetExhausted:
             if windows_advanced == 0:
                 raise
@@ -1413,6 +1431,12 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 # devices_deferred and the connection-budget WARNING —
                 # instead of the throttle being silent.
                 traversal.mark_slot_starved(device.nDeviceID)
+            elif cut_reason == "backend":
+                # Partial progress then Redis failure (Copilot round 13):
+                # remaining work defers, the backend stop is recorded, and
+                # the one-shot ERROR below moves the health signal — partial
+                # progress means the zero-progress ERROR cannot (round 5).
+                traversal.mark_backend_cut(device.nDeviceID)
             elif cut_reason == "deadline":
                 # Partial progress then a soft-deadline crossing (Copilot
                 # round 12): register with the guard-stopped cohort so the
@@ -1500,6 +1524,21 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         # retriggering on has_gap alone spun an unthrottled tight loop that
         # re-fetched and re-sent the same window forever (review finding) —
         # no-progress runs now wait for the next head-pass cadence instead.
+        if traversal.backend_unavailable:
+            # One action-level ERROR per run for a shared-backend outage
+            # (Copilot round 13): the traversal already stopped after the
+            # chunk that hit it, and per-device ERRORs cover that chunk; this
+            # is the health-signal summary — and the only ERROR at all when
+            # partial progress suppressed the zero-progress one.
+            message = (
+                f"Redis unavailable during backfill for integration {integration_id}: "
+                f"stopped after the current chunk; {len(traversal.deferred_devices)} device(s) deferred."
+            )
+            logger.error(message)
+            await _try_log_activity(
+                integration_id, "backfill_observations", message, LogLevel.ERROR
+            )
+
         breaker_hot = guards.consecutive_transport_failures >= BREAKER_THRESHOLD
         gaps_remaining = (
             any(state.has_gap for _, state in gapped)
@@ -1517,6 +1556,11 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             # removed raise used to guarantee this by unwinding before the
             # re-trigger below; now it has to be explicit (spec D7).
             and not zero_progress
+            # Re-triggering into a dead Redis is pointless — the next run's
+            # own lease acquire would fail against the same outage (Copilot
+            # round 13). The next scheduled head pass re-triggers once Redis
+            # is back.
+            and not traversal.backend_unavailable
         )
         result = {
             'observations_extracted': observations_extracted,

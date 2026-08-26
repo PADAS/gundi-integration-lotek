@@ -239,6 +239,70 @@ async def test_partial_deadline_cut_is_reported_as_deferred(
 
 
 @pytest.mark.asyncio
+async def test_backfill_device_keeps_progress_when_redis_dies_before_window_two(
+    mocker, lotek_integration
+):
+    """Copilot round 13: re-raising SlotBackendUnavailable discarded window
+    1's delivered-and-checkpointed progress when Redis died before window
+    2's acquire — the "progress requires a successful save" rationale
+    assumed the save and the next acquire were simultaneous; a brownout can
+    start in between. Zero-progress backend failure still raises."""
+    from app.actions.handlers import _backfill_device
+    from app.actions.device_state import DeviceState
+    from app.services.lotek_connections import SlotBackendUnavailable
+
+    now = datetime.now(timezone.utc)
+    state = DeviceState(
+        high_water=now,
+        gap_start=now - timedelta(days=20), gap_end=now - timedelta(days=1),
+    )
+    device = _devices("d1")[0]
+
+    mocker.patch(
+        "app.actions.handlers._fetch_window",
+        new=AsyncMock(side_effect=[(["pos"], False), SlotBackendUnavailable("redis down")]),
+    )
+    mocker.patch("app.actions.handlers._deliver", new=AsyncMock(return_value=(7, False)))
+    mocker.patch("app.actions.handlers._save_device_state_fields", new=AsyncMock())
+
+    result = await _backfill_device(device, state, lotek_integration, object(), object(), object())
+    sent, device_failed, transport_failure, gap_closed, windows_advanced, cut_reason = result
+    assert (sent, windows_advanced, cut_reason) == (7, 1, "backend")
+    assert device_failed is False
+
+
+@pytest.mark.asyncio
+async def test_partial_backend_cut_defers_and_alerts_once(
+    mocker, lotek_integration, mock_redis
+):
+    """A backend cut after partial progress must stay visible: the device's
+    remaining work is deferred, the cascade is throttled (re-triggering into
+    a dead Redis is pointless), and ONE action-level ERROR moves the health
+    signal — partial progress means the zero-progress ERROR cannot fire, so
+    without this the outage would be WARNING-only (round-5 contract)."""
+    _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"),
+        {"1": _gap_state(days_back_start=20, days_back_end=1)},
+    )
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+    mocker.patch(
+        "app.actions.handlers._backfill_device",
+        new=AsyncMock(return_value=(7, False, False, False, 1, "backend")),
+    )
+
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig(triggered_by="test")
+    )
+
+    assert result["devices_deferred"] == ["1"]
+    assert result["observations_extracted"] == 7
+    trigger.assert_not_awaited()
+    error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
+    assert len(error_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_backfill_listing_deadline_exhaustion_is_not_a_capacity_skip(
     mocker, lotek_integration, mock_redis
 ):

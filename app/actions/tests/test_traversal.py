@@ -221,6 +221,55 @@ async def test_mark_deadline_cut_registers_caller_detected_deadline(integration)
 
 
 @pytest.mark.asyncio
+async def test_backend_unavailable_stops_the_traversal_after_the_chunk(integration, mocker):
+    """Copilot round 13: SlotBackendUnavailable is an ACCOUNT-WIDE backend
+    failure, but it was handled as an isolated device failure with
+    transport_failure=False — the breaker never opened, so a persistent
+    Redis outage made every remaining device grind through its full bounded
+    acquire and publish an ERROR each (potentially hundreds across the
+    fan-out). A shared-backend failure now stops the traversal after the
+    current chunk: peers in the chunk keep their results, the untouched
+    tail defers under stop_reason "redis unavailable", and budget_starved
+    stays clear (this is not saturation)."""
+    from app.services.lotek_connections import SlotBackendUnavailable
+
+    log = mocker.patch("app.actions.traversal.log_action_activity", new=AsyncMock())
+
+    async def process(i):
+        if i == 2:
+            raise SlotBackendUnavailable("redis down")
+        return f"r{i}"
+
+    t = DeviceTraversal(integration, "act", FakeGuards(), concurrency=2)
+    seen = [item async for item, _ in t.run([1, 2, 3, 4, 5], key=str, process=process)]
+
+    assert seen == [1]                          # chunk peer kept its result
+    assert t.failed_devices == ["2"]            # the device that hit it: per-device ERROR
+    assert log.await_count == 1
+    assert t.guard_stopped_devices == ["3", "4", "5"]  # untouched tail deferred
+    assert t.stop_reason == "redis unavailable"
+    assert t.backend_unavailable is True
+    assert t.budget_starved is False
+
+
+@pytest.mark.asyncio
+async def test_mark_backend_cut_registers_partial_progress_backend_failure(integration):
+    """The backend twin of mark_deadline_cut: a backfill device that advanced
+    a window and then hit a Redis failure RETURNS partial progress, so the
+    traversal never sees the exception — register the remaining work as
+    deferred and record the backend stop."""
+    t = DeviceTraversal(integration, "act", FakeGuards(), concurrency=2)
+    _ = [item async for item, _ in t.run([1], key=str, process=_ok)]
+
+    t.mark_backend_cut("1")
+
+    assert t.guard_stopped_devices == ["1"]
+    assert t.stop_reason == "redis unavailable"
+    assert t.backend_unavailable is True
+    assert t.budget_starved is False
+
+
+@pytest.mark.asyncio
 async def test_guard_stop_defers_the_unreached_tail(integration):
     t = DeviceTraversal(integration, "act", FakeGuards(stop_after=1), concurrency=2)
     seen = [item async for item, _ in t.run([1, 2, 3, 4], key=str, process=_ok)]
