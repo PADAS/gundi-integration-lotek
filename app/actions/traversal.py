@@ -71,6 +71,18 @@ class DeviceTraversal:
         # zero progress — which alerts.
         return self._yielded - self._marked_failed
 
+    def mark_slot_starved(self, device_id):
+        """Caller-side starvation: the device returned a result (it made
+        partial progress before hitting saturation), so the traversal never
+        saw the NoConnectionSlot — but its remaining work was genuinely
+        deferred by a saturated account and must be visible as such:
+        in devices_deferred, in the connection-budget WARNING, and in the
+        callers' budget_starved policy (Copilot round 11). Mirrors
+        mark_failed: bookkeeping lives here, detection lives with the
+        caller."""
+        self.slot_starved_devices.append(device_id)
+        self.budget_starved = True
+
     def mark_failed(self, device_id):
         """Caller-side failure: the device produced a result, but the result
         says it failed (e.g. delivery rejected)."""
@@ -122,8 +134,16 @@ class DeviceTraversal:
                     # share the same clock and fraction), so the caller's
                     # deadline disposition — the shard's re-trigger included —
                     # picks this device up with the tail. Ordered BEFORE the
-                    # NoConnectionSlot check — it is a subclass.
+                    # NoConnectionSlot check — it is a subclass. Recording the
+                    # reason here matters for the LAST chunk (Copilot round
+                    # 11): with no next boundary should_stop() call,
+                    # stop_reason stayed None and the caller neither logged
+                    # nor re-triggered the deferral — and could emit a
+                    # spurious zero-progress ERROR. Exhaustion IS a deadline
+                    # detection on the same clock, so it records the same
+                    # reason (never overwriting a reason already set).
                     self.guard_stopped_devices.append(device_id)
+                    self.stop_reason = self.stop_reason or "deadline"
                     continue
                 elif isinstance(res, NoConnectionSlot):
                     # Account budget saturated for longer than this run can wait:

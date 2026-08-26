@@ -202,6 +202,44 @@ async def test_partial_starvation_still_throttles_the_cascade(
     assert result["observations_extracted"] == 7
     assert result["gaps_closed"] == 0
     trigger.assert_not_awaited()   # cascade throttled despite windows_advanced > 0
+    # Copilot round 11: the throttle must not be silent — the device's
+    # remaining windows were genuinely deferred by saturation, so it belongs
+    # in devices_deferred and in the connection-budget deferral WARNING.
+    assert result["devices_deferred"] == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_listing_deadline_exhaustion_is_not_a_capacity_skip(
+    mocker, lotek_integration, mock_redis
+):
+    """Copilot round 11 (inline): SlotWaitBudgetExhausted subclasses
+    NoConnectionSlot, so the listing's quiet capacity-saturation catch
+    swallowed it and reported reason="no_connection_slot" though no capacity
+    check ever ran. Near-unreachable with the default 540s budget (the
+    listing runs on a fresh ~432s budget) but MAX_ACTION_EXECUTION_TIME is
+    env-configurable, and a deadline stop in the backfill must carry the
+    ERROR its policy pins."""
+    from contextlib import asynccontextmanager
+    from app.services.lotek_connections import SlotWaitBudgetExhausted
+
+    _, _, _, release, _ = _setup_backfill_mocks(mocker, mock_redis, [], {})
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+
+    @asynccontextmanager
+    async def exhausted_slot(username, **kwargs):
+        raise SlotWaitBudgetExhausted("soft deadline crossed")
+        yield
+
+    mocker.patch("app.actions.handlers.lotek_slot", exhausted_slot)
+
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig(triggered_by="test")
+    )
+
+    assert result == {"skipped": True, "reason": "deadline_exhausted"}
+    assert try_log.await_count == 1
+    assert try_log.await_args.args[3] is LogLevel.ERROR
+    release.assert_awaited_once()
 
 
 @pytest.mark.asyncio

@@ -1302,6 +1302,26 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 integration_id, "backfill_observations", message, LogLevel.ERROR
             )
             return {"skipped": True, "reason": "redis_unavailable"}
+        except SlotWaitBudgetExhausted as e:
+            # The run crossed its soft deadline before the listing finished —
+            # near-unreachable with the default 540s budget (the listing runs
+            # on a fresh ~432s budget) but MAX_ACTION_EXECUTION_TIME is
+            # env-configurable. This is DEADLINE policy, not capacity: the
+            # subclass fell into the quiet saturation catch below and
+            # reported "no_connection_slot" though no capacity check ever
+            # ran (Copilot round 11). A backfill deadline stop with zero
+            # progress alerts — same contract as the traversal's deadline
+            # stop. Ordered BEFORE NoConnectionSlot (subclass).
+            message = (
+                f"Backfill for integration {integration_id} exhausted its action "
+                f"budget before listing devices: {describe_exception(e)}. "
+                f"Open gaps are retried on the next trigger."
+            )
+            logger.error(message)
+            await _try_log_activity(
+                integration_id, "backfill_observations", message, LogLevel.ERROR
+            )
+            return {"skipped": True, "reason": "deadline_exhausted"}
         except NoConnectionSlot:
             # Account budget saturated by head-pass shards: back off quietly.
             # The lease releases via the finally; open gaps re-trigger on the
@@ -1362,7 +1382,6 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         observations_extracted = 0
         gaps_closed = 0
         windows_advanced_total = 0
-        partial_starvation = False
 
         async for (device, state), res in traversal.run(
             gapped,
@@ -1374,11 +1393,13 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             sent, device_failed, transport_failure, gap_closed, windows_advanced, dev_slot_starved = res
             if dev_slot_starved:
                 # Partial progress then saturation: the device returned a
-                # result instead of raising, so traversal.budget_starved
-                # never got set — but a mid-device starvation is the same
-                # evidence of a saturated account, and the cascade must not
-                # re-trigger straight back into it (Copilot review, round 10).
-                partial_starvation = True
+                # result instead of raising, so the traversal never saw the
+                # exception. Register it through the traversal's own
+                # bookkeeping (Copilot rounds 10+11): the cascade throttles
+                # via budget_starved, AND the device stays visible — in
+                # devices_deferred and the connection-budget WARNING —
+                # instead of the throttle being silent.
+                traversal.mark_slot_starved(device.nDeviceID)
             # Single recording site, mirroring the head pass.
             guards.record(transport_failure=transport_failure)
             observations_extracted += sent
@@ -1469,7 +1490,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             # holding it. Unlike the shard cascade this one has no generation
             # cap, so the throttle has to come from here; the next scheduled
             # head pass re-triggers it once the budget frees up.
-            and not (traversal.budget_starved or partial_starvation)
+            and not traversal.budget_starved
             # A wholly-failing backfill must not re-trigger itself forever. The
             # removed raise used to guarantee this by unwinding before the
             # re-trigger below; now it has to be explicit (spec D7).

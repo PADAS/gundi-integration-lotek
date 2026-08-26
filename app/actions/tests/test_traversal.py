@@ -174,6 +174,31 @@ async def test_wait_budget_exhaustion_defers_as_deadline_not_starvation(integrat
     assert t.slot_starved_devices == []
     assert t.budget_starved is False          # must NOT mimic saturation
     assert t.failed_devices == []
+    # Copilot round 11: in the LAST (or only) chunk there is no next
+    # chunk-boundary should_stop() call, so without recording the reason here
+    # stop_reason stayed None — the shard neither logged nor re-triggered the
+    # deferral and could emit a spurious zero-progress ERROR. Exhaustion IS a
+    # deadline detection on the same clock, so it records the same reason.
+    assert t.stop_reason == "deadline"
+
+
+@pytest.mark.asyncio
+async def test_mark_slot_starved_registers_caller_detected_starvation(integration):
+    """Copilot round 11: a backfill device that advances a window and then
+    starves RETURNS a result (round 10), so the traversal never sees the
+    exception — the device vanished from devices_deferred and no
+    connection-budget WARNING said why the cascade throttled. The caller
+    reports it through the same bookkeeping the exception path uses,
+    mirroring mark_failed."""
+    t = DeviceTraversal(integration, "act", FakeGuards(), concurrency=2)
+    _ = [item async for item, _ in t.run([1], key=str, process=_ok)]
+
+    t.mark_slot_starved("1")
+
+    assert t.slot_starved_devices == ["1"]
+    assert t.budget_starved is True
+    assert t.deferred_devices == ["1"]
+    assert t.failed_devices == []
 
 
 @pytest.mark.asyncio
