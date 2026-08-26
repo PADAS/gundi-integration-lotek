@@ -110,6 +110,101 @@ async def test_backfill_reports_redis_unavailable_as_an_error_and_releases_the_l
 
 
 @pytest.mark.asyncio
+async def test_backfill_device_keeps_window_one_progress_when_window_two_starves(
+    mocker, lotek_integration
+):
+    """Copilot review, round 10: a device can deliver and checkpoint window 1,
+    then starve acquiring a slot for window 2. Letting the exception escape
+    discarded the whole result — the run reported zero observations and zero
+    windows advanced for progress that really happened (and skipped the
+    last_backfilled fairness save). Partial progress must be returned, with a
+    starvation flag so the handler can still throttle the cascade."""
+    from app.actions.handlers import _backfill_device
+    from app.actions.device_state import DeviceState
+    from app.services.lotek_connections import NoConnectionSlot
+
+    now = datetime.now(timezone.utc)
+    state = DeviceState(
+        high_water=now,
+        gap_start=now - timedelta(days=20), gap_end=now - timedelta(days=1),
+    )
+    device = _devices("d1")[0]
+
+    fetch = mocker.patch(
+        "app.actions.handlers._fetch_window",
+        new=AsyncMock(side_effect=[(["pos"], False), NoConnectionSlot("saturated")]),
+    )
+    mocker.patch("app.actions.handlers._deliver", new=AsyncMock(return_value=(7, False)))
+    save = mocker.patch("app.actions.handlers._save_device_state_fields", new=AsyncMock())
+
+    result = await _backfill_device(device, state, lotek_integration, object(), object(), object())
+
+    sent, device_failed, transport_failure, gap_closed, windows_advanced, slot_starved = result
+    assert (sent, windows_advanced, slot_starved) == (7, 1, True)
+    assert device_failed is False
+    # Window 1's checkpoint AND the fairness save both happened.
+    saved_fields = [c.args[2] for c in save.await_args_list]
+    assert any("gap_start" in f for f in saved_fields)
+    assert any("last_backfilled" in f for f in saved_fields)
+    assert fetch.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_backfill_device_still_raises_when_starved_before_any_progress(
+    mocker, lotek_integration
+):
+    """Zero-progress starvation keeps the exception contract: the traversal's
+    narrow-deferral path (defer this device, set budget_starved) is correct
+    when nothing was delivered."""
+    from app.actions.handlers import _backfill_device
+    from app.actions.device_state import DeviceState
+    from app.services.lotek_connections import NoConnectionSlot
+
+    now = datetime.now(timezone.utc)
+    state = DeviceState(
+        high_water=now,
+        gap_start=now - timedelta(days=20), gap_end=now - timedelta(days=1),
+    )
+    device = _devices("d1")[0]
+
+    mocker.patch(
+        "app.actions.handlers._fetch_window",
+        new=AsyncMock(side_effect=NoConnectionSlot("saturated")),
+    )
+    mocker.patch("app.actions.handlers._save_device_state_fields", new=AsyncMock())
+
+    with pytest.raises(NoConnectionSlot):
+        await _backfill_device(device, state, lotek_integration, object(), object(), object())
+
+
+@pytest.mark.asyncio
+async def test_partial_starvation_still_throttles_the_cascade(
+    mocker, lotek_integration, mock_redis
+):
+    """A device that advanced a window and then starved is evidence the
+    account budget is saturated — the self-retrigger must not fire straight
+    back into it, even though traversal.budget_starved never got set (the
+    device returned a result instead of raising)."""
+    get_positions, _, _, _, _ = _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"),
+        {"1": _gap_state(days_back_start=20, days_back_end=1)},
+    )
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    mocker.patch(
+        "app.actions.handlers._backfill_device",
+        new=AsyncMock(return_value=(7, False, False, False, 1, True)),  # partial + starved
+    )
+
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig(triggered_by="test")
+    )
+
+    assert result["observations_extracted"] == 7
+    assert result["gaps_closed"] == 0
+    trigger.assert_not_awaited()   # cascade throttled despite windows_advanced > 0
+
+
+@pytest.mark.asyncio
 async def test_backfill_skips_when_integration_is_paused(
     mocker, lotek_integration, mock_redis
 ):

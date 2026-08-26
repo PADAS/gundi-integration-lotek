@@ -151,6 +151,32 @@ async def test_backend_unavailable_is_a_failure_not_starvation(integration, mock
 
 
 @pytest.mark.asyncio
+async def test_wait_budget_exhaustion_defers_as_deadline_not_starvation(integration):
+    """Copilot review, round 10: an exhausted computed budget means the run
+    crossed its soft deadline mid-chunk — that is DEADLINE policy, not
+    capacity starvation. Classifying it as starvation set budget_starved,
+    which mislabelled the deferral log and suppressed the backfill's
+    zero-progress ERROR (its only clean-deferral case is real saturation).
+    The device defers with the guard-stopped cohort — the shard's deadline
+    re-trigger picks it up — and budget_starved stays untouched."""
+    from app.services.lotek_connections import SlotWaitBudgetExhausted
+
+    async def process(i):
+        if i == 1:
+            raise SlotWaitBudgetExhausted("soft deadline crossed")
+        return f"r{i}"
+
+    t = DeviceTraversal(integration, "act", FakeGuards(), concurrency=3)
+    seen = [item async for item, _ in t.run([1, 2, 3], key=str, process=process)]
+
+    assert seen == [2, 3]                     # peers unaffected
+    assert t.guard_stopped_devices == ["1"]   # deadline cohort, not starved
+    assert t.slot_starved_devices == []
+    assert t.budget_starved is False          # must NOT mimic saturation
+    assert t.failed_devices == []
+
+
+@pytest.mark.asyncio
 async def test_guard_stop_defers_the_unreached_tail(integration):
     t = DeviceTraversal(integration, "act", FakeGuards(stop_after=1), concurrency=2)
     seen = [item async for item, _ in t.run([1, 2, 3, 4], key=str, process=_ok)]

@@ -45,6 +45,17 @@ class NoConnectionSlot(Exception):
     """Raised when the Lotek connection budget for a username is exhausted."""
 
 
+class SlotWaitBudgetExhausted(NoConnectionSlot):
+    """Raised at entry when a QUEUEING caller's computed budget is already
+    <= 0: the run crossed its soft deadline mid-chunk. This is DEADLINE
+    policy, not capacity starvation — classifying it as plain
+    NoConnectionSlot set budget_starved, which mislabelled the deferral log
+    ("connection budget exhausted") and, in the backfill, suppressed the
+    zero-progress ERROR that a genuine deadline stop is pinned to emit
+    (Copilot review, round 10). Subclasses NoConnectionSlot so an unaware
+    caller still degrades to the safe non-raising path."""
+
+
 class SlotBackendUnavailable(NoConnectionSlot):
     """Raised when the slot could not be acquired because REDIS failed, not
     because the account is saturated. Subclasses NoConnectionSlot so a caller
@@ -167,9 +178,9 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300,
         # no time left, and even one socket-bounded attempt costs up to ~10s
         # of the 108s hard-deadline margin. Cause-free: this is budget
         # exhaustion, not a Redis failure and not (necessarily) saturation.
-        raise NoConnectionSlot(
-            f"No Lotek connection slot available within 0.0s "
-            f"(limit {settings.LOTEK_MAX_CONNECTIONS})."
+        raise SlotWaitBudgetExhausted(
+            f"Lotek connection-slot queueing budget exhausted (soft deadline "
+            f"crossed mid-run; limit {settings.LOTEK_MAX_CONNECTIONS})."
         )
 
     client = _client()

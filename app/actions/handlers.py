@@ -24,7 +24,9 @@ from app.actions.core import action_title, describe_exception
 from app.actions.device_state import DeviceState
 from app.actions.traversal import DeviceTraversal
 from app.services.action_scheduler import trigger_action
-from app.services.lotek_connections import lotek_slot, NoConnectionSlot, SlotBackendUnavailable
+from app.services.lotek_connections import (
+    lotek_slot, NoConnectionSlot, SlotBackendUnavailable, SlotWaitBudgetExhausted,
+)
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.state import IntegrationStateManager
 from gundi_core.schemas.v2.gundi import LogLevel
@@ -1150,26 +1152,50 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     device's gap.
 
     Returns (observations_sent, device_failed, transport_failure, gap_closed,
-    windows_advanced). gap_start advances only past windows that were actually
-    delivered, so a failure re-fetches the same window next trigger (re-sends
-    are tolerated, silent skips are not). windows_advanced counts those
-    actually-delivered windows: the caller only keeps the self-retrigger
-    cascade going while some gap is really shrinking.
+    windows_advanced, slot_starved). gap_start advances only past windows that
+    were actually delivered, so a failure re-fetches the same window next
+    trigger (re-sends are tolerated, silent skips are not). windows_advanced
+    counts those actually-delivered windows: the caller only keeps the
+    self-retrigger cascade going while some gap is really shrinking.
+
+    slot_starved marks a device that advanced at least one window and THEN
+    hit account saturation on a later window's acquire. Letting that
+    exception escape discarded the whole result — the run reported zero
+    progress for observations that were already delivered and checkpointed,
+    and skipped the last_backfilled fairness save (Copilot review, round
+    10). Saturation (or a mid-run deadline crossing) with NO progress still
+    raises, keeping the traversal's narrow-deferral contract.
     """
     integration_id = str(integration.id)
     observations_sent = 0
     device_failed = False
     transport_failure = False
     windows_advanced = 0
+    slot_starved = False
     for _ in range(BACKFILL_MAX_WINDOWS_PER_DEVICE):
         if not state.has_gap:
             break
         window_start = state.gap_start
         upper_date = min(state.gap_end, state.gap_start + BACKFILL_WINDOW)
 
-        cdip_positions, transport_failure = await _fetch_window(
-            device.nDeviceID, integration, auth, pull_config, window_start, upper_date, guards, "backfill_observations"
-        )
+        try:
+            cdip_positions, transport_failure = await _fetch_window(
+                device.nDeviceID, integration, auth, pull_config, window_start, upper_date, guards, "backfill_observations"
+            )
+        except SlotBackendUnavailable:
+            # Redis-down is loud by design; and progress requires a
+            # successful checkpoint save, so this after progress is
+            # near-impossible anyway.
+            raise
+        except SlotWaitBudgetExhausted:
+            if windows_advanced == 0:
+                raise
+            break  # deadline mid-device: keep the progress; the run stops at the next boundary
+        except NoConnectionSlot:
+            if windows_advanced == 0:
+                raise
+            slot_starved = True
+            break  # saturated mid-device: keep the progress, tell the caller to throttle
         if cdip_positions is None:
             device_failed = True
             break
@@ -1201,7 +1227,7 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     await _save_device_state_fields(
         integration_id, device.nDeviceID, {"last_backfilled": state.last_backfilled}
     )
-    return observations_sent, device_failed, transport_failure, not state.has_gap, windows_advanced
+    return observations_sent, device_failed, transport_failure, not state.has_gap, windows_advanced, slot_starved
 
 
 @action_title("Backfill Observations")
@@ -1336,6 +1362,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         observations_extracted = 0
         gaps_closed = 0
         windows_advanced_total = 0
+        partial_starvation = False
 
         async for (device, state), res in traversal.run(
             gapped,
@@ -1344,7 +1371,14 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 pair[0], pair[1], integration, auth, pull_config, guards
             ),
         ):
-            sent, device_failed, transport_failure, gap_closed, windows_advanced = res
+            sent, device_failed, transport_failure, gap_closed, windows_advanced, dev_slot_starved = res
+            if dev_slot_starved:
+                # Partial progress then saturation: the device returned a
+                # result instead of raising, so traversal.budget_starved
+                # never got set — but a mid-device starvation is the same
+                # evidence of a saturated account, and the cascade must not
+                # re-trigger straight back into it (Copilot review, round 10).
+                partial_starvation = True
             # Single recording site, mirroring the head pass.
             guards.record(transport_failure=transport_failure)
             observations_extracted += sent
@@ -1435,7 +1469,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             # holding it. Unlike the shard cascade this one has no generation
             # cap, so the throttle has to come from here; the next scheduled
             # head pass re-triggers it once the budget frees up.
-            and not traversal.budget_starved
+            and not (traversal.budget_starved or partial_starvation)
             # A wholly-failing backfill must not re-trigger itself forever. The
             # removed raise used to guarantee this by unwinding before the
             # re-trigger below; now it has to be explicit (spec D7).

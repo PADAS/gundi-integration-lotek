@@ -7,7 +7,9 @@ from gundi_core.events import LogLevel
 from app.actions.client import LotekUnauthorizedException
 from app.actions.core import describe_exception
 from app.services.activity_logger import log_action_activity
-from app.services.lotek_connections import NoConnectionSlot, SlotBackendUnavailable
+from app.services.lotek_connections import (
+    NoConnectionSlot, SlotBackendUnavailable, SlotWaitBudgetExhausted,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +112,19 @@ class DeviceTraversal:
                     # counted failed, retried next run. Ordered BEFORE the
                     # NoConnectionSlot check — it is a subclass.
                     pass
+                elif isinstance(res, SlotWaitBudgetExhausted):
+                    # The run crossed its soft deadline mid-chunk: DEADLINE
+                    # policy, not starvation. budget_starved must stay clear
+                    # (it mislabels the log and suppresses the backfill's
+                    # zero-progress ERROR — Copilot review, round 10). The
+                    # device joins the guard-stopped cohort: guards.should_stop
+                    # returns "deadline" at the next chunk boundary (the two
+                    # share the same clock and fraction), so the caller's
+                    # deadline disposition — the shard's re-trigger included —
+                    # picks this device up with the tail. Ordered BEFORE the
+                    # NoConnectionSlot check — it is a subclass.
+                    self.guard_stopped_devices.append(device_id)
+                    continue
                 elif isinstance(res, NoConnectionSlot):
                     # Account budget saturated for longer than this run can wait:
                     # not a device failure and not evidence about Lotek. Defer

@@ -516,12 +516,20 @@ async def test_exhausted_computed_budget_defers_immediately_without_touching_red
     A computed budget of <= 0 now means "no time left at all": defer
     immediately, cause-free, with zero Redis calls. Fail-fast is spelled
     max_wait_seconds=None (the default), not 0."""
-    from app.services.lotek_connections import SlotBackendUnavailable
+    from app.services.lotek_connections import (
+        SlotBackendUnavailable, SlotWaitBudgetExhausted,
+    )
 
-    with pytest.raises(NoConnectionSlot) as exc_info:
+    with pytest.raises(SlotWaitBudgetExhausted) as exc_info:
         async with lotek_slot("user@example.com", max_wait_seconds=0.0):
             pytest.fail("body must not run")
 
+    # Round 10: a distinct type, because plain NoConnectionSlot made the
+    # traversal set budget_starved — "connection budget exhausted" in the
+    # logs, and in the backfill a suppressed zero-progress ERROR, when the
+    # truth was a mid-run deadline crossing. Still a NoConnectionSlot
+    # subclass so an unaware caller degrades safely.
+    assert isinstance(exc_info.value, NoConnectionSlot)
     assert not isinstance(exc_info.value, SlotBackendUnavailable)
     assert exc_info.value.__cause__ is None
     fake_redis.eval.assert_not_awaited()   # zero acquire attempts
