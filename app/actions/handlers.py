@@ -773,7 +773,16 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         device_states and traversal.serviced_devices == 0
         and observations_extracted == 0 and not deferred_cleanly
     )
-    if zero_progress:
+    if zero_progress and not traversal.backend_unavailable:
+        # The `and not backend_unavailable` guard keeps ONE action-level ERROR
+        # per incident (Copilot round 14): a Redis outage before any device is
+        # serviced makes this run BOTH zero-progress and backend-unavailable,
+        # so the dedicated Redis ERROR above and this generic one both fired —
+        # counting a single incident twice in the ERROR-driven health metric.
+        # The Redis event is strictly more diagnostic, so it wins; the
+        # zero_progress flag itself stays true for the result payload and the
+        # backfill-trigger gate below.
+        #
         # Zero progress: nothing serviced, nothing delivered, and no deferred
         # tail re-dispatched — systemic degradation that must alert rather than
         # pass as a clean completion. A successfully re-triggered deferral is
@@ -1497,7 +1506,12 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             gapped and traversal.serviced_devices == 0
             and observations_extracted == 0 and not traversal.budget_starved
         )
-        if zero_progress:
+        if zero_progress and not traversal.backend_unavailable:
+            # See the head pass's twin: the dedicated Redis ERROR above is the
+            # single action-level event for a backend outage, so this generic
+            # one is skipped when that fired (Copilot round 14). zero_progress
+            # stays true for the result flag and the cascade gate.
+            #
             # Same systemic-degradation contract as the head pass. Reported, NOT
             # raised: raising routes through the runner's generic _handle_error,
             # which publishes config_data containing every integration

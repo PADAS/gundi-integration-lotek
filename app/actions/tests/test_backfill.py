@@ -303,6 +303,40 @@ async def test_partial_backend_cut_defers_and_alerts_once(
 
 
 @pytest.mark.asyncio
+async def test_backfill_zero_progress_backend_outage_alerts_exactly_once(
+    mocker, lotek_integration, mock_redis
+):
+    """Copilot round 14: when Redis dies before ANY device is serviced, the
+    run is zero-progress AND backend_unavailable, so both the generic
+    zero-progress ERROR and the dedicated Redis ERROR fired — one incident
+    counted twice in the ERROR-driven health metric. Exactly one ERROR, and
+    it is the diagnostic Redis one; the zero_progress result flag and the
+    cascade suppression both survive."""
+    from app.services.lotek_connections import SlotBackendUnavailable
+
+    _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1"),
+        {"1": _gap_state(days_back_start=20, days_back_end=1)},
+    )
+    trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+    mocker.patch(
+        "app.actions.handlers._backfill_device",
+        side_effect=SlotBackendUnavailable("redis down"),
+    )
+
+    result = await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig(triggered_by="test")
+    )
+
+    assert result["zero_progress"] is True     # flag preserved for the result
+    trigger.assert_not_awaited()               # cascade still suppressed
+    error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
+    assert len(error_calls) == 1
+    assert "Redis unavailable" in error_calls[0].args[2]
+
+
+@pytest.mark.asyncio
 async def test_backfill_listing_deadline_exhaustion_is_not_a_capacity_skip(
     mocker, lotek_integration, mock_redis
 ):

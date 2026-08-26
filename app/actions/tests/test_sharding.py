@@ -159,6 +159,39 @@ async def test_shard_backend_outage_defers_tail_and_alerts_once(
     assert len(result["devices_deferred"]) == 5
     error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
     assert any("edis" in c.args[2] for c in error_calls)  # action-level Redis ERROR present
+    # Copilot round 14: this run IS zero-progress (every attempted device hit
+    # the outage), so the generic zero-progress ERROR used to fire too —
+    # double-counting one incident in the ERROR-driven health metric and
+    # breaking the "one action-level ERROR per run" contract the backend
+    # branch introduced. Exactly one, and it is the diagnostic Redis one.
+    assert len(error_calls) == 1
+    assert "No devices could be serviced" not in error_calls[0].args[2]
+
+
+@pytest.mark.asyncio
+async def test_shard_zero_progress_without_backend_outage_still_alerts(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """Guard the other side of round 14's fix: suppressing the generic ERROR
+    is conditional on the backend event having been published. An ordinary
+    zero-progress run (per-device failures, Redis fine) must still emit it."""
+    from app.actions.handlers import action_pull_observations_shard
+
+    devices = ["dev0", "dev1"]
+    _setup_pull_mocks(mocker, mock_redis, _devices(*devices))
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch(
+        "app.actions.handlers._head_pass_device", side_effect=ValueError("boom"),
+    )
+    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+
+    result = await action_pull_observations_shard(
+        lotek_integration, PullObservationsShardConfig(devices=devices)
+    )
+
+    assert result["zero_progress"] is True
+    error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
+    assert any("No devices could be serviced" in c.args[2] for c in error_calls)
 
 
 @pytest.mark.asyncio
