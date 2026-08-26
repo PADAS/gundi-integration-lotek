@@ -41,9 +41,15 @@ is the root of symptom 1. After this change:
 
 | Constant | Role | Is it a concurrency limit? |
 |---|---|---|
-| `LOTEK_MAX_CONNECTIONS` (20) | Account-wide ceiling on simultaneous Lotek requests, enforced in Redis across invocations | **Yes — the only one** |
-| `FETCH_CONCURRENCY` (5) | How many devices one invocation processes per chunk | No — in-process batching |
-| `SHARD_SIZE` (25) | How much work fits in one action budget | No — work partitioning |
+| `LOTEK_MAX_CONNECTIONS` (20) | Account-wide ceiling on simultaneous Lotek requests, enforced in Redis across invocations | **Yes — the only cross-invocation one, and the only one that bounds total load on the account** |
+| `FETCH_CONCURRENCY` (5) | How many devices one invocation gathers per chunk | Yes, but only **per-invocation** — it caps in-flight requests inside one shard, and may oversubscribe the account ceiling |
+| `SHARD_SIZE` (25) | How much work fits in one action budget | No — pure work partitioning; shards are separate invocations, so their overlap is set by the scheduler and the account ceiling |
+
+*(PR #20 review corrected this table: it previously said `FETCH_CONCURRENCY` was
+"not a concurrency limit", which is false — `DeviceTraversal` gathers one
+coroutine per device in each chunk. The real distinction is per-invocation
+versus cross-invocation, not limit versus non-limit. Raising `FETCH_CONCURRENCY`
+adds queued coroutines, not throughput; raise `LOTEK_MAX_CONNECTIONS` for that.)*
 
 `FETCH_CONCURRENCY` and `SHARD_SIZE` become *work-partitioning* parameters that may
 oversubscribe the budget freely, because the budget itself now applies backpressure instead

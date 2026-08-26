@@ -54,15 +54,23 @@ BREAKER_THRESHOLD = 3
 BACKFILL_MAX_WINDOWS_PER_DEVICE = 2
 BACKFILL_WINDOW = timedelta(days=7)
 BACKFILL_LEASE_SOURCE = "lease"
-# How many devices one invocation processes per chunk. WORK PARTITIONING, not a
-# concurrency limit: the account-wide ceiling is LOTEK_MAX_CONNECTIONS, enforced
-# in Redis by lotek_slot, which now WAITS rather than refusing. Chunk size may
-# freely oversubscribe that ceiling — the budget applies backpressure (spec D1).
+# How many devices one invocation processes per chunk. This IS a per-invocation
+# concurrency limit — DeviceTraversal gathers one coroutine per device in the
+# chunk — but it is NOT the account ceiling (PR #20 review: an earlier version
+# of this comment said "not a concurrency limit", which was wrong). The
+# account-wide, cross-invocation ceiling is LOTEK_MAX_CONNECTIONS, enforced in
+# Redis by lotek_slot, which WAITS rather than refusing; chunk size may
+# oversubscribe it because the budget applies backpressure (spec D1). Raising
+# this does not buy throughput against Lotek — it just parks more coroutines at
+# the slot.
 FETCH_CONCURRENCY = 5
 # How much work fits in one action budget, i.e. how the dispatcher partitions
-# the fleet across sub-actions. WORK PARTITIONING, not a concurrency limit —
-# see FETCH_CONCURRENCY. Do not shrink this to "fit" LOTEK_MAX_CONNECTIONS;
-# that reintroduces the coupling spec D1 removed.
+# the fleet across sub-actions. Pure work partitioning: unlike
+# FETCH_CONCURRENCY this really does not bound concurrency at all — shards run
+# as separate pubsub-triggered invocations, so their overlap is decided by the
+# scheduler and LOTEK_MAX_CONNECTIONS, never by this number. Do not shrink it
+# to "fit" LOTEK_MAX_CONNECTIONS; that reintroduces the coupling spec D1
+# removed.
 SHARD_SIZE = 25
 # Re-trigger governor (review finding, PR #20 discussion): a deferred tail may
 # hop to a fresh shard at most this many times before falling back to the next

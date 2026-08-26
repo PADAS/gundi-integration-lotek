@@ -32,9 +32,14 @@ class DeviceTraversal:
         self.integration_id = str(integration.id)
         self.action_id = action_id
         self.guards = guards
-        # Work partitioning, not a concurrency limit — the account-wide ceiling
-        # lives in the Redis slot (spec D1). Callers pass their chunk width; the
-        # default of 1 just means "one device per chunk".
+        # Chunk width: run() gathers one coroutine per device in a chunk, so
+        # this DOES bound in-flight requests for this invocation (PR #20
+        # review — this comment previously denied being a concurrency limit,
+        # which was wrong here of all places, since the gather is five lines
+        # away). What it does not bound is the ACCOUNT: that ceiling lives in
+        # the Redis slot and holds across invocations (spec D1), so a chunk
+        # may oversubscribe it and the slot queues. Callers pass their chunk
+        # width; the default of 1 means "one device per chunk".
         self.concurrency = concurrency
         self.failed_devices = []
         # Two reason-specific lists, not one combined `deferred_devices`:
