@@ -449,7 +449,7 @@ async def test_fail_fast_caller_completes_the_policy_even_with_slow_attempts(
     """Copilot review, rounds 7/8: with 5s socket timeouts, five attempts plus
     backoff can total ~77s — any clock bound derived for this (20s, then 30s)
     cancelled the policy mid-brownout for the fail-fast dispatcher. The bare
-    policy is the FAIL-FAST caller's contract only: max_wait_seconds=0 means
+    policy is the FAIL-FAST caller's contract only: max_wait_seconds=None means
     "do not queue behind a busy account", not "cut my Redis retries" — the
     dispatcher has the whole 540s action budget behind it. Slow attempts must
     all run, and the give-up must chain the RedisError (policy exhausted),
@@ -466,7 +466,7 @@ async def test_fail_fast_caller_completes_the_policy_even_with_slow_attempts(
     fake_redis.eval = AsyncMock(side_effect=slow_failing_eval)
 
     with pytest.raises(SlotBackendUnavailable) as exc_info:
-        async with lotek_slot("user@example.com", max_wait_seconds=0):
+        async with lotek_slot("user@example.com"):
             pytest.fail("body must not run")
 
     assert fake_redis.eval.await_count == SLOT_REDIS_RETRY["attempts"]
@@ -503,6 +503,29 @@ async def test_positive_budget_bounds_the_first_pass_too(fake_redis, monkeypatch
     assert fake_redis.eval.await_count < SLOT_REDIS_RETRY["attempts"]
     assert isinstance(exc_info.value.__cause__, asyncio.TimeoutError)
     assert elapsed < 0.5  # bounded by the budget, not by the ~77s policy
+
+
+@pytest.mark.asyncio
+async def test_exhausted_computed_budget_defers_immediately_without_touching_redis(
+    fake_redis,
+):
+    """Copilot review, round 9: _slot_wait_budget returns 0.0 once the soft
+    deadline is crossed mid-run, and 0 used to be indistinguishable from the
+    dispatcher's fail-fast sentinel — so an exhausted shard got the bare ~77s
+    Redis policy exactly when only the 108s hard-deadline margin remained.
+    A computed budget of <= 0 now means "no time left at all": defer
+    immediately, cause-free, with zero Redis calls. Fail-fast is spelled
+    max_wait_seconds=None (the default), not 0."""
+    from app.services.lotek_connections import SlotBackendUnavailable
+
+    with pytest.raises(NoConnectionSlot) as exc_info:
+        async with lotek_slot("user@example.com", max_wait_seconds=0.0):
+            pytest.fail("body must not run")
+
+    assert not isinstance(exc_info.value, SlotBackendUnavailable)
+    assert exc_info.value.__cause__ is None
+    fake_redis.eval.assert_not_awaited()   # zero acquire attempts
+    fake_redis.zrem.assert_not_awaited()   # nothing granted, nothing to release
 
 
 def test_slot_client_is_socket_bounded(monkeypatch):

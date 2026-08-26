@@ -121,16 +121,32 @@ async def close_connection_client() -> None:
 
 
 @asynccontextmanager
-async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds: float = 0.0):
+async def lotek_slot(username: str, *, ttl_seconds: int = 300,
+                     max_wait_seconds: Optional[float] = None):
     """Acquire one Lotek connection slot for `username`, shared across every
     shard/backfill invocation on the same Redis.
 
-    With `max_wait_seconds > 0` a saturated budget makes the caller QUEUE
+    `max_wait_seconds` is the caller's SATURATION-queueing budget, and its
+    three shapes mean three different things (Copilot review, round 9 — 0 used
+    to double as the fail-fast sentinel, so a shard whose computed budget hit
+    0 mid-run inherited the dispatcher's bare ~77s Redis policy exactly when
+    only the hard-deadline margin remained):
+
+    - `None` (the default) — a FAIL-FAST caller (the dispatcher): never queue
+      behind a busy account, but run the full Redis retry policy on a
+      brownout; its whole action budget stands behind it.
+    - `> 0` — a QUEUEING caller: poll for a slot up to this many seconds,
+      with every Redis pass clock-bounded by it too.
+    - `<= 0` — a queueing caller whose computed budget is already exhausted
+      (the soft deadline passed mid-run): defer IMMEDIATELY, cause-free,
+      without touching Redis at all.
+
+    With a positive budget, a saturated account makes the caller QUEUE
     (jittered poll) rather than fail: fan-out deliberately oversubscribes the
     ceiling, so refusing on first contention aborted whole shards and turned
     ordinary large-fleet ticks into zero-progress churn (spec D2). The wait is
     capped by the caller's remaining action budget, so queueing can never cause
-    a timeout that failing fast would have avoided. NoConnectionSlot now means
+    a timeout that failing fast would have avoided. NoConnectionSlot means
     "saturated for longer than I can afford to wait".
 
     Slots are members of a per-username sorted set scored by expiry time, so a
@@ -145,13 +161,25 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds:
     somehow outlives the TTL only soft-fails (one extra admission until the
     next purge).
     """
+    if max_wait_seconds is not None and max_wait_seconds <= 0:
+        # A computed queueing budget that is already spent. No Redis call is
+        # worth making: whether a slot is free is irrelevant to a caller with
+        # no time left, and even one socket-bounded attempt costs up to ~10s
+        # of the 108s hard-deadline margin. Cause-free: this is budget
+        # exhaustion, not a Redis failure and not (necessarily) saturation.
+        raise NoConnectionSlot(
+            f"No Lotek connection slot available within 0.0s "
+            f"(limit {settings.LOTEK_MAX_CONNECTIONS})."
+        )
+
     client = _client()
     key = connection_key(username)
     # One token for the whole acquire, including every wait poll: the Lua's
     # ZSCORE fast-path re-grants an already-held slot, so re-using the token is
     # what makes a lost reply safe (Task 1).
     token = str(uuid.uuid4())
-    deadline = time.monotonic() + max(0.0, max_wait_seconds)
+    # Only queueing callers have a deadline; the fail-fast branch never reads it.
+    deadline = None if max_wait_seconds is None else time.monotonic() + max_wait_seconds
     backoff = SLOT_WAIT_POLL_INITIAL
     acquired = 0
 
@@ -175,9 +203,13 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds:
                 f"Failed to release Lotek connection slot on {reason} "
                 f"(will expire via TTL): {cleanup_exc}"
             )
+        budget_desc = (
+            "without queueing (fail-fast)" if max_wait_seconds is None
+            else f"within {max_wait_seconds:.1f}s"
+        )
         message = (
-            f"No Lotek connection slot available within "
-            f"{max_wait_seconds:.1f}s (limit {settings.LOTEK_MAX_CONNECTIONS})."
+            f"No Lotek connection slot available {budget_desc} "
+            f"(limit {settings.LOTEK_MAX_CONNECTIONS})."
         )
         if exc is not None:
             # `exc` is the Redis-side failure that caused this give-up, when
@@ -202,27 +234,30 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds:
 
     while True:
         acquired = 0
-        if max_wait_seconds <= 0:
-            # A FAIL-FAST caller (the dispatcher). max_wait_seconds=0 means
-            # "do not queue behind a busy account", not "cut my Redis
-            # retries": this caller has the whole 540s action budget behind
-            # it, so on a brownout it runs D5's full retry policy BARE —
-            # intrinsically bounded by the per-attempt socket timeouts
-            # (SLOT_REDIS_SOCKET_TIMEOUT) plus stamina's capped backoff
-            # (~77s worst case), with no clock to derive wrong (a derived
-            # floor was wrong twice: 20s from one sample, then 30s ignoring
-            # the socket timeouts — Copilot rounds 3 and 7). A fail-fast
-            # caller never loops: saturation gives up at the bottom of this
-            # pass. Positive budgets take the clock-bounded branch below on
-            # EVERY pass including the first — a queueing caller's budget is
-            # its remaining soft-deadline, and a fetch entering near the 432s
-            # soft deadline that spent ~77s on Redis retries would overrun
-            # the 540s hard timeout into _handle_error's config_data publish
-            # (Copilot review, round 8).
+        if max_wait_seconds is None:
+            # A FAIL-FAST caller (the dispatcher). None means "do not queue
+            # behind a busy account", not "cut my Redis retries": this caller
+            # has the whole 540s action budget behind it, so on a brownout it
+            # runs D5's full retry policy BARE — intrinsically bounded by the
+            # per-attempt socket timeouts (SLOT_REDIS_SOCKET_TIMEOUT) plus
+            # stamina's capped backoff (~77s worst case), with no clock to
+            # derive wrong (a derived floor was wrong twice: 20s from one
+            # sample, then 30s ignoring the socket timeouts — Copilot rounds
+            # 3 and 7). The sentinel is None, NOT 0: a queueing caller's
+            # computed budget legitimately reaches 0 once the soft deadline
+            # passes mid-run, and 0-as-fail-fast handed that exhausted caller
+            # this bare ~77s policy exactly when only the hard-deadline
+            # margin remained (Copilot review, round 9) — a <= 0 budget now
+            # defers at entry instead. This branch never loops: saturation
+            # gives up right here. Positive budgets take the clock-bounded
+            # branch below on EVERY pass including the first (round 8).
             try:
                 acquired = await _retry_policy()
             except redis.RedisError as exc:
                 await _give_up("retry give-up", exc)
+            if acquired:
+                break
+            await _give_up("give-up")
         else:
             retry_window = deadline - time.monotonic()
             if retry_window <= 0:
