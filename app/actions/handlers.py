@@ -323,16 +323,26 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 await client.get_token(integration, auth)
                 # Deliberately fail-fast here (no max_wait_seconds), unlike
                 # every per-device/backfill acquire, which now waits. This is
-                # not an inconsistency to "harmonise" away — it is the
-                # system's anti-tick-overlap governor. A saturated shard can
-                # legitimately occupy its whole invocation for up to
-                # DEADLINE_FRACTION * MAX_ACTION_EXECUTION_TIME (~432s)
-                # waiting for a slot instead of exiting in seconds. If this
-                # dispatcher acquire also waited, tick N+1's shards would pile
-                # onto tick N's queue and the account would never drain — a
-                # positive feedback loop. Refusing fast here skips the whole
-                # tick instead, and SHARD_RETRIGGER_CAP is the secondary
-                # damper. Do not add max_wait_seconds to this call.
+                # not an inconsistency to "harmonise" away, but be precise
+                # about what it buys (Copilot review): it is a PARTIAL
+                # tick-overlap damper, not a governor. It samples
+                # INSTANTANEOUS saturation — shards release their slot
+                # between requests while they deliver and checkpoint, so a
+                # transiently free slot usually exists even under full load,
+                # and an overlapping tick can still fan out. Overlap itself
+                # is tolerated by design and predates sharding: at-least-once
+                # pubsub already re-runs whole ticks, cursors make re-fetches
+                # idempotent, re-sends are tolerated, and SHARD_RETRIGGER_CAP
+                # bounds each tick's total work. What refusing fast DOES buy:
+                # this dispatcher never spends its own budget queueing behind
+                # shard work (a wait here delays the freshest-first ordering
+                # of the NEXT fan-out), and a fully-saturated instant — the
+                # one case sampling can see — skips the tick outright. A
+                # per-account outstanding-work lease would close the gap
+                # fully, but its completion detection (when is a fan-out of
+                # independent pubsub shards "done"?) is a new coordination
+                # mechanism guarding an already-tolerated hazard — rejected
+                # for now. Do not add max_wait_seconds to this call.
                 async with lotek_slot(auth.username):
                     device_list = await client.get_devices(integration, auth)
     except SlotBackendUnavailable as e:
