@@ -443,33 +443,66 @@ async def test_genuine_saturation_is_never_the_backend_type(fake_redis, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_first_pass_completes_the_policy_even_when_attempts_outlast_the_budget(
+async def test_fail_fast_caller_completes_the_policy_even_with_slow_attempts(
     fake_redis, monkeypatch
 ):
-    """Copilot review, round 7: with 5s socket timeouts, five attempts plus
-    backoff can total ~77s — any clock bound derived for the first pass (20s,
-    then 30s) cancelled it mid-policy, recreating the shortened brownout
-    handling for the fail-fast dispatcher. Here each attempt takes longer
-    than the caller's entire queueing budget; every attempt must still run,
-    and the give-up must chain the RedisError (policy exhausted), never a
-    TimeoutError (clock cut)."""
+    """Copilot review, rounds 7/8: with 5s socket timeouts, five attempts plus
+    backoff can total ~77s — any clock bound derived for this (20s, then 30s)
+    cancelled the policy mid-brownout for the fail-fast dispatcher. The bare
+    policy is the FAIL-FAST caller's contract only: max_wait_seconds=0 means
+    "do not queue behind a busy account", not "cut my Redis retries" — the
+    dispatcher has the whole 540s action budget behind it. Slow attempts must
+    all run, and the give-up must chain the RedisError (policy exhausted),
+    never a TimeoutError (clock cut)."""
     from redis.exceptions import RedisError
     from app.services.lotek_connections import SLOT_REDIS_RETRY, SlotBackendUnavailable
 
     _fast_stamina(monkeypatch)  # zero the BACKOFF sleeps; attempt duration below
 
     async def slow_failing_eval(*args, **kwargs):
-        await asyncio.sleep(0.01)  # one attempt outlasts the whole 0.001s budget
+        await asyncio.sleep(0.01)
         raise RedisError("brownout")
 
     fake_redis.eval = AsyncMock(side_effect=slow_failing_eval)
 
     with pytest.raises(SlotBackendUnavailable) as exc_info:
-        async with lotek_slot("user@example.com", max_wait_seconds=0.001):
+        async with lotek_slot("user@example.com", max_wait_seconds=0):
             pytest.fail("body must not run")
 
     assert fake_redis.eval.await_count == SLOT_REDIS_RETRY["attempts"]
     assert isinstance(exc_info.value.__cause__, RedisError)
+
+
+@pytest.mark.asyncio
+async def test_positive_budget_bounds_the_first_pass_too(fake_redis, monkeypatch):
+    """Copilot review, round 8: a QUEUEING caller's max_wait_seconds is its
+    remaining soft-deadline budget — a fetch entering near the 432s soft
+    deadline that spends ~77s retrying Redis and then starts a slow Lotek
+    read overruns the 540s hard timeout, which routes through _handle_error's
+    config_data publish. For positive budgets the clock must bind from the
+    FIRST attempt: here each attempt outlasts the whole budget, so the pass
+    is cut early with the TimeoutError chained, instead of running all five
+    attempts."""
+    from redis.exceptions import RedisError
+    from app.services.lotek_connections import SLOT_REDIS_RETRY, SlotBackendUnavailable
+
+    _fast_stamina(monkeypatch)
+
+    async def slow_failing_eval(*args, **kwargs):
+        await asyncio.sleep(0.01)
+        raise RedisError("brownout")
+
+    fake_redis.eval = AsyncMock(side_effect=slow_failing_eval)
+
+    start = time.monotonic()
+    with pytest.raises(SlotBackendUnavailable) as exc_info:
+        async with lotek_slot("user@example.com", max_wait_seconds=0.001):
+            pytest.fail("body must not run")
+    elapsed = time.monotonic() - start
+
+    assert fake_redis.eval.await_count < SLOT_REDIS_RETRY["attempts"]
+    assert isinstance(exc_info.value.__cause__, asyncio.TimeoutError)
+    assert elapsed < 0.5  # bounded by the budget, not by the ~77s policy
 
 
 def test_slot_client_is_socket_bounded(monkeypatch):

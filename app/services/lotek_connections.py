@@ -200,23 +200,25 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds:
             with attempt:
                 return await _acquire_once()
 
-    first_pass = True
     while True:
         acquired = 0
-        if first_pass:
-            first_pass = False
-            # max_wait_seconds is the SATURATION-queueing budget, not a
-            # Redis-error budget: a fail-fast caller (max_wait_seconds=0, i.e.
-            # the dispatcher) still wants D5's full retry policy on a brownout
-            # — it just must not queue behind a busy account. The first pass
-            # therefore runs the policy BARE: it is intrinsically bounded by
-            # the per-attempt socket timeouts (SLOT_REDIS_SOCKET_TIMEOUT) plus
-            # stamina's own capped backoff, so no clock is needed. A derived
-            # clock floor was wrong twice — 20s from one sample, then 30s
-            # ignoring the socket timeouts (5 attempts x ~10s + 27s backoff
-            # ~= 77s) — and any constant here re-breaks whenever the retry
-            # policy or the socket bounds change (Copilot review, rounds 3
-            # and 7).
+        if max_wait_seconds <= 0:
+            # A FAIL-FAST caller (the dispatcher). max_wait_seconds=0 means
+            # "do not queue behind a busy account", not "cut my Redis
+            # retries": this caller has the whole 540s action budget behind
+            # it, so on a brownout it runs D5's full retry policy BARE —
+            # intrinsically bounded by the per-attempt socket timeouts
+            # (SLOT_REDIS_SOCKET_TIMEOUT) plus stamina's capped backoff
+            # (~77s worst case), with no clock to derive wrong (a derived
+            # floor was wrong twice: 20s from one sample, then 30s ignoring
+            # the socket timeouts — Copilot rounds 3 and 7). A fail-fast
+            # caller never loops: saturation gives up at the bottom of this
+            # pass. Positive budgets take the clock-bounded branch below on
+            # EVERY pass including the first — a queueing caller's budget is
+            # its remaining soft-deadline, and a fetch entering near the 432s
+            # soft deadline that spent ~77s on Redis retries would overrun
+            # the 540s hard timeout into _handle_error's config_data publish
+            # (Copilot review, round 8).
             try:
                 acquired = await _retry_policy()
             except redis.RedisError as exc:
@@ -244,9 +246,10 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds:
                 # Either stamina exhausted SLOT_REDIS_RETRY, or the
                 # retry/backoff ran past the caller's remaining queueing
                 # budget — both mean Redis, not the Lotek account, is why
-                # this caller has no slot. Clock-bounding is correct HERE:
-                # mid-queue, the queueing budget genuinely binds, unlike on
-                # the first pass.
+                # this caller has no slot. Clock-bounding is correct for
+                # every positive-budget pass, first included: the queueing
+                # budget is the caller's remaining soft-deadline and
+                # genuinely binds.
                 await _give_up("retry give-up", exc)
         if acquired:
             break
