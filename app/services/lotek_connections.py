@@ -23,21 +23,6 @@ logger = logging.getLogger(__name__)
 # a fabricated Lotek failure caused by our own Redis (review finding).
 SLOT_REDIS_RETRY = dict(attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0)
 
-# max_wait_seconds is the SATURATION-queueing budget (spec D2/D3: don't queue
-# behind a busy account), not a Redis-error budget — the two are different
-# things a caller can afford. Without a floor, a fail-fast caller
-# (max_wait_seconds=0, i.e. the dispatcher) got exactly one unretried acquire
-# on a Redis brownout, silently losing SLOT_REDIS_RETRY entirely (review
-# finding). This floors the retry window on the first acquire pass only, so
-# every caller keeps the full 5-attempt policy on a brownout; the overrun is
-# bounded and only happens while Redis itself is unhealthy, where the action
-# is failing regardless. Value covers SLOT_REDIS_RETRY's worst case, derived
-# rather than sampled (Copilot review: a 20.0 floor taken from one ~19.7s
-# measurement could cut attempt 5 short on unlucky jitter): exponential waits
-# between attempts 1..5 are 1+2+4+8 = 15s, plus wait_jitter up to 3s on each
-# of the four waits = up to 27s of backoff, plus the eval calls themselves.
-SLOT_REDIS_RETRY_FLOOR = 30.0
-
 # Backpressure poll schedule for a saturated account budget. Jittered so that
 # N shards refused in the same millisecond do not retry in lockstep.
 SLOT_WAIT_POLL_INITIAL = 0.25
@@ -210,47 +195,59 @@ async def lotek_slot(username: str, *, ttl_seconds: int = 300, max_wait_seconds:
             raise SlotBackendUnavailable(message) from exc
         raise NoConnectionSlot(message)
 
+    async def _retry_policy():
+        async for attempt in stamina.retry_context(on=redis.RedisError, **SLOT_REDIS_RETRY):
+            with attempt:
+                return await _acquire_once()
+
     first_pass = True
     while True:
         acquired = 0
-        # max_wait_seconds is the SATURATION-queueing budget, not a Redis-error
-        # budget: a fail-fast caller (max_wait_seconds=0, i.e. the dispatcher)
-        # still wants D5's shared retry policy on a brownout — it just must
-        # not queue behind a busy account. Floor the retry window so every
-        # caller keeps the full 5 attempts; the overrun is bounded and only
-        # happens on a Redis brownout, where the action is failing regardless.
-        # Only the first pass gets the floor, so a caller already deep into
-        # its queueing budget is not extended on every poll.
-        floor = SLOT_REDIS_RETRY_FLOOR if first_pass else 0.0
-        first_pass = False
-        retry_window = max(deadline - time.monotonic(), floor)
-        if retry_window <= 0:
-            # Only reachable on a non-first pass (the first pass is floored):
-            # the final saturation sleep consumed the whole queueing budget.
-            # wait_for(timeout<=0) would raise TimeoutError before any Redis
-            # call ran, sending ordinary saturation down the Redis-blamed
-            # give-up path with a chained cause (Copilot review). The sleep
-            # existed to wait for a peer to release a slot, so make one last
-            # unretried attempt, then give up under the correct diagnosis.
+        if first_pass:
+            first_pass = False
+            # max_wait_seconds is the SATURATION-queueing budget, not a
+            # Redis-error budget: a fail-fast caller (max_wait_seconds=0, i.e.
+            # the dispatcher) still wants D5's full retry policy on a brownout
+            # — it just must not queue behind a busy account. The first pass
+            # therefore runs the policy BARE: it is intrinsically bounded by
+            # the per-attempt socket timeouts (SLOT_REDIS_SOCKET_TIMEOUT) plus
+            # stamina's own capped backoff, so no clock is needed. A derived
+            # clock floor was wrong twice — 20s from one sample, then 30s
+            # ignoring the socket timeouts (5 attempts x ~10s + 27s backoff
+            # ~= 77s) — and any constant here re-breaks whenever the retry
+            # policy or the socket bounds change (Copilot review, rounds 3
+            # and 7).
             try:
-                acquired = await _acquire_once()
+                acquired = await _retry_policy()
             except redis.RedisError as exc:
-                await _give_up("final-attempt give-up", exc)
-            if acquired:
-                break
-            await _give_up("give-up")
-        try:
-            async def _bounded_retry():
-                async for attempt in stamina.retry_context(on=redis.RedisError, **SLOT_REDIS_RETRY):
-                    with attempt:
-                        return await _acquire_once()
-            acquired = await asyncio.wait_for(_bounded_retry(), timeout=retry_window)
-        except (redis.RedisError, asyncio.TimeoutError) as exc:
-            # Either stamina exhausted SLOT_REDIS_RETRY, or the retry/backoff
-            # itself ran past retry_window before an attempt succeeded — both
-            # mean Redis, not the Lotek account, is why this caller has no
-            # slot.
-            await _give_up("retry give-up", exc)
+                await _give_up("retry give-up", exc)
+        else:
+            retry_window = deadline - time.monotonic()
+            if retry_window <= 0:
+                # The final saturation sleep consumed the whole queueing
+                # budget. wait_for(timeout<=0) would raise TimeoutError before
+                # any Redis call ran, sending ordinary saturation down the
+                # Redis-blamed give-up path with a chained cause (Copilot
+                # review). The sleep existed to wait for a peer to release a
+                # slot, so make one last unretried attempt, then give up under
+                # the correct diagnosis.
+                try:
+                    acquired = await _acquire_once()
+                except redis.RedisError as exc:
+                    await _give_up("final-attempt give-up", exc)
+                if acquired:
+                    break
+                await _give_up("give-up")
+            try:
+                acquired = await asyncio.wait_for(_retry_policy(), timeout=retry_window)
+            except (redis.RedisError, asyncio.TimeoutError) as exc:
+                # Either stamina exhausted SLOT_REDIS_RETRY, or the
+                # retry/backoff ran past the caller's remaining queueing
+                # budget — both mean Redis, not the Lotek account, is why
+                # this caller has no slot. Clock-bounding is correct HERE:
+                # mid-queue, the queueing budget genuinely binds, unlike on
+                # the first pass.
+                await _give_up("retry give-up", exc)
         if acquired:
             break
         # Saturated. Wait for a peer to release rather than aborting the
