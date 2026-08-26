@@ -1263,10 +1263,22 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     # deliberate LRS-fairness trade-off so one permanently-broken device
     # doesn't monopolize the front of the backfill queue. The zero-progress
     # raise is the actual safety net when it's the only gapped device.
-    state.last_backfilled = datetime.now(tz=timezone.utc)
-    await _save_device_state_fields(
-        integration_id, device.nDeviceID, {"last_backfilled": state.last_backfilled}
-    )
+    #
+    # Skipped on a backend cut (Copilot round 15): this writes to the SAME
+    # Redis whose failure caused the cut, so during a real outage it raised
+    # and took the whole partial-progress return with it — the traversal saw
+    # a generic device failure and observations_sent, windows_advanced and
+    # the backend signal were all lost, making the partial-progress path
+    # inoperative in exactly the situation it exists for. Nothing is lost by
+    # skipping it: the gap checkpoint that matters was persisted before the
+    # failing acquire, and fairness self-corrects on the next run (this
+    # device keeps its older last_backfilled, so it stays at the front of
+    # the LRS queue — the right place after an interrupted run).
+    if cut_reason != "backend":
+        state.last_backfilled = datetime.now(tz=timezone.utc)
+        await _save_device_state_fields(
+            integration_id, device.nDeviceID, {"last_backfilled": state.last_backfilled}
+        )
     return observations_sent, device_failed, transport_failure, not state.has_gap, windows_advanced, cut_reason
 
 

@@ -272,6 +272,55 @@ async def test_backfill_device_keeps_progress_when_redis_dies_before_window_two(
 
 
 @pytest.mark.asyncio
+async def test_backend_cut_progress_survives_a_dead_redis_fairness_write(
+    mocker, lotek_integration
+):
+    """Copilot round 15: the round-3 partial-backend path was mostly
+    inoperative. After breaking with cut_reason="backend" the function still
+    performed the unconditional last_backfilled fairness write — to the SAME
+    Redis that just failed — so during a real outage that write raised, the
+    traversal saw a generic device failure, and observations_sent,
+    windows_advanced and the backend signal were all lost anyway. The
+    fairness write is skipped on a backend cut: the gap checkpoint that
+    matters was already persisted before the failing acquire."""
+    from app.actions.handlers import _backfill_device
+    from app.actions.device_state import DeviceState
+    from app.services.lotek_connections import SlotBackendUnavailable
+    from redis.exceptions import RedisError
+
+    now = datetime.now(timezone.utc)
+    state = DeviceState(
+        high_water=now,
+        gap_start=now - timedelta(days=20), gap_end=now - timedelta(days=1),
+    )
+    device = _devices("d1")[0]
+
+    mocker.patch(
+        "app.actions.handlers._fetch_window",
+        new=AsyncMock(side_effect=[(["pos"], False), SlotBackendUnavailable("redis down")]),
+    )
+    mocker.patch("app.actions.handlers._deliver", new=AsyncMock(return_value=(7, False)))
+
+    # Window 1's checkpoint succeeds; every later write fails, as a real
+    # outage would — the fairness write must not be attempted at all.
+    saves = []
+
+    async def flaky_save(integration_id, device_id, fields):
+        saves.append(fields)
+        if "last_backfilled" in fields:
+            raise RedisError("redis down")
+
+    mocker.patch("app.actions.handlers._save_device_state_fields", side_effect=flaky_save)
+
+    result = await _backfill_device(device, state, lotek_integration, object(), object(), object())
+    sent, device_failed, transport_failure, gap_closed, windows_advanced, cut_reason = result
+
+    assert (sent, windows_advanced, cut_reason) == (7, 1, "backend")
+    assert not any("last_backfilled" in f for f in saves)  # never attempted
+    assert any("gap_start" in f for f in saves)            # the one that matters persisted
+
+
+@pytest.mark.asyncio
 async def test_partial_backend_cut_defers_and_alerts_once(
     mocker, lotek_integration, mock_redis
 ):
