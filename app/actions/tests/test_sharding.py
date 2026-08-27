@@ -8,6 +8,7 @@ from gundi_core.schemas.v2 import LogLevel
 from app.actions.configurations import PullObservationsShardConfig
 from app.actions.device_state import DeviceState
 from app.actions.handlers import (
+    DISPATCH_CONCURRENCY,
     SHARD_SIZE,
     STATE_READ_CONCURRENCY,
     action_pull_observations,
@@ -219,6 +220,7 @@ async def test_pure_starvation_with_no_failures_still_suppresses(
     must stay quiet, or every busy tick would page someone."""
     from app.services.lotek_connections import NoConnectionSlot
     from app.actions.handlers import action_pull_observations_shard
+    import app.actions.handlers as handlers
 
     devices = ["dev0", "dev1"]
 
@@ -303,6 +305,77 @@ async def test_shard_dispatch_failure_stays_isolated_under_concurrency(
     assert len(calls) == 3                           # every shard attempted
     warn_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.WARNING]
     assert warn_calls
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cancellation_propagates_instead_of_counting_as_undispatched(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """PR #20 review: return_exceptions=True turns a child CancelledError into
+    a RESULT, and the dispatch loop recorded it as a failed publish — so
+    worker shutdown or the action timeout was swallowed and the dispatcher
+    kept publishing. The traversal already re-raises cancellation for exactly
+    this reason; the new concurrent dispatch has to as well."""
+    from app.actions.handlers import action_pull_observations
+
+    devices = [f"dev{i}" for i in range(75)]
+    _setup_pull_mocks(mocker, mock_redis, _devices(*devices))
+
+    calls = []
+
+    async def cancelling_trigger(integration_id, action_id, config=None):
+        calls.append(config.devices)
+        raise asyncio.CancelledError()
+
+    mocker.patch("app.actions.handlers.trigger_action", side_effect=cancelling_trigger)
+
+    with pytest.raises(asyncio.CancelledError):
+        await action_pull_observations(lotek_integration, pull_config)
+
+    # Stopped at the first batch rather than grinding through all three shards.
+    assert len(calls) <= DISPATCH_CONCURRENCY
+
+
+@pytest.mark.asyncio
+async def test_post_deadline_publishes_are_bounded_by_the_hard_timeout(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    """PR #20 review: after a deadline cut at 80% of the budget only ~108s
+    remain, but each post-work publish can burn ~36s of stamina retries under
+    Pub/Sub degradation — re-trigger + deferral WARNING + completion event
+    consumes the whole margin, so the run blows the hard 540s timeout and
+    lands in action_runner's generic handler, which publishes config_data
+    with plaintext auth. The exact path the never-raise convention exists to
+    avoid. Post-work publishes are now bounded by the remaining budget."""
+    from app.actions.handlers import action_pull_observations_shard
+
+    devices = ["dev0", "dev1"]
+    _setup_pull_mocks(mocker, mock_redis, _devices(*devices))
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch("app.actions.handlers._head_pass_device", return_value=(0, False, False))
+    # Force the deadline branch, then make every post-work publish hang the
+    # way a degraded commands topic would.
+    mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
+
+    async def hanging_publish(*args, **kwargs):
+        await asyncio.sleep(3600)
+
+    mocker.patch("app.actions.handlers.trigger_action", side_effect=hanging_publish)
+    mocker.patch("app.actions.handlers.log_action_activity", side_effect=hanging_publish)
+    mocker.patch("app.actions.handlers._try_log_activity", side_effect=hanging_publish)
+    # Arm the publish deadline in the past so the bound engages immediately —
+    # the same state a run that has burned its budget would be in.
+    import time as _t
+    import app.actions.handlers as _h
+    mocker.patch("app.actions.handlers._arm_publish_deadline",
+                 side_effect=lambda: _h._publish_deadline.set(_t.monotonic() - 1))
+
+    result = await action_pull_observations_shard(
+        lotek_integration, PullObservationsShardConfig(devices=devices)
+    )
+
+    # Returned a result instead of hanging into the hard timeout.
+    assert "devices_deferred" in result
 
 
 @pytest.mark.asyncio

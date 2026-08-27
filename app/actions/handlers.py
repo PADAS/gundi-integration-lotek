@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import httpx
 import logging
 import stamina
@@ -8,6 +9,8 @@ import app.services.gundi as gundi_tools
 import app.actions.client as client
 import app.settings as app_settings
 import app.settings.integration as settings
+
+import time
 
 from datetime import datetime, timezone, timedelta
 
@@ -173,6 +176,66 @@ def _summarize_ids(ids):
     return listed
 
 
+# Monotonic instant after which this action must not start another publish.
+# Set once per handler invocation; a ContextVar rather than a module global so
+# concurrently-running actions in one worker each see their own value (asyncio
+# tasks inherit a copy of the context, so a set here never leaks sideways).
+_publish_deadline = contextvars.ContextVar("lotek_publish_deadline", default=None)
+
+# Seconds reserved for @activity_logger's completion publish, which this module
+# cannot wrap — the decorator applies it after the handler returns. Sized to one
+# publish_event retry budget (~36s) plus slack.
+COMPLETION_EVENT_RESERVE = 45.0
+
+
+def _arm_publish_deadline():
+    """Bound every later publish in this invocation by the action's HARD
+    timeout, not just by the soft deadline.
+
+    A deadline cut at DEADLINE_FRACTION leaves ~108s, but each post-work
+    publish can burn a full publish_event retry budget (~36s) under Pub/Sub
+    degradation: re-trigger + deferral WARNING + completion event consumes the
+    whole margin, and a failed re-trigger adds a fourth. The run then blows
+    MAX_ACTION_EXECUTION_TIME and lands in action_runner's generic handler,
+    which publishes config_data carrying plaintext auth — the exact path the
+    never-raise convention exists to avoid (PR #20 review).
+
+    Armed at handler entry, so it also covers @activity_logger's START publish
+    having already run: that time is simply elapsed by the time we measure.
+    """
+    _publish_deadline.set(
+        time.monotonic() + app_settings.MAX_ACTION_EXECUTION_TIME - COMPLETION_EVENT_RESERVE
+    )
+
+
+async def _bounded_publish(coro, what):
+    """Await a best-effort publish under the remaining hard-deadline budget.
+
+    Every caller is best-effort — deferral WARNINGs, summaries, re-trigger
+    publishes and zero-progress events all tolerate a failed publish — so a
+    timeout here degrades exactly like a dropped event, and unlike an
+    unbounded await it cannot carry the action past its hard timeout. Applied
+    at this chokepoint rather than per call site so publishes added later are
+    covered by construction.
+    """
+    deadline = _publish_deadline.get()
+    if deadline is None:
+        return await coro          # unarmed (e.g. a direct unit-test call)
+    budget = deadline - time.monotonic()
+    if budget <= 0:
+        coro.close()
+        logger.warning(f"Skipping {what}: no action budget left before the hard timeout.")
+        return None
+    try:
+        return await asyncio.wait_for(coro, timeout=budget)
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"Gave up on {what} after {budget:.1f}s: the action budget is nearly spent "
+            f"and the hard timeout must not be reached."
+        )
+        return None
+
+
 async def _log_deferral(integration, action_id, reason, deferred_ids, disposition="to the next run"):
     # disposition tells the operator what actually happens to the tail: a
     # deadline-cut shard hands it to a re-triggered shard immediately, while a
@@ -184,11 +247,14 @@ async def _log_deferral(integration, action_id, reason, deferred_ids, dispositio
         f"{len(deferred_ids)} device(s) {disposition}: {_summarize_ids(deferred_ids)}."
     )
     logger.warning(message)
-    await log_action_activity(
-        integration_id=str(integration.id),
-        action_id=action_id,
-        title=message,
-        level=LogLevel.WARNING
+    await _bounded_publish(
+        log_action_activity(
+            integration_id=str(integration.id),
+            action_id=action_id,
+            title=message,
+            level=LogLevel.WARNING
+        ),
+        "a deferral WARNING",
     )
 
 
@@ -198,11 +264,14 @@ async def _try_log_activity(integration_id, action_id, title, level):
     already-delivered counts and resets the circuit-breaker streak with a
     failure that says nothing about Lotek (review finding)."""
     try:
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id=action_id,
-            title=title,
-            level=level
+        await _bounded_publish(
+            log_action_activity(
+                integration_id=integration_id,
+                action_id=action_id,
+                title=title,
+                level=level
+            ),
+            "an activity-log event",
         )
     except Exception as e:
         logger.warning(
@@ -333,6 +402,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     logger.info(f"Executing pull_observations action for integration {integration.id}...")
 
     integration_id = str(integration.id)
+    _arm_publish_deadline()
     auth = get_auth_config(integration)
     try:
         async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
@@ -412,11 +482,14 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             f"{describe_exception(e)}. The run will be retried on the next schedule."
         )
         logger.warning(message)
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id="pull_observations",
-            title=message,
-            level=LogLevel.WARNING
+        await _bounded_publish(
+            log_action_activity(
+                integration_id=integration_id,
+                action_id="pull_observations",
+                title=message,
+                level=LogLevel.WARNING
+            ),
+            "an activity-log event",
         )
         # Any non-starved outcome breaks the "consecutive" skip streak — a
         # transport skip between two slot skips must not let them read as
@@ -431,11 +504,14 @@ async def action_pull_observations(integration, action_config: PullObservationsC
     except Exception as e:
         message = f"Error fetching devices from Lotek. Integration ID: {integration.id} Exception: {describe_exception(e)}"
         logger.exception(message)
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id="pull_observations",
-            title=message,
-            level=LogLevel.ERROR
+        await _bounded_publish(
+            log_action_activity(
+                integration_id=integration_id,
+                action_id="pull_observations",
+                title=message,
+                level=LogLevel.ERROR
+            ),
+            "an activity-log event",
         )
         # Same reason as the transport path: a non-starved outcome breaks the
         # "consecutive" skip streak (review finding — this path was missed).
@@ -491,11 +567,14 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         # Returns the shard on failure, None on success, so the caller can
         # keep per-shard isolation while the publishes overlap.
         try:
-            await trigger_action(
-                integration_id, "pull_observations_shard",
-                config=PullObservationsShardConfig(
-                    devices=shard, triggered_by="pull_observations", manual_run=manual_run
-                )
+            await _bounded_publish(
+                trigger_action(
+                    integration_id, "pull_observations_shard",
+                    config=PullObservationsShardConfig(
+                        devices=shard, triggered_by="pull_observations", manual_run=manual_run
+                    )
+                ),
+                "a shard dispatch",
             )
             return None
         except Exception as e:
@@ -512,6 +591,14 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         outcomes = await asyncio.gather(
             *(_dispatch_one(shard) for shard in batch), return_exceptions=True
         )
+        # Cancellation must propagate, never be recorded as a failed publish
+        # (PR #20 review): return_exceptions=True turns a child
+        # CancelledError into a RESULT, so worker shutdown or the action
+        # timeout would be swallowed and the dispatcher would keep publishing.
+        # Same guard the traversal applies to its own gather.
+        for outcome in outcomes:
+            if isinstance(outcome, asyncio.CancelledError):
+                raise outcome
         for shard, outcome in zip(batch, outcomes):
             if outcome is None:
                 dispatched += 1
@@ -614,14 +701,17 @@ async def _retrigger_shard(integration, device_ids, generation, manual_run=False
         )
         return RETRIGGER_CAP_REACHED
     try:
-        await trigger_action(
-            integration_id, "pull_observations_shard",
-            config=PullObservationsShardConfig(
-                devices=device_ids,
-                triggered_by="pull_observations_shard",
-                generation=generation + 1,
-                manual_run=manual_run,
-            )
+        await _bounded_publish(
+            trigger_action(
+                integration_id, "pull_observations_shard",
+                config=PullObservationsShardConfig(
+                    devices=device_ids,
+                    triggered_by="pull_observations_shard",
+                    generation=generation + 1,
+                    manual_run=manual_run,
+                )
+            ),
+            "a shard re-trigger",
         )
         return RETRIGGER_HANDED_OFF
     except Exception as e:
@@ -645,6 +735,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
     )
     integration_id = str(integration.id)
     run_started = datetime.now(tz=timezone.utc)
+    _arm_publish_deadline()
     try:
         auth = get_auth_config(integration)
         pull_config = get_pull_config(integration)
@@ -762,11 +853,14 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             f"They will be retried on the next run."
         )
         logger.warning(message)
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id="pull_observations_shard",
-            title=message,
-            level=LogLevel.WARNING
+        await _bounded_publish(
+            log_action_activity(
+                integration_id=integration_id,
+                action_id="pull_observations_shard",
+                title=message,
+                level=LogLevel.WARNING
+            ),
+            "an activity-log event",
         )
 
     if stale_drops:
@@ -780,11 +874,14 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             f"{_summarize_ids(stale_drops)}. See the application log for per-device ranges."
         )
         logger.warning(message)
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id="pull_observations_shard",
-            title=message,
-            level=LogLevel.WARNING
+        await _bounded_publish(
+            log_action_activity(
+                integration_id=integration_id,
+                action_id="pull_observations_shard",
+                title=message,
+                level=LogLevel.WARNING
+            ),
+            "an activity-log event",
         )
 
     # Suppression policy, preserved EXACTLY as it was before the traversal
@@ -886,16 +983,19 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
                 # override — a bare trigger_action(..., "backfill_observations")
                 # publishes an empty config_overrides, which execute_action reads
                 # as "no config at all" and 404s before the handler ever runs.
-                await trigger_action(
-                    integration_id, "backfill_observations",
-                    config=BackfillObservationsConfig(
-                        triggered_by="pull_observations_shard",
-                        # Carry the manual marker: without it a Trigger on a
-                        # paused integration pulled head data but its backfill
-                        # skipped on the pause, silently importing no history
-                        # (review finding).
-                        manual_run=action_config.manual_run,
-                    )
+                await _bounded_publish(
+                    trigger_action(
+                        integration_id, "backfill_observations",
+                        config=BackfillObservationsConfig(
+                            triggered_by="pull_observations_shard",
+                            # Carry the manual marker: without it a Trigger on a
+                            # paused integration pulled head data but its backfill
+                            # skipped on the pause, silently importing no history
+                            # (review finding).
+                            manual_run=action_config.manual_run,
+                        )
+                    ),
+                    "the backfill trigger",
                 )
                 published = True
         except Exception as e:
@@ -1340,6 +1440,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
     logger.info(f"Executing backfill_observations action for integration {integration.id}...")
     integration_id = str(integration.id)
     run_started = datetime.now(tz=timezone.utc)
+    _arm_publish_deadline()
     try:
         auth = get_auth_config(integration)
         pull_config = get_pull_config(integration)  # max_pdop applies to backfilled data too
@@ -1440,11 +1541,14 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 f"{integration_id}: {describe_exception(e)}. Open gaps are retried on the next trigger."
             )
             logger.warning(message)
-            await log_action_activity(
-                integration_id=integration_id,
-                action_id="backfill_observations",
-                title=message,
-                level=LogLevel.WARNING
+            await _bounded_publish(
+                log_action_activity(
+                    integration_id=integration_id,
+                    action_id="backfill_observations",
+                    title=message,
+                    level=LogLevel.WARNING
+                ),
+                "an activity-log event",
             )
             return {"skipped": True, "reason": "lotek_unreachable"}
         except Exception as e:
@@ -1453,11 +1557,14 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 f"{integration_id} Exception: {describe_exception(e)}"
             )
             logger.exception(message)
-            await log_action_activity(
-                integration_id=integration_id,
-                action_id="backfill_observations",
-                title=message,
-                level=LogLevel.ERROR
+            await _bounded_publish(
+                log_action_activity(
+                    integration_id=integration_id,
+                    action_id="backfill_observations",
+                    title=message,
+                    level=LogLevel.ERROR
+                ),
+                "an activity-log event",
             )
             raise  # bare: preserve the original traceback
 
@@ -1549,11 +1656,14 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 f"Their gaps are retried on the next trigger."
             )
             logger.warning(message)
-            await log_action_activity(
-                integration_id=integration_id,
-                action_id="backfill_observations",
-                title=message,
-                level=LogLevel.WARNING
+            await _bounded_publish(
+                log_action_activity(
+                    integration_id=integration_id,
+                    action_id="backfill_observations",
+                    title=message,
+                    level=LogLevel.WARNING
+                ),
+                "an activity-log event",
             )
 
         # Backfill's suppression policy differs from the shard's and is
@@ -1671,12 +1781,15 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         # continuously instead of waiting for the next head-pass tick. Runs
         # AFTER the lease release so the next run doesn't skip on our own lease.
         try:
-            await trigger_action(
-                integration_id, "backfill_observations",
-                config=BackfillObservationsConfig(
-                    triggered_by="backfill_observations",
-                    manual_run=action_config.manual_run,
-                )
+            await _bounded_publish(
+                trigger_action(
+                    integration_id, "backfill_observations",
+                    config=BackfillObservationsConfig(
+                        triggered_by="backfill_observations",
+                        manual_run=action_config.manual_run,
+                    )
+                ),
+                "the backfill self-retrigger",
             )
         except Exception as e:
             # The next head pass will re-trigger; losing one cascade step is fine.
