@@ -34,6 +34,26 @@ _RELEASE_LEASE_SCRIPT = (
     "return redis.call('del', KEYS[1]) else return 0 end"
 )
 
+# Same-token fast path: SET NX succeeds only when the key is absent, so a
+# lost reply on the attempt that actually won retries into a false refusal —
+# the retry's own SET NX sees the key it just created and reports "someone
+# else has it" (review finding). Recognizing the caller's own token as an
+# already-held lease (not just "absent") makes a retry of the exact same
+# acquire call idempotent, the same way _ACQUIRE_LUA's ZSCORE fast-path does
+# for the Lotek connection slot.
+_ACQUIRE_LEASE_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if current == false then
+    redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+    return 1
+end
+if current == ARGV[1] then
+    redis.call('EXPIRE', KEYS[1], ARGV[2])
+    return 1
+end
+return 0
+"""
+
 # Atomic field merge into a JSON-blob state key: decode the current document
 # (or start empty), overwrite only the fields in ARGV[1], re-encode. Redis
 # runs scripts atomically, so two writers updating disjoint fields can never
@@ -54,6 +74,27 @@ for k, v in pairs(cjson.decode(ARGV[2])) do
 end
 redis.call('SET', KEYS[1], cjson.encode(doc))
 return 1
+"""
+
+# Atomic increment-and-expire, with a self-heal for a legacy value. Doing
+# this client-side (INCR; on a specific error DELETE+INCR; then EXPIRE) is
+# not atomic: two callers racing the same legacy value can interleave so one
+# DELETE erases the other's fresh increment, and a crash/cancellation between
+# steps can leave the new key with no TTL (review finding). Redis executes a
+# script as one atomic unit, so all three steps (or the self-heal branch)
+# happen indivisibly — no interleaving between callers, and the key is never
+# observed with an increment applied but no TTL.
+_INCREMENT_COUNTER_SCRIPT = """
+local result = redis.pcall('INCR', KEYS[1])
+if type(result) == 'table' and result.err then
+    if string.find(string.lower(result.err), 'not an integer') == nil then
+        return redis.error_reply(result.err)
+    end
+    redis.call('DEL', KEYS[1])
+    result = redis.call('INCR', KEYS[1])
+end
+redis.call('EXPIRE', KEYS[1], ARGV[1])
+return result
 """
 
 
@@ -133,16 +174,23 @@ class IntegrationStateManager:
         self, integration_id: str, action_id: str, *, ttl_seconds: int, source_id: str = "no-source"
     ) -> Optional[str]:
         """Atomically acquire an ownership lease: SET NX of a unique token with
-        a TTL. Returns the token when acquired (pass it to release_lease), or
-        None when another holder already has the lease. Unlike set_if_absent,
-        the token lets the holder release without racing a successor that
-        acquired after the TTL expired.
+        a TTL, via a script with a same-token fast path (see
+        _ACQUIRE_LEASE_SCRIPT). Returns the token when acquired (pass it to
+        release_lease), or None when another holder already has the lease.
+        Unlike set_if_absent, the token lets the holder release without racing
+        a successor that acquired after the TTL expired.
+
+        The token is generated once, before the retry loop, and the fast path
+        makes a retry of this exact call safe: a lost reply on the attempt
+        that actually won no longer makes a retry see its own token and
+        falsely report "already held" (review finding) — the script
+        recognizes the caller's own token and reports success again.
         """
         token = str(uuid.uuid4())
         key = f"integration_state.{integration_id}.{action_id}.{source_id}"
         for attempt in stamina.retry_context(on=redis.RedisError, attempts=5, wait_initial=1.0, wait_max=30, wait_jitter=3.0):
             with attempt:
-                was_set = await self.db_client.set(key, json.dumps(token), ex=ttl_seconds, nx=True)
+                was_set = await self.db_client.eval(_ACQUIRE_LEASE_SCRIPT, 1, key, json.dumps(token), ttl_seconds)
         return token if was_set else None
 
     async def release_lease(
@@ -158,6 +206,48 @@ class IntegrationStateManager:
             with attempt:
                 deleted = await self.db_client.eval(_RELEASE_LEASE_SCRIPT, 1, key, json.dumps(token))
         return bool(deleted)
+
+    async def increment_counter(
+        self, integration_id: str, action_id: str, source_id: str = "no-source",
+        ttl_seconds: int = 3600,
+    ) -> int:
+        """Atomically increment a small counter and refresh its TTL, in one
+        Redis-side script.
+
+        Used for streak counters. A client-side get / int+1 / set loses
+        increments when two runs overlap — the same race merge_state_fields was
+        added to close — and an untimed key leaks for anything abandoned
+        mid-streak.
+
+        The whole operation (self-heal, increment, expire) is one atomic Lua
+        script, not wrapped in any stamina retry: a blind client-side retry of
+        a non-idempotent write risks double-counting the streak when the
+        server actually applied it but the reply was lost, and doing the
+        self-heal's delete-then-increment as separate client-side calls let
+        two callers racing the same legacy value interleave (one caller's
+        DELETE erasing the other's fresh increment), or leave the key
+        incremented with no TTL if the process died between steps (review
+        findings). A single, unretried script call instead risks only an
+        occasional missed increment on a genuine Redis blip — an acceptable
+        miss for a best-effort streak counter whose callers already treat any
+        failure as a safe default.
+
+        Self-heals a legacy value: this key was previously written by
+        set_state as a JSON blob (e.g. {"streak": 2}), with no TTL, so any
+        pre-existing key from before this counter was atomic is permanent and
+        INCR against it always fails with "value is not an integer or out of
+        range". Rather than fail forever, the first INCR to hit one drops the
+        stale value and increments once more, inside the same script — the
+        streak would otherwise never advance for any integration carrying a
+        legacy key, making the DISPATCHER_SKIP_WARN_AFTER diagnostic
+        permanently unreachable exactly on the saturated accounts it exists to
+        diagnose (review finding). Only that specific message is treated as a
+        legacy value; any other error (a genuine server-side problem) surfaces
+        as a ResponseError, untouched.
+        """
+        key = f"integration_state.{integration_id}.{action_id}.{source_id}"
+        value = await self.db_client.eval(_INCREMENT_COUNTER_SCRIPT, 1, key, ttl_seconds)
+        return int(value)
 
     async def delete_state(self, integration_id: str, action_id: str, source_id: str = "no-source"):
         if _skip_on_ephemeral_run("delete_state", integration_id, action_id):

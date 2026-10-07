@@ -51,6 +51,91 @@ def _reset_shared_http_client():
 
 
 @pytest.fixture(autouse=True)
+def _stub_state_delete(monkeypatch):
+    # The dispatcher clears its slot-skip streak with delete_state on every
+    # non-starved outcome. Most handler tests mock get_state/set_state but not
+    # delete_state, so without this the call reaches a real Redis and burns
+    # ~19s of stamina retries per test. Tests that assert on deletion patch it
+    # themselves.
+    from app.services.state import IntegrationStateManager
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(IntegrationStateManager, "delete_state", AsyncMock(return_value=None))
+
+
+@pytest.fixture(autouse=True)
+def _stub_state_increment_counter(monkeypatch):
+    # The dispatcher bumps its slot-skip streak with increment_counter on
+    # every no_connection_slot skip. Most handler tests mock get_state/
+    # set_state but not increment_counter, so without this it reaches a real
+    # Redis (slow stamina retries, and a leaked real key/client behind the
+    # closed test event loop — review finding I2). Tests exercising the
+    # streak itself patch increment_counter with mocker.patch, which — being
+    # applied inside the test body, after this fixture runs — takes
+    # precedence for the duration of that test.
+    from app.services.state import IntegrationStateManager
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setattr(IntegrationStateManager, "increment_counter", AsyncMock(return_value=1))
+
+
+@pytest.fixture(autouse=True)
+def _grant_backfill_trigger_claim(monkeypatch):
+    # The backfill-trigger claim (a token-based lease via acquire_lease, not
+    # a plain boolean set_if_absent — a same-token retry of a raw SET NX
+    # could falsely report "already held", review finding) is not part of
+    # the class-level get_state/set_state mocking most tests do, so without
+    # this it reaches a real Redis (slow stamina retries). Granted by
+    # default with a fresh token per call; the duplicate-suppression test
+    # overrides it. set_if_absent is also granted here for any other caller
+    # (e.g. action_runner.py's throttle window) exercised incidentally by
+    # these handler tests.
+    import uuid
+    from app.services.state import IntegrationStateManager
+
+    async def granted(self, integration_id, action_id, *, ttl_seconds, source_id="no-source"):
+        return True
+
+    async def lease_granted(self, integration_id, action_id, *, ttl_seconds, source_id="no-source"):
+        return str(uuid.uuid4())
+
+    async def lease_released(self, integration_id, action_id, token, source_id="no-source"):
+        return True
+
+    monkeypatch.setattr(IntegrationStateManager, "set_if_absent", granted)
+    monkeypatch.setattr(IntegrationStateManager, "acquire_lease", lease_granted)
+    # release_lease is the corresponding release for the same claim (and for
+    # the pre-existing backfill execution lease at BACKFILL_LEASE_SOURCE);
+    # stub it here too for the same reason delete_state is stubbed above —
+    # tests exercising a specific release outcome patch it themselves.
+    monkeypatch.setattr(IntegrationStateManager, "release_lease", lease_released)
+
+
+@pytest.fixture(autouse=True)
+def _grant_connection_slots(monkeypatch):
+    # lotek_slot talks to real Redis (per-account connection budget). Grant
+    # every slot by default so handler tests don't need a Redis server; tests
+    # exercising budget exhaustion patch app.actions.handlers.lotek_slot to
+    # raise NoConnectionSlot themselves.
+    #
+    # Every call's (username, kwargs) is recorded in order so tests can assert
+    # on how a given handler actually invokes lotek_slot (e.g. that the
+    # per-device/backfill paths still pass max_wait_seconds) — a signature
+    # check alone proves nothing about the call sites (review finding I1).
+    from contextlib import asynccontextmanager
+
+    calls = []
+
+    @asynccontextmanager
+    async def granted_slot(username, **kwargs):
+        calls.append({"username": username, **kwargs})
+        yield
+
+    monkeypatch.setattr("app.actions.handlers.lotek_slot", granted_slot)
+    return calls
+
+
+@pytest.fixture(autouse=True)
 def _zero_retry_waits(monkeypatch):
     # Retry-path tests otherwise sleep through real stamina backoff (minutes
     # over the suite, enough to blow a CI step timeout — review finding).

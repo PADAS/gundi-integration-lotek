@@ -1,0 +1,218 @@
+import asyncio
+import logging
+from typing import Optional
+
+from gundi_core.events import LogLevel
+
+from app.actions.client import LotekUnauthorizedException
+from app.actions.core import describe_exception
+from app.services.activity_logger import log_action_activity
+from app.services.lotek_connections import (
+    NoConnectionSlot, SlotBackendUnavailable, SlotWaitBudgetExhausted,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class DeviceTraversal:
+    """Shared chunked-device-loop mechanics for the head pass and the backfill.
+
+    Owns: chunking, gather-with-return_exceptions, fatal re-raise, per-device
+    failure logging, slot-starvation collection, guard-stop detection, and the
+    deferred-tail computation.
+
+    Deliberately does NOT own: whether to re-trigger, what the deferral message
+    says, or what zero progress means. Those differ between the head pass and
+    the backfill and stay in the handlers (spec D6). Keeping policy out is what
+    makes one traversal serve both without a flag soup.
+    """
+
+    def __init__(self, integration, action_id, guards, *, concurrency=1, log_activity=None):
+        self.integration = integration
+        self.integration_id = str(integration.id)
+        self.action_id = action_id
+        self.guards = guards
+        # Handlers supply their deadline-aware best-effort publisher so error
+        # reporting cannot consume the budget reserved for stopping the run.
+        self.log_activity = log_activity if log_activity is not None else log_action_activity
+        # Chunk width: run() gathers one coroutine per device in a chunk, so
+        # this DOES bound in-flight requests for this invocation (PR #20
+        # review — this comment previously denied being a concurrency limit,
+        # which was wrong here of all places, since the gather is five lines
+        # away). What it does not bound is the ACCOUNT: that ceiling lives in
+        # the Redis slot and holds across invocations (spec D1), so a chunk
+        # may oversubscribe it and the slot queues. Callers pass their chunk
+        # width; the default of 1 means "one device per chunk".
+        self.concurrency = concurrency
+        self.failed_devices = []
+        # Two reason-specific lists, not one combined `deferred_devices`:
+        # guard_stopped_devices is the unreached tail cut short by
+        # should_stop() (deadline/breaker/cap); slot_starved_devices is
+        # per-device NoConnectionSlot within an attempted chunk. Callers used
+        # to share one list for both, so a chunk that starved on slots right
+        # before a deadline cut got its starved devices re-triggered/logged as
+        # the deadline tail, and the untouched tail got mislabeled as slot
+        # starvation — devices reported under the wrong reason, and reported
+        # twice when both conditions applied to the same run (review finding).
+        self.guard_stopped_devices = []
+        self.slot_starved_devices = []
+        self.stop_reason: Optional[str] = None
+        self.budget_starved = False
+        self.backend_unavailable = False
+        self._yielded = 0
+        self._marked_failed = 0
+
+    @property
+    def deferred_devices(self):
+        """Union of every deferred device, for the overall reported count and
+        result only. Stop-reason and budget-starved handling must use
+        guard_stopped_devices / slot_starved_devices directly instead of this
+        union — see the constructor comment."""
+        return self.guard_stopped_devices + self.slot_starved_devices
+
+    @property
+    def serviced_devices(self):
+        # Only the caller knows whether a yielded result counts as success, so
+        # it calls mark_failed() for the ones that don't. Discount ONLY those:
+        # a device whose exception the traversal logged never yielded, so
+        # subtracting all of failed_devices would count it twice and could make
+        # a run that serviced devices quietly (nothing new to send) look like
+        # zero progress — which alerts.
+        return self._yielded - self._marked_failed
+
+    def mark_slot_starved(self, device_id):
+        """Caller-side starvation: the device returned a result (it made
+        partial progress before hitting saturation), so the traversal never
+        saw the NoConnectionSlot — but its remaining work was genuinely
+        deferred by a saturated account and must be visible as such:
+        in devices_deferred, in the connection-budget WARNING, and in the
+        callers' budget_starved policy (Copilot round 11). Mirrors
+        mark_failed: bookkeeping lives here, detection lives with the
+        caller."""
+        self.slot_starved_devices.append(device_id)
+        self.budget_starved = True
+
+    def mark_backend_cut(self, device_id):
+        """The backend twin of mark_deadline_cut (Copilot round 13): a device
+        that made partial progress and then hit a Redis failure returns a
+        result, so the traversal never sees SlotBackendUnavailable. Registers
+        the remaining work as deferred and records the backend stop; the
+        caller decides the alerting (partial progress suppresses the
+        zero-progress ERROR, so the caller emits the backend ERROR itself)."""
+        self.guard_stopped_devices.append(device_id)
+        self.stop_reason = self.stop_reason or "redis unavailable"
+        self.backend_unavailable = True
+
+    def mark_deadline_cut(self, device_id):
+        """Caller-side deadline detection: the deadline twin of
+        mark_slot_starved (Copilot round 12). A device that made partial
+        progress and then crossed the soft deadline returns a result, so the
+        traversal never sees SlotWaitBudgetExhausted — and in a last/only
+        chunk no boundary check follows to set stop_reason. Registers the
+        device with the guard-stopped cohort and records the reason (never
+        overwriting one already set)."""
+        self.guard_stopped_devices.append(device_id)
+        self.stop_reason = self.stop_reason or "deadline"
+
+    def mark_failed(self, device_id):
+        """Caller-side failure: the device produced a result, but the result
+        says it failed (e.g. delivery rejected)."""
+        self.failed_devices.append(device_id)
+        self._marked_failed += 1
+
+    async def run(self, work, key, process):
+        work = list(work)
+        for chunk_start in range(0, len(work), self.concurrency):
+            if reason := self.guards.should_stop():
+                self.stop_reason = reason
+                self.guard_stopped_devices.extend(key(item) for item in work[chunk_start:])
+                return
+            chunk = work[chunk_start:chunk_start + self.concurrency]
+            results = await asyncio.gather(
+                *(process(item) for item in chunk),
+                # Collect every task's outcome rather than aborting the chunk on
+                # the first exception: per-device failures must stay per-device.
+                return_exceptions=True,
+            )
+            # Credentials refused is integration-wide and fatal; re-raise it over
+            # any per-device outcomes in the same chunk. Cancellation must also
+            # propagate: with return_exceptions=True a task's CancelledError
+            # comes back as a result, and treating it as a device failure would
+            # swallow shutdown/timeout cancellation and keep the run going.
+            for res in results:
+                if isinstance(res, (LotekUnauthorizedException, asyncio.CancelledError)):
+                    raise res
+            for item, res in zip(chunk, results):
+                device_id = key(item)
+                if isinstance(res, SlotBackendUnavailable):
+                    # REDIS failed to answer, which says nothing about the
+                    # Lotek account budget. Classifying this as starvation set
+                    # budget_starved, which suppresses the caller's
+                    # zero-progress ERROR — so a persistent Redis outage
+                    # looked like a clean capacity deferral and never moved
+                    # the portal health signal (Copilot review, round 5).
+                    # Fall through to the failure branch below: ERROR-logged,
+                    # counted failed, retried next run. Ordered BEFORE the
+                    # NoConnectionSlot check — it is a subclass. This is also
+                    # an ACCOUNT-WIDE backend failure, not device evidence
+                    # (Copilot round 13): the flag below stops the traversal
+                    # after this chunk, so a persistent outage costs one
+                    # chunk's per-device ERRORs plus the caller's action-level
+                    # one — not an ERROR and a full bounded acquire for every
+                    # remaining device in the fan-out.
+                    self.backend_unavailable = True
+                elif isinstance(res, SlotWaitBudgetExhausted):
+                    # The run crossed its soft deadline mid-chunk: DEADLINE
+                    # policy, not starvation. budget_starved must stay clear
+                    # (it mislabels the log and suppresses the backfill's
+                    # zero-progress ERROR — Copilot review, round 10). The
+                    # device joins the guard-stopped cohort: guards.should_stop
+                    # returns "deadline" at the next chunk boundary (the two
+                    # share the same clock and fraction), so the caller's
+                    # deadline disposition — the shard's re-trigger included —
+                    # picks this device up with the tail. Ordered BEFORE the
+                    # NoConnectionSlot check — it is a subclass. Recording the
+                    # reason here matters for the LAST chunk (Copilot round
+                    # 11): with no next boundary should_stop() call,
+                    # stop_reason stayed None and the caller neither logged
+                    # nor re-triggered the deferral — and could emit a
+                    # spurious zero-progress ERROR. Exhaustion IS a deadline
+                    # detection on the same clock, so it records the same
+                    # reason (never overwriting a reason already set).
+                    self.guard_stopped_devices.append(device_id)
+                    self.stop_reason = self.stop_reason or "deadline"
+                    continue
+                elif isinstance(res, NoConnectionSlot):
+                    # Account budget saturated for longer than this run can wait:
+                    # not a device failure and not evidence about Lotek. Defer
+                    # THIS device only; peers and later chunks continue (D3).
+                    self.slot_starved_devices.append(device_id)
+                    self.budget_starved = True
+                    continue
+                if isinstance(res, BaseException):
+                    message = (
+                        f"Failed to process device {device_id} for integration "
+                        f"{self.integration.id}: {describe_exception(res)}"
+                    )
+                    logger.error(message, exc_info=res)
+                    await self.log_activity(
+                        integration_id=self.integration_id,
+                        action_id=self.action_id,
+                        title=message,
+                        level=LogLevel.ERROR,
+                    )
+                    self.failed_devices.append(device_id)
+                    self.guards.record(transport_failure=False)
+                    continue
+                self._yielded += 1
+                yield item, res
+            if self.backend_unavailable:
+                # Shared-backend failure: stop after this chunk. The chunk's
+                # own members already got honest per-device outcomes above;
+                # grinding the remaining chunks through the same dead Redis
+                # would add nothing but noise and wasted budget.
+                self.stop_reason = "redis unavailable"
+                self.guard_stopped_devices.extend(
+                    key(item) for item in work[chunk_start + self.concurrency:]
+                )
+                return

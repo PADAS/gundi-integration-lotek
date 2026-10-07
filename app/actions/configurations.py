@@ -1,6 +1,6 @@
 import pydantic
 
-from typing import Optional
+from typing import List, Optional
 
 from .core import (
     AuthActionConfiguration,
@@ -72,6 +72,46 @@ class PullObservationsConfig(PullActionConfiguration, ExecutableActionMixin):
     )
 
 
+class PullObservationsShardConfig(InternalActionConfiguration):
+    """Internal-only: one shard of the head pass (GUNDI-5620). The scheduled
+    pull_observations action only lists devices and dispatches shards; each
+    shard invocation gets its own MAX_ACTION_EXECUTION_TIME budget, so a large
+    account's fleet no longer has to fit one 540s window. The devices list is
+    always non-empty, which also keeps the config_overrides payload non-empty
+    (see BackfillObservationsConfig for why that matters)."""
+    devices: List[str] = pydantic.Field(
+        ...,
+        min_items=1,
+        title="Devices",
+        description="Device ids this shard is responsible for.",
+    )
+    triggered_by: str = pydantic.Field(
+        "pull_observations",
+        title="Triggered By",
+        description="Which action triggered this shard.",
+    )
+    manual_run: bool = pydantic.Field(
+        False,
+        title="Manual Run",
+        description=(
+            "True when the dispatching pull_observations run was operator-"
+            "triggered while the integration is paused; exempts this shard "
+            "from the pause skip so the portal's Trigger button still pulls."
+        ),
+    )
+    generation: int = pydantic.Field(
+        0,
+        ge=0,
+        title="Generation",
+        description=(
+            "Re-trigger hop count. The dispatcher publishes generation 0; each "
+            "deferred-tail re-trigger increments it. Capped in the handler so a "
+            "shard that keeps deferring falls back to the next scheduled tick "
+            "instead of looping."
+        ),
+    )
+
+
 class BackfillObservationsConfig(InternalActionConfiguration):
     """Internal-only: triggered by pull_observations, never configured in the portal.
 
@@ -88,4 +128,13 @@ class BackfillObservationsConfig(InternalActionConfiguration):
         "pull_observations",
         title="Triggered By",
         description="Which action triggered this backfill run.",
+    )
+    manual_run: bool = pydantic.Field(
+        False,
+        title="Manual Run",
+        description=(
+            "True when this backfill descends from an operator-triggered head "
+            "pass on a paused integration; exempts it from the pause skip so a "
+            "manual run imports history instead of stopping at the head window."
+        ),
     )

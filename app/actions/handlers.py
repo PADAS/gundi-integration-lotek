@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import httpx
 import logging
 import stamina
@@ -9,15 +10,26 @@ import app.actions.client as client
 import app.settings as app_settings
 import app.settings.integration as settings
 
+import time
+
 from datetime import datetime, timezone, timedelta
 
 from app.services.errors import ConfigurationNotFound
 from app.actions.client import LotekException, LotekTokenExpiredException, LotekUnauthorizedException
 from app.services.utils import find_config_for_action
-from app.actions.configurations import AuthenticateConfig, BackfillObservationsConfig, PullObservationsConfig
-from app.actions.core import action_title
+from app.actions.configurations import (
+    AuthenticateConfig,
+    BackfillObservationsConfig,
+    PullObservationsConfig,
+    PullObservationsShardConfig,
+)
+from app.actions.core import action_title, describe_exception
 from app.actions.device_state import DeviceState
+from app.actions.traversal import DeviceTraversal
 from app.services.action_scheduler import trigger_action
+from app.services.lotek_connections import (
+    lotek_slot, NoConnectionSlot, SlotBackendUnavailable, SlotWaitBudgetExhausted,
+)
 from app.services.activity_logger import activity_logger, log_action_activity
 from app.services.state import IntegrationStateManager
 from gundi_core.schemas.v2.gundi import LogLevel
@@ -45,15 +57,63 @@ BREAKER_THRESHOLD = 3
 BACKFILL_MAX_WINDOWS_PER_DEVICE = 2
 BACKFILL_WINDOW = timedelta(days=7)
 BACKFILL_LEASE_SOURCE = "lease"
-# Devices are fetched in bounded-concurrency chunks over the shared HTTP
-# client (GUNDI-5620). Sequential fetching put 400-600 Lotek round trips on
-# the action budget one at a time, which is what pushed the big integrations
-# into the MAX_ACTION_EXECUTION_TIME ceiling. Guards (deadline + breaker) are
-# checked between chunks, so their granularity coarsens from 1 device to
-# FETCH_CONCURRENCY devices — with the breaker threshold at 3, a fully-bad
-# chunk overshoots by at most 2 requests. Chunk results are recorded in list
-# order, preserving the sequential consecutive-failure semantics.
+# How many devices one invocation processes per chunk. This IS a per-invocation
+# concurrency limit — DeviceTraversal gathers one coroutine per device in the
+# chunk — but it is NOT the account ceiling (PR #20 review: an earlier version
+# of this comment said "not a concurrency limit", which was wrong). The
+# account-wide, cross-invocation ceiling is LOTEK_MAX_CONNECTIONS, enforced in
+# Redis by lotek_slot, which WAITS rather than refusing; chunk size may
+# oversubscribe it because the budget applies backpressure (spec D1). Raising
+# this does not buy throughput against Lotek — it just parks more coroutines at
+# the slot.
 FETCH_CONCURRENCY = 5
+# How much work fits in one action budget, i.e. how the dispatcher partitions
+# the fleet across sub-actions. Pure work partitioning: unlike
+# FETCH_CONCURRENCY this really does not bound concurrency at all — shards run
+# as separate pubsub-triggered invocations, so their overlap is decided by the
+# scheduler and LOTEK_MAX_CONNECTIONS, never by this number. Do not shrink it
+# to "fit" LOTEK_MAX_CONNECTIONS; that reintroduces the coupling spec D1
+# removed.
+SHARD_SIZE = 25
+# Re-trigger governor (review finding, PR #20 discussion): a deferred tail may
+# hop to a fresh shard at most this many times before falling back to the next
+# scheduled tick. Without the cap, sustained slot starvation turned the
+# "pubsub round trip is the backoff" re-trigger into an unbounded busy-loop of
+# zero-progress invocations — bounded waste is acceptable, an ungoverned loop
+# is not. Exceeding the cap is surfaced at ERROR: it means the account could
+# not drain within ~cap budgets and someone should know.
+SHARD_RETRIGGER_CAP = 3
+# Consecutive whole-tick dispatcher skips on slot starvation before the skip
+# is promoted from local log to a portal WARNING. The first skip stays quiet
+# (publish-volume discipline); a streak means the account budget has been
+# saturated across ticks and must be visible in the portal.
+DISPATCHER_SKIP_WARN_AFTER = 2
+DISPATCHER_SKIP_STREAK_SOURCE = "slot_skip_streak"
+# How many device cursors the dispatcher reads concurrently when ordering the
+# fleet. Independent of SHARD_SIZE (this bounds Redis fan-out, not action
+# budget) — named so tuning one does not silently look like it covers the other.
+STATE_READ_CONCURRENCY = 25
+
+# How many shard commands the dispatcher publishes at once. Serial publishes
+# meant a commands-topic outage (publish_event burns ~36s of retries before
+# failing) could exceed the whole action budget before the loop reached every
+# shard on a large fleet — 25 shards x 36s far exceeds 540s — aborting the
+# fan-out through the runner's generic failure path and breaking the
+# per-shard isolation contract (PR #20 review). Bounded, not unbounded: the
+# publish path is the one GUNDI-5620 blamed for congestion, so this overlaps
+# enough to keep the worst case inside the budget without recreating it.
+DISPATCH_CONCURRENCY = 5
+# Outcomes of a deferred-tail re-trigger attempt (see _retrigger_shard).
+RETRIGGER_HANDED_OFF = "handed_off"
+RETRIGGER_CAP_REACHED = "cap_reached"
+RETRIGGER_FAILED = "failed"
+# One backfill trigger per head-pass tick: every shard of a gapped fleet used
+# to read the lease and publish its own backfill command (the lease is only
+# created a pubsub hop later, when the backfill handler runs), so 25 shards
+# produced up to 25 commands — 24 of them full no-op invocations with their own
+# activity events (review finding). This claim is atomic, so exactly one shard
+# publishes per window.
+BACKFILL_TRIGGER_CLAIM_SOURCE = "backfill_trigger_claim"
 # Head fetches re-cover this much of the cursor's trailing edge: rows whose
 # server-assigned UploadTimeStamp falls inside a window we already queried can
 # become queryable only after our request completed (write latency / clock
@@ -66,6 +126,14 @@ HEAD_LATE_UPLOAD_OVERLAP = timedelta(hours=2)
 def _deadline_exceeded(run_started_at):
     elapsed = (datetime.now(tz=timezone.utc) - run_started_at).total_seconds()
     return elapsed > DEADLINE_FRACTION * app_settings.MAX_ACTION_EXECUTION_TIME
+
+
+def _slot_wait_budget(run_started_at):
+    """Seconds this run can still afford to spend queueing for a connection
+    slot. Mirrors _deadline_exceeded's fraction so waiting stops exactly when
+    the traversal would have stopped anyway."""
+    elapsed = (datetime.now(tz=timezone.utc) - run_started_at).total_seconds()
+    return max(0.0, DEADLINE_FRACTION * app_settings.MAX_ACTION_EXECUTION_TIME - elapsed)
 
 
 def _fetch_retry_kwargs(run_started_at):
@@ -108,17 +176,86 @@ def _summarize_ids(ids):
     return listed
 
 
-async def _log_deferral(integration, action_id, reason, deferred_ids):
+# Monotonic instant after which this action must not start another publish.
+# Set once per handler invocation; a ContextVar rather than a module global so
+# concurrently-running actions in one worker each see their own value (asyncio
+# tasks inherit a copy of the context, so a set here never leaks sideways).
+_publish_deadline = contextvars.ContextVar("lotek_publish_deadline", default=None)
+
+# Seconds reserved for @activity_logger's completion publish, which this module
+# cannot wrap — the decorator applies it after the handler returns. Sized to one
+# publish_event retry budget (~36s) plus slack.
+COMPLETION_EVENT_RESERVE = 45.0
+
+
+def _arm_publish_deadline():
+    """Bound every later publish in this invocation by the action's HARD
+    timeout, not just by the soft deadline.
+
+    A deadline cut at DEADLINE_FRACTION leaves ~108s, but each post-work
+    publish can burn a full publish_event retry budget (~36s) under Pub/Sub
+    degradation: re-trigger + deferral WARNING + completion event consumes the
+    whole margin, and a failed re-trigger adds a fourth. The run then blows
+    MAX_ACTION_EXECUTION_TIME and lands in action_runner's generic handler,
+    which publishes config_data carrying plaintext auth — the exact path the
+    never-raise convention exists to avoid (PR #20 review).
+
+    Armed at handler entry, so it also covers @activity_logger's START publish
+    having already run: that time is simply elapsed by the time we measure.
+    """
+    _publish_deadline.set(
+        time.monotonic() + app_settings.MAX_ACTION_EXECUTION_TIME - COMPLETION_EVENT_RESERVE
+    )
+
+
+async def _bounded_publish(coro, what, *, required=False):
+    """Await a best-effort publish under the remaining hard-deadline budget.
+
+    Activity events tolerate being dropped. Command callers pass required=True
+    so a skipped or timed-out command remains a failure: their existing error
+    paths record undispatched work and release unconsumed trigger claims.
+    """
+    deadline = _publish_deadline.get()
+    if deadline is None:
+        return await coro          # unarmed (e.g. a direct unit-test call)
+    budget = deadline - time.monotonic()
+    if budget <= 0:
+        coro.close()
+        logger.warning(f"Skipping {what}: no action budget left before the hard timeout.")
+        if required:
+            raise asyncio.TimeoutError(f"No action budget left for {what}")
+        return None
+    try:
+        return await asyncio.wait_for(coro, timeout=budget)
+    except asyncio.TimeoutError:
+        if required:
+            raise
+        logger.warning(
+            f"Gave up on {what} after {budget:.1f}s: the action budget is nearly spent "
+            f"and the hard timeout must not be reached."
+        )
+        return None
+
+
+async def _log_deferral(integration, action_id, reason, deferred_ids, disposition="to the next run"):
+    # disposition tells the operator what actually happens to the tail: a
+    # deadline-cut shard hands it to a re-triggered shard immediately, while a
+    # breaker stop really does wait for the next scheduled tick (Copilot
+    # review: the fixed "to the next run" text was misleading under deadline
+    # pressure).
     message = (
         f"Stopping early ({reason}) for integration {integration.id}: deferring "
-        f"{len(deferred_ids)} device(s) to the next run: {_summarize_ids(deferred_ids)}."
+        f"{len(deferred_ids)} device(s) {disposition}: {_summarize_ids(deferred_ids)}."
     )
     logger.warning(message)
-    await log_action_activity(
-        integration_id=str(integration.id),
-        action_id=action_id,
-        title=message,
-        level=LogLevel.WARNING
+    await _bounded_publish(
+        log_action_activity(
+            integration_id=str(integration.id),
+            action_id=action_id,
+            title=message,
+            level=LogLevel.WARNING
+        ),
+        "a deferral WARNING",
     )
 
 
@@ -128,22 +265,19 @@ async def _try_log_activity(integration_id, action_id, title, level):
     already-delivered counts and resets the circuit-breaker streak with a
     failure that says nothing about Lotek (review finding)."""
     try:
-        await log_action_activity(
-            integration_id=integration_id,
-            action_id=action_id,
-            title=title,
-            level=level
+        await _bounded_publish(
+            log_action_activity(
+                integration_id=integration_id,
+                action_id=action_id,
+                title=title,
+                level=level
+            ),
+            "an activity-log event",
         )
     except Exception as e:
         logger.warning(
             f"Could not publish activity log for integration {integration_id}: {describe_exception(e)}"
         )
-
-
-def describe_exception(exc):
-    # httpx timeout exceptions carry an empty message, which used to render as a bare
-    # "Exception: " in the activity log and told operators nothing.
-    return str(exc) or type(exc).__name__
 
 
 def generate_batches(iterable, n=settings.OBSERVATIONS_BATCH_SIZE):
@@ -250,17 +384,94 @@ def ensure_timezone_aware(val: datetime, default_tz: timezone = timezone.utc) ->
 @action_title("Integration Settings")
 @activity_logger()
 async def action_pull_observations(integration, action_config: PullObservationsConfig):
+    """Dispatcher (GUNDI-5620, movebank-connector pattern): list the account's
+    devices, order them least-fresh first, and fan the fleet out as
+    pull_observations_shard sub-actions of SHARD_SIZE ids each. Every shard
+    invocation gets its own MAX_ACTION_EXECUTION_TIME budget, so a 600-device
+    account no longer has to fit one 540s window.
+
+    RESULT CONTRACT CHANGE (Copilot review): this action no longer does the
+    fetching, so it no longer reports `observations_extracted`, `devices_failed`
+    or `devices_deferred` — those now belong to each pull_observations_shard
+    result (and its completion event). This action returns `devices_found` and
+    `shards_triggered`, plus `devices_undispatched` when a publish failed, and
+    `skipped`/`reason` when the tick was skipped. Anything aggregating per-tick
+    throughput must sum the shard results instead of reading this one.
+    """
     # Log only the id: the full Integration object embeds auth config data in
     # plaintext (same leak family as the action-runner _handle_error ticket).
     logger.info(f"Executing pull_observations action for integration {integration.id}...")
 
-    # The clock starts before get_devices: it spends the same action budget.
-    run_started = datetime.now(tz=timezone.utc)
+    integration_id = str(integration.id)
+    _arm_publish_deadline()
     auth = get_auth_config(integration)
     try:
         async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
             with attempt:
-                device_list = await client.get_devices(integration, auth)
+                # Token outside the slot — see _fetch_window.
+                await client.get_token(integration, auth)
+                # Deliberately fail-fast here (no max_wait_seconds), unlike
+                # every per-device/backfill acquire, which now waits. This is
+                # not an inconsistency to "harmonise" away, but be precise
+                # about what it buys (Copilot review): it is a PARTIAL
+                # tick-overlap damper, not a governor. It samples
+                # INSTANTANEOUS saturation — shards release their slot
+                # between requests while they deliver and checkpoint, so a
+                # transiently free slot usually exists even under full load,
+                # and an overlapping tick can still fan out. Overlap itself
+                # is tolerated by design and predates sharding: at-least-once
+                # pubsub already re-runs whole ticks, cursors make re-fetches
+                # idempotent, re-sends are tolerated, and SHARD_RETRIGGER_CAP
+                # bounds each tick's total work. What refusing fast DOES buy:
+                # this dispatcher never spends its own budget queueing behind
+                # shard work (a wait here delays the freshest-first ordering
+                # of the NEXT fan-out), and a fully-saturated instant — the
+                # one case sampling can see — skips the tick outright. A
+                # per-account outstanding-work lease would close the gap
+                # fully, but its completion detection (when is a fan-out of
+                # independent pubsub shards "done"?) is a new coordination
+                # mechanism guarding an already-tolerated hazard — rejected
+                # for now. Do not add max_wait_seconds to this call.
+                async with lotek_slot(auth.username):
+                    device_list = await client.get_devices(integration, auth)
+    except SlotBackendUnavailable as e:
+        # REDIS failed to answer, which is not account saturation (Copilot
+        # review, round 5): the quiet capacity-skip below (INFO + streak) left
+        # a persistent Redis outage invisible to the portal health signal —
+        # pulls stopped while everything reported clean deferrals. ERROR
+        # immediately (pre-consolidation, a dispatcher Redis failure was an
+        # ERROR too — via the raise into _handle_error this branch exists to
+        # avoid), skip the Redis-backed streak counter, and return a distinct
+        # reason. Ordered BEFORE NoConnectionSlot — it is a subclass.
+        message = (
+            f"Skipping pull for integration {integration_id}: could not reach Redis "
+            f"to acquire a Lotek connection slot: {describe_exception(e)}"
+        )
+        logger.error(message)
+        await _try_log_activity(
+            integration_id, "pull_observations", message, LogLevel.ERROR
+        )
+        return {"skipped": True, "reason": "redis_unavailable"}
+    except NoConnectionSlot:
+        # Account budget saturated (shards/backfills from a previous tick are
+        # still draining). Scheduled tick — skip cleanly and let the next one
+        # retry, mirroring the movebank pull's no_connection_slot skip. A
+        # single skip stays out of the portal, but a STREAK of skipped ticks
+        # means the account has been saturated for tens of minutes and must
+        # not stay invisible (review finding: this was logger.info only).
+        message = (
+            f"Skipping pull for integration {integration_id}: Lotek connection budget "
+            f"exhausted; the next scheduled tick will retry."
+        )
+        logger.info(message)
+        streak = await _bump_dispatcher_skip_streak(integration_id)
+        if streak >= DISPATCHER_SKIP_WARN_AFTER:
+            await _try_log_activity(
+                integration_id, "pull_observations",
+                f"{message} ({streak} consecutive ticks skipped on connection-budget exhaustion.)",
+                LogLevel.WARNING,
+            )
+        return {"skipped": True, "reason": "no_connection_slot"}
     except httpx.TransportError as e:
         # Transport failures reaching Lotek are the same class the per-device
         # breaker treats as WARNING; classifying them ERROR here marked every
@@ -272,127 +483,388 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             f"{describe_exception(e)}. The run will be retried on the next schedule."
         )
         logger.warning(message)
-        await log_action_activity(
-            integration_id=str(integration.id),
-            action_id="pull_observations",
-            title=message,
-            level=LogLevel.WARNING
+        await _bounded_publish(
+            log_action_activity(
+                integration_id=integration_id,
+                action_id="pull_observations",
+                title=message,
+                level=LogLevel.WARNING
+            ),
+            "an activity-log event",
         )
+        # Any non-starved outcome breaks the "consecutive" skip streak — a
+        # transport skip between two slot skips must not let them read as
+        # adjacent (review finding).
+        await _reset_dispatcher_skip_streak(integration_id)
         return {
-            "observations_extracted": 0,
-            "devices_failed": [],
-            "devices_deferred": [],
+            "devices_found": 0,
+            "shards_triggered": 0,
             "skipped": True,
             "reason": "lotek_unreachable",
         }
     except Exception as e:
         message = f"Error fetching devices from Lotek. Integration ID: {integration.id} Exception: {describe_exception(e)}"
         logger.exception(message)
-        await log_action_activity(
-            integration_id=str(integration.id),
-            action_id="pull_observations",
-            title=message,
-            level=LogLevel.ERROR
+        await _bounded_publish(
+            log_action_activity(
+                integration_id=integration_id,
+                action_id="pull_observations",
+                title=message,
+                level=LogLevel.ERROR
+            ),
+            "an activity-log event",
         )
+        # Same reason as the transport path: a non-starved outcome breaks the
+        # "consecutive" skip streak (review finding — this path was missed).
+        await _reset_dispatcher_skip_streak(integration_id)
         raise  # bare: preserve the original traceback
 
     logger.info(f"Extracted {len(device_list)} devices from Lotek for inbound: {integration.id}")
-    present_time = datetime.now(tz=timezone.utc)
-    # Least-fresh first (mirrors the backfill's LRS ordering): the deadline and
-    # breaker always cut the tail of this list, and Lotek returns devices in a
-    # stable order — without re-ordering, sustained slowness starved the same
-    # tail devices every run until bounded staleness dropped their data
-    # permanently (review finding). Sorting by high_water puts the devices
-    # most behind first, so deferral rotates naturally as serviced devices
-    # move to the back.
-    integration_id = str(integration.id)
-    device_states = []
-    for device in device_list:
-        state, is_new = await _load_device_state(
-            integration_id, device.nDeviceID, present_time, action_config
+    await _reset_dispatcher_skip_streak(integration_id)
+    if not device_list:
+        return {"devices_found": 0, "shards_triggered": 0}
+
+    # Least-fresh first (mirrors the backfill's LRS ordering): if shards get
+    # cut by their rails, it's always the freshest tail that defers, and the
+    # ordering rotates naturally as serviced devices move to the back. Reads
+    # only the saved cursor (one Redis get per device); devices with no state
+    # yet sort first (most behind by definition).
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+
+    async def read_high_water(device_id):
+        # quiet: the shard publishes the unparseable-state warning when it
+        # actually discards the cursor; this read only orders the fleet.
+        state = await _read_device_state(integration_id, device_id, quiet=True)
+        return device_id, state.high_water if state else epoch
+
+    # Bounded-concurrency reads (Copilot review): sequential awaits made this
+    # sort a per-device Redis round trip — a latency multiplier on exactly the
+    # large fleets sharding exists to serve. STATE_READ_CONCURRENCY keeps the
+    # dispatcher fast without a thundering herd on Redis.
+    staleness = []
+    all_ids = [device.nDeviceID for device in device_list]
+    for batch in generate_batches(all_ids, STATE_READ_CONCURRENCY):
+        staleness.extend(await asyncio.gather(*(read_high_water(d) for d in batch)))
+    staleness.sort(key=lambda entry: entry[1])
+    device_ids = [device_id for device_id, _ in staleness]
+
+    # Manual-run marker: the runner's pause check only skips SCHEDULED runs,
+    # so if this dispatcher is executing while run_on_schedule is off, the run
+    # is manual — the shards it publishes are machine-triggered and would
+    # otherwise skip on the pause, silently breaking the portal's Trigger
+    # button for the whole head pass (review finding).
+    manual_run = not action_config.run_on_schedule
+
+    # Per-shard guard (review finding): an unguarded loop let one pubsub blip
+    # abort every remaining shard AND escape through the runner's generic
+    # error handler (whose ERROR event embeds the integration's full config,
+    # auth included). Failures are collected, not fatal — the next tick
+    # re-lists and re-shards everything.
+    shards = list(generate_batches(device_ids, SHARD_SIZE))
+    dispatched = 0
+    undispatched_devices = []
+
+    async def _dispatch_one(shard):
+        # Returns the shard on failure, None on success, so the caller can
+        # keep per-shard isolation while the publishes overlap.
+        try:
+            await _bounded_publish(
+                trigger_action(
+                    integration_id, "pull_observations_shard",
+                    config=PullObservationsShardConfig(
+                        devices=shard, triggered_by="pull_observations", manual_run=manual_run
+                    )
+                ),
+                "a shard dispatch",
+                required=True,
+            )
+            return None
+        except Exception as e:
+            logger.warning(
+                f"Could not dispatch a shard of {len(shard)} device(s) for integration "
+                f"{integration_id}: {describe_exception(e)}"
+            )
+            return shard
+
+    for batch in generate_batches(shards, DISPATCH_CONCURRENCY):
+        # return_exceptions so an unexpected error in one publish cannot abort
+        # the batch — the same isolation the serial loop's try/except gave,
+        # preserved under concurrency.
+        outcomes = await asyncio.gather(
+            *(_dispatch_one(shard) for shard in batch), return_exceptions=True
         )
-        device_states.append((device, state, is_new))
+        # Cancellation must propagate, never be recorded as a failed publish
+        # (PR #20 review): return_exceptions=True turns a child
+        # CancelledError into a RESULT, so worker shutdown or the action
+        # timeout would be swallowed and the dispatcher would keep publishing.
+        # Same guard the traversal applies to its own gather.
+        for outcome in outcomes:
+            if isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+        for shard, outcome in zip(batch, outcomes):
+            if outcome is None:
+                dispatched += 1
+            elif isinstance(outcome, BaseException):
+                undispatched_devices.extend(shard)
+                logger.warning(
+                    f"Could not dispatch a shard of {len(shard)} device(s) for integration "
+                    f"{integration_id}: {describe_exception(outcome)}"
+                )
+            else:
+                undispatched_devices.extend(outcome)
+    if undispatched_devices:
+        message = (
+            f"Dispatched {dispatched} of {len(shards)} shard(s) for integration "
+            f"{integration_id}; {len(undispatched_devices)} device(s) get no pull this "
+            f"tick and are retried on the next schedule: {_summarize_ids(undispatched_devices)}."
+        )
+        logger.warning(message)
+        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.WARNING)
+    if shards and dispatched == 0:
+        # Nothing was handed off at all: systemic (commands topic down). ERROR
+        # activity event rather than a raise, for the same reason as the shard's
+        # zero-progress path — a raise routes through the runner's generic
+        # _handle_error, which publishes every integration configuration
+        # (plaintext Lotek password included) into the event payload.
+        message = (
+            f"Could not dispatch any of {len(shards)} shard(s) for integration "
+            f"{integration_id}; see the application log for the publish errors."
+        )
+        logger.error(message)
+        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.ERROR)
+    result = {"devices_found": len(device_list), "shards_triggered": dispatched}
+    if undispatched_devices:
+        result["devices_undispatched"] = undispatched_devices
+    return result
+
+
+async def _bump_dispatcher_skip_streak(integration_id):
+    """Count consecutive dispatcher runs that pulled nothing because the account
+    connection budget was saturated. Atomic INCR: two dispatcher runs in the
+    same window (schedule tick plus a redelivery or manual trigger) both
+    starving would lose an increment under a client-side read-modify-write, and
+    the counter would silently never reach DISPATCHER_SKIP_WARN_AFTER."""
+    try:
+        return await state_manager.increment_counter(
+            integration_id, "pull_observations",
+            source_id=DISPATCHER_SKIP_STREAK_SOURCE,
+            ttl_seconds=24 * 3600,
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not track skip streak for integration {integration_id}: {describe_exception(e)}"
+        )
+        return 1
+
+
+async def _reset_dispatcher_skip_streak(integration_id):
+    try:
+        await state_manager.delete_state(
+            integration_id, "pull_observations", DISPATCHER_SKIP_STREAK_SOURCE
+        )
+    except Exception as e:
+        logger.warning(
+            f"Could not reset skip streak for integration {integration_id}: {describe_exception(e)}"
+        )
+
+
+async def _retrigger_shard(integration, device_ids, generation, manual_run=False):
+    """Re-dispatch deferred devices as a fresh shard with its own budget,
+    instead of parking them until the next scheduled tick.
+
+    Governed by SHARD_RETRIGGER_CAP: `generation` is the CURRENT shard's hop
+    count, and the cap bounds how deep a defer-retrigger chain can grow before
+    the tail falls back to the next scheduled tick — an ungoverned chain under
+    sustained slot starvation was an unbounded busy-loop of zero-progress
+    invocations, invisible because each hop reported success (review finding).
+
+    Returns one of:
+      RETRIGGER_HANDED_OFF  — a fresh shard owns the tail
+      RETRIGGER_CAP_REACHED — cap hit; the tail waits for the next tick and the
+                              exhaustion was already reported at ERROR, so the
+                              caller must NOT also emit its own alert (review
+                              finding: one load event produced two ERRORs)
+      RETRIGGER_FAILED      — publish failed; nobody owns the tail this tick
+    """
+    integration_id = str(integration.id)
+    if generation >= SHARD_RETRIGGER_CAP:
+        # ERROR, not WARNING: the account failed to drain within ~cap action
+        # budgets — either the connection budget is far too small for the
+        # fleet or something is systemically slow. The data self-heals on the
+        # next tick; the signal must not.
+        message = (
+            f"Shard re-trigger cap ({SHARD_RETRIGGER_CAP}) reached for integration "
+            f"{integration_id}: deferring {len(device_ids)} device(s) to the next "
+            f"scheduled tick: {_summarize_ids(device_ids)}."
+        )
+        logger.error(message)
+        await _try_log_activity(
+            integration_id, "pull_observations_shard", message, LogLevel.ERROR
+        )
+        return RETRIGGER_CAP_REACHED
+    try:
+        await _bounded_publish(
+            trigger_action(
+                integration_id, "pull_observations_shard",
+                config=PullObservationsShardConfig(
+                    devices=device_ids,
+                    triggered_by="pull_observations_shard",
+                    generation=generation + 1,
+                    manual_run=manual_run,
+                )
+            ),
+            "a shard re-trigger",
+            required=True,
+        )
+        return RETRIGGER_HANDED_OFF
+    except Exception as e:
+        logger.warning(
+            f"Could not re-trigger shard for integration {integration_id}: {describe_exception(e)}"
+        )
+        return RETRIGGER_FAILED
+
+
+# on_start=False: the dispatcher's own started event already marks the tick, and
+# a started event per shard doubled the publish volume on the aiohttp/pubsub
+# path GUNDI-5620 identified as the dominant error source (review finding). The
+# completion event is kept — it carries this shard's observations_extracted.
+@activity_logger(on_start=False)
+async def action_pull_observations_shard(integration, action_config: PullObservationsShardConfig):
+    """Internal action: process one shard of the head pass. Machine-triggered
+    by pull_observations (and by itself, for a deadline-deferred tail)."""
+    logger.info(
+        f"Executing pull_observations_shard ({len(action_config.devices)} devices) "
+        f"for integration {integration.id}..."
+    )
+    integration_id = str(integration.id)
+    run_started = datetime.now(tz=timezone.utc)
+    _arm_publish_deadline()
+    try:
+        auth = get_auth_config(integration)
+        pull_config = get_pull_config(integration)
+    except ConfigurationNotFound as e:
+        # Skip quietly, mirroring backfill: machine-triggered, so raising would
+        # route through the generic _handle_error — an ERROR event embedding
+        # the integration's full config (auth included). The scheduled parent
+        # is where a missing config gets surfaced.
+        logger.warning(
+            f"Skipping shard for integration {integration_id}: {describe_exception(e)}"
+        )
+        return {"skipped": True, "reason": "configuration_missing"}
+
+    if not pull_config.run_on_schedule and not action_config.manual_run:
+        # The operator's pause toggle must also stop the shard cascade:
+        # internal actions bypass the runner's skippable_pull pause check.
+        # manual_run exempts shards belonging to a portal-triggered run — the
+        # runner only pauses SCHEDULED runs, and without the exemption a
+        # manual Trigger on a paused integration dispatched shards that all
+        # skipped, showing success while pulling nothing (review finding).
+        logger.info(f"Integration {integration_id} is paused (run_on_schedule=false); skipping shard.")
+        return {"skipped": True, "reason": "integration_paused"}
+
+    present_time = datetime.now(tz=timezone.utc)
+    # Batched like the dispatcher's fleet-ordering reads: the sort below forces
+    # every state eager anyway, so sequential awaits were a flat ~SHARD_SIZE
+    # round-trip startup tax per invocation and per re-trigger hop.
+    # _load_device_state performs no Redis write (its legacy-migration branch
+    # only mutates the in-memory state and returns is_new=True for a later
+    # save), so it is side-effect-free and order-independent.
+    device_states = []
+    for batch in generate_batches(list(action_config.devices), STATE_READ_CONCURRENCY):
+        loaded = await asyncio.gather(
+            *(
+                _load_device_state(integration_id, device_id, present_time, pull_config)
+                for device_id in batch
+            )
+        )
+        device_states.extend(
+            (device_id, state, is_new)
+            for device_id, (state, is_new) in zip(batch, loaded)
+        )
+    # Least-fresh first within the shard too: a rail cut defers the freshest tail.
     device_states.sort(key=lambda entry: entry[1].high_water)
 
     guards = RunGuards(run_started)
+    traversal = DeviceTraversal(
+        integration, "pull_observations_shard", guards, concurrency=FETCH_CONCURRENCY,
+        log_activity=_try_log_activity,
+    )
     observations_extracted = 0
-    failed_devices = []
-    deferred_devices = []
-    serviced_devices = 0
-    # Only reflects devices actually processed this run — a device deferred by
-    # the deadline/breaker before its gap status is checked doesn't trigger
-    # backfill this cycle. Self-correcting: the next run's head pass reaches it
-    # and triggers then, same as the worst-case import delay the design accepts.
-    any_open_gap = False
     stale_drops = []
-    for chunk_start in range(0, len(device_states), FETCH_CONCURRENCY):
-        if reason := guards.should_stop():
-            deferred_devices = [d.nDeviceID for d, _, _ in device_states[chunk_start:]]
-            await _log_deferral(integration, "pull_observations", reason, deferred_devices)
-            break
-        chunk = device_states[chunk_start:chunk_start + FETCH_CONCURRENCY]
-        results = await asyncio.gather(
-            *(
-                _head_pass_device(
-                    device, state, is_new, integration, auth, action_config,
-                    present_time, guards, stale_drops=stale_drops
-                )
-                for device, state, is_new in chunk
-            ),
-            # Collect every task's outcome rather than aborting the chunk on
-            # the first exception: per-device failures must stay per-device.
-            return_exceptions=True,
+    # Only reflects devices actually processed this run — a device deferred by
+    # the rails before its gap status is checked doesn't trigger backfill this
+    # cycle. Self-correcting: the re-triggered tail (or the next tick) reaches it.
+    any_open_gap = False
+
+    async for (device_id, state, is_new), res in traversal.run(
+        device_states,
+        key=lambda entry: entry[0],
+        process=lambda entry: _head_pass_device(
+            entry[0], entry[1], entry[2], integration, auth, pull_config,
+            present_time, guards, stale_drops=stale_drops,
+        ),
+    ):
+        sent, device_failed, transport_failure = res
+        # Single recording site: transport failures arm the breaker, anything
+        # else (success included) breaks the consecutive streak.
+        guards.record(transport_failure=transport_failure)
+        observations_extracted += sent
+        if state.has_gap:
+            any_open_gap = True
+        if device_failed:
+            traversal.mark_failed(device_id)
+
+    failed_devices = traversal.failed_devices
+    # Union, for the overall count/result only (below). The retrigger and the
+    # two deferral logs each use their own reason-specific list — sharing one
+    # combined list here re-triggered/logged slot-starved devices under a
+    # "deadline" tail and vice versa, and double-reported any device covered
+    # by both conditions in the same run (review finding).
+    deferred_devices = traversal.deferred_devices
+
+    # Policy, deliberately NOT in the traversal (spec D6): a deadline cut gets a
+    # fresh budget immediately; a hot breaker does NOT re-trigger — that would
+    # defeat the pause the breaker exists to buy. Its devices wait for the next
+    # scheduled tick.
+    retrigger_outcome = None
+    if traversal.stop_reason == "deadline" and traversal.guard_stopped_devices:
+        retrigger_outcome = await _retrigger_shard(
+            integration, traversal.guard_stopped_devices, action_config.generation,
+            manual_run=action_config.manual_run,
         )
-        # Credentials refused is integration-wide and fatal; re-raise it over
-        # any per-device outcomes in the same chunk. Cancellation must also
-        # propagate: with return_exceptions=True a task's CancelledError comes
-        # back as a result, and treating it as a device failure would swallow
-        # shutdown/timeout cancellation and keep the run going.
-        for res in results:
-            if isinstance(res, (LotekUnauthorizedException, asyncio.CancelledError)):
-                raise res
-        for (device, state, is_new), res in zip(chunk, results):
-            if isinstance(res, BaseException):
-                # Sending to Gundi and checkpointing can fail too, and a device that fetched
-                # fine but failed downstream must not take the rest of the batch with it.
-                message = (
-                    f"Failed to process device {device.nDeviceID} for integration "
-                    f"{integration.id}: {describe_exception(res)}"
-                )
-                logger.error(message, exc_info=res)
-                await log_action_activity(
-                    integration_id=str(integration.id),
-                    action_id="pull_observations",
-                    title=message,
-                    level=LogLevel.ERROR
-                )
-                failed_devices.append(device.nDeviceID)
-                guards.record(transport_failure=False)
-                continue
-            sent, device_failed, transport_failure = res
-            # Single recording site: transport failures arm the breaker, anything
-            # else (success included) breaks the consecutive streak.
-            guards.record(transport_failure=transport_failure)
-            observations_extracted += sent
-            if state.has_gap:
-                any_open_gap = True
-            if device_failed:
-                failed_devices.append(device.nDeviceID)
-            else:
-                serviced_devices += 1
+    if traversal.stop_reason:
+        await _log_deferral(
+            integration, "pull_observations_shard", traversal.stop_reason,
+            traversal.guard_stopped_devices,
+            disposition=(
+                "to an immediately re-triggered shard"
+                if retrigger_outcome == RETRIGGER_HANDED_OFF
+                else "to the next scheduled run"
+            ),
+        )
+    if traversal.budget_starved:
+        # Portal WARNING like every other deferral cause: a starved tail must
+        # not park with zero portal visibility (review finding).
+        await _log_deferral(
+            integration, "pull_observations_shard", "connection budget exhausted",
+            traversal.slot_starved_devices, disposition="to the next scheduled run",
+        )
 
     if failed_devices:
         message = (
-            f"Pulled observations with {len(failed_devices)} of {len(device_list)} device(s) "
+            f"Pulled observations with {len(failed_devices)} of {len(action_config.devices)} device(s) "
             f"failing for integration {integration.id}: {_summarize_ids(failed_devices)}. "
             f"They will be retried on the next run."
         )
         logger.warning(message)
-        await log_action_activity(
-            integration_id=str(integration.id),
-            action_id="pull_observations",
-            title=message,
-            level=LogLevel.WARNING
+        await _bounded_publish(
+            log_action_activity(
+                integration_id=integration_id,
+                action_id="pull_observations_shard",
+                title=message,
+                level=LogLevel.WARNING
+            ),
+            "an activity-log event",
         )
 
     if stale_drops:
@@ -401,66 +873,190 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         # finding on the publish-volume fix). Per-device ranges are in the
         # local log.
         message = (
-            f"Dropped data older than max_data_age_hours={action_config.max_data_age_hours} "
+            f"Dropped data older than max_data_age_hours={pull_config.max_data_age_hours} "
             f"permanently for {len(stale_drops)} device(s) on integration {integration.id}: "
             f"{_summarize_ids(stale_drops)}. See the application log for per-device ranges."
         )
         logger.warning(message)
-        await log_action_activity(
-            integration_id=str(integration.id),
-            action_id="pull_observations",
-            title=message,
-            level=LogLevel.WARNING
+        await _bounded_publish(
+            log_action_activity(
+                integration_id=integration_id,
+                action_id="pull_observations_shard",
+                title=message,
+                level=LogLevel.WARNING
+            ),
+            "an activity-log event",
         )
 
-    if device_list and serviced_devices == 0 and observations_extracted == 0:
-        # Zero progress: nothing serviced and nothing delivered — whether every
-        # device failed or the rails deferred them all, this is systemic
-        # degradation and must alert rather than publish action_complete. A
-        # device that delivered part of its window before failing still counts
-        # as progress, so partial runs stay warnings. This comes after the
-        # summary so the worst case keeps its device-naming log.
-        raise LotekException(
-            message=(
-                f"No devices could be serviced for integration {integration.id}: "
-                f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
-                f"{len(device_list)}. See the per-device errors in this action's activity log."
-            )
+    # Suppression policy, preserved EXACTLY as it was before the traversal
+    # existed: a successful hand-off, a cap-reached deferral (which already
+    # alerted at ERROR inside _retrigger_shard), or slot starvation all explain
+    # the lack of progress. A BREAKER stop deliberately does not — a Lotek-wide
+    # outage must still raise the zero-progress ERROR that the cdip health
+    # metric counts.
+    deferred_cleanly = (
+        retrigger_outcome in (RETRIGGER_HANDED_OFF, RETRIGGER_CAP_REACHED)
+        # Starvation explains a no-progress run only when nothing actually
+        # FAILED (PR #20 review). A mixed run — four devices timing out on
+        # Lotek, tripping the breaker, plus one losing the slot race — used
+        # to be silenced by budget_starved alone, contradicting the comment
+        # above: a breaker stop must still alert. Failures mean the run has a
+        # real cause that is not capacity.
+        or (traversal.budget_starved and not failed_devices)
+    )
+    if traversal.backend_unavailable:
+        # One action-level ERROR per run for a shared-backend outage (Copilot
+        # round 13); see the backfill handler's twin for the rationale.
+        message = (
+            f"Redis unavailable during shard for integration {integration.id}: "
+            f"stopped after the current chunk; {len(traversal.deferred_devices)} device(s) deferred."
+        )
+        logger.error(message)
+        await _try_log_activity(
+            integration_id, "pull_observations_shard", message, LogLevel.ERROR
         )
 
-    if any_open_gap:
+    zero_progress = (
+        device_states and traversal.serviced_devices == 0
+        and observations_extracted == 0 and not deferred_cleanly
+    )
+    if zero_progress and not traversal.backend_unavailable:
+        # The `and not backend_unavailable` guard keeps ONE action-level ERROR
+        # per incident (Copilot round 14): a Redis outage before any device is
+        # serviced makes this run BOTH zero-progress and backend-unavailable,
+        # so the dedicated Redis ERROR above and this generic one both fired —
+        # counting a single incident twice in the ERROR-driven health metric.
+        # The Redis event is strictly more diagnostic, so it wins; the
+        # zero_progress flag itself stays true for the result payload and the
+        # backfill-trigger gate below.
+        #
+        # Zero progress: nothing serviced, nothing delivered, and no deferred
+        # tail re-dispatched — systemic degradation that must alert rather than
+        # pass as a clean completion. A successfully re-triggered deferral is
+        # progress (the work moved to a fresh budget); slot starvation and a
+        # cap-reached deferral are clean back-offs that alert on their own
+        # branches.
+        #
+        # Reported as an ERROR activity event, NOT raised (review finding):
+        # raising routes through the runner's generic _handle_error, which
+        # publishes `config_data` containing every integration configuration —
+        # the auth action's plaintext Lotek password included — and a fleet-wide
+        # outage would leak it once per shard, up to SHARD_SIZE-many times per
+        # tick. An ERROR activity event carries the same health signal (the
+        # unhealthy-connection metric counts ERROR activity events) without the
+        # credential exposure.
+        message = (
+            f"No devices could be serviced for integration {integration.id}: "
+            f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
+            f"{len(action_config.devices)}. See the per-device errors in this action's activity log."
+        )
+        logger.error(message)
+        await _try_log_activity(
+            integration_id, "pull_observations_shard", message, LogLevel.ERROR
+        )
+
+    if any_open_gap and not zero_progress:
+        claim_token = None
+        published = False
         try:
-            lease = await state_manager.get_state(
-                str(integration.id), "backfill_observations", BACKFILL_LEASE_SOURCE
+            # Atomic per-window claim first: concurrent shards all reach this
+            # point within seconds of each other, and the lease below is only
+            # created a pubsub hop later (when the backfill handler runs), so a
+            # plain lease read let every shard publish its own command (review
+            # finding). Exactly one shard wins the claim per window.
+            #
+            # A token-based lease, not set_if_absent's plain boolean: tracking
+            # ownership as a boolean is not reliable across a retried claim —
+            # set_if_absent's own stamina retry can win the SET NX, lose the
+            # reply, and then have its retry see the key it just created and
+            # report "already held", leaving `claimed` false with the claim
+            # still consumed and never released below (review finding).
+            # acquire_lease's same-token fast path makes a retry of the exact
+            # same call recognize its own win instead.
+            claim_token = await state_manager.acquire_lease(
+                integration_id, "backfill_observations",
+                ttl_seconds=app_settings.MAX_ACTION_EXECUTION_TIME,
+                source_id=BACKFILL_TRIGGER_CLAIM_SOURCE,
             )
-            if not lease:
+            lease = await state_manager.get_state(
+                integration_id, "backfill_observations", BACKFILL_LEASE_SOURCE
+            )
+            if claim_token and not lease:
                 # backfill_observations is an InternalActionConfiguration with no
                 # persisted portal config, so this MUST carry a non-empty config
                 # override — a bare trigger_action(..., "backfill_observations")
                 # publishes an empty config_overrides, which execute_action reads
                 # as "no config at all" and 404s before the handler ever runs.
-                await trigger_action(
-                    str(integration.id), "backfill_observations",
-                    config=BackfillObservationsConfig(triggered_by="pull_observations")
+                await _bounded_publish(
+                    trigger_action(
+                        integration_id, "backfill_observations",
+                        config=BackfillObservationsConfig(
+                            triggered_by="pull_observations_shard",
+                            # Carry the manual marker: without it a Trigger on a
+                            # paused integration pulled head data but its backfill
+                            # skipped on the pause, silently importing no history
+                            # (review finding).
+                            manual_run=action_config.manual_run,
+                        )
+                    ),
+                    "the backfill trigger",
+                    required=True,
                 )
+                published = True
         except Exception as e:
-            # The head pass succeeded; a failed trigger must not fail the run.
+            # The shard succeeded; a failed trigger must not fail the run.
             logger.warning(
                 f"Could not trigger backfill for integration {integration.id}: {describe_exception(e)}"
             )
+        finally:
+            if claim_token and not published:
+                # We consumed the per-window claim but never published, so no
+                # backfill command exists. Leaving the claim would suppress
+                # every other shard this tick AND the next (TTL is a full
+                # action budget); pre-sharding a lost trigger self-healed on
+                # the next run. Give the claim back (review finding).
+                #
+                # release_lease is compare-and-delete on claim_token: an
+                # unconditional delete-by-key could remove a SUCCESSOR's
+                # claim if this claim's own TTL expired and was re-acquired by
+                # another shard before this finally ran, permitting duplicate
+                # publication (review finding) — release_lease can never
+                # delete a lease it does not still hold the token for.
+                try:
+                    await state_manager.release_lease(
+                        integration_id, "backfill_observations", claim_token,
+                        source_id=BACKFILL_TRIGGER_CLAIM_SOURCE,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Could not release the backfill trigger claim for integration "
+                        f"{integration.id} (the TTL will expire it): {describe_exception(e)}"
+                    )
 
-    return {
+    result = {
         'observations_extracted': observations_extracted,
         'devices_failed': failed_devices,
         'devices_deferred': deferred_devices,
     }
+    if zero_progress:
+        # Only present on the bad path (like `skipped`/`reason` elsewhere), so
+        # the systemic-degradation signal is machine-readable in the completion
+        # event without changing the shape of every healthy result.
+        result['zero_progress'] = True
+    return result
 
 
-async def _read_device_state(integration_id, device_id, action_id="pull_observations"):
+async def _read_device_state(integration_id, device_id, action_id="pull_observations", quiet=False):
     """Read one device's saved state. Returns a DeviceState, or None when the
     key is absent or unparseable. Unparseable state is surfaced at WARNING —
     it means a cursor is about to be discarded and the lookback re-imported
-    (review finding: this was announced only at DEBUG)."""
+    (review finding: this was announced only at DEBUG).
+
+    `quiet` suppresses the portal publish for readers that are not the writer:
+    the dispatcher reads every device's cursor just to order the fleet, and the
+    shard that actually discards the cursor publishes the same warning moments
+    later — publishing on both doubled the volume per affected device (review
+    finding). The local log line is kept either way."""
     saved = await state_manager.get_state(integration_id, "pull_observations", device_id)
     if not saved:
         return None
@@ -473,7 +1069,8 @@ async def _read_device_state(integration_id, device_id, action_id="pull_observat
             f"{integration_id} Error: {describe_exception(e)}"
         )
         logger.warning(message)
-        await _try_log_activity(integration_id, action_id, message, LogLevel.WARNING)
+        if not quiet:
+            await _try_log_activity(integration_id, action_id, message, LogLevel.WARNING)
         return None
 
 
@@ -524,20 +1121,34 @@ async def _save_device_state_fields(integration_id, device_id, updates, init_onl
     )
 
 
-async def _fetch_window(device, integration, auth, config, lower_date, upper_date, guards, action_id):
+async def _fetch_window(device_id, integration, auth, config, lower_date, upper_date, guards, action_id):
     """Fetch + transform one window for one device.
 
     Returns (cdip_positions | None, transport_failure). None means the fetch
     failed — already logged and classified; the caller marks the device failed
     and records transport_failure for the circuit breaker. Raises only
-    LotekUnauthorizedException (integration-wide).
+    LotekUnauthorizedException (integration-wide) and NoConnectionSlot
+    (account-wide budget, the caller defers and re-triggers).
     """
     integration_id = str(integration.id)
     try:
         async for attempt in stamina.retry_context(**_fetch_retry_kwargs(guards.run_started_at), wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
             with attempt:
-                positions = await client.get_positions(device.nDeviceID, auth, integration, lower_date, upper_date, True)
-        logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device.nDeviceID} between {lower_date} and {upper_date}.")
+                # Pre-resolve the token OUTSIDE the slot: get_positions calls
+                # get_token internally, and on a cache miss that is a full
+                # login (plus possible queueing on the per-integration token
+                # lock) — holding a slot through it both starves peers and
+                # risks outliving the slot TTL (review finding). Pre-warmed,
+                # the in-slot get_token is a single cached Redis read.
+                await client.get_token(integration, auth)
+                # The slot is held for exactly one request and re-acquired on
+                # retry, so a stamina backoff never parks a slot idle.
+                async with lotek_slot(
+                    auth.username,
+                    max_wait_seconds=_slot_wait_budget(guards.run_started_at),
+                ):
+                    positions = await client.get_positions(device_id, auth, integration, lower_date, upper_date, True)
+        logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device_id} between {lower_date} and {upper_date}.")
         # Transform inside the try: a malformed payload is a per-device, fetch-class
         # failure and must get the same device/date-window log and isolation.
         return filter_and_transform_positions(positions, integration, config), False
@@ -545,17 +1156,22 @@ async def _fetch_window(device, integration, auth, config, lower_date, upper_dat
         # Credentials are an integration-wide problem: every remaining device
         # would fail the same way, so fail fast instead of N identical errors.
         raise
+    except NoConnectionSlot:
+        # Account-wide connection budget exhausted (other shards/backfills are
+        # saturating it). Not a device failure and not evidence about Lotek —
+        # the caller defers the rest of its devices and re-triggers.
+        raise
     except httpx.TransportError as e:
         # WARNING + breaker-feeding: enough timeouts/transport failures in a
         # row mean Lotek-wide degradation, not a bad device.
         # Local log only: failed devices are aggregated into one end-of-run
         # summary publish. Per-device publishes multiplied exactly when Lotek
         # (or the instance) was already drowning — a congestion feedback loop.
-        message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
+        message = f"Error fetching positions from Lotek. Device: {device_id}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         logger.warning(message, exc_info=True)
         return None, True
     except LotekException as e:
-        message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
+        message = f"Error fetching positions from Lotek. Device: {device_id}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         if e.status_code >= 500 or e.status_code == 429:
             # A Lotek-side 5xx/429 is outage/throttling, the same class of
             # Lotek-wide degradation as a timeout: WARNING + breaker-feeding.
@@ -580,13 +1196,13 @@ async def _fetch_window(device, integration, auth, config, lower_date, upper_dat
         # above), a data-shape break is permanent and won't self-heal on retry —
         # it must stay visible to health/alerting or it can persist unnoticed
         # forever (review finding).
-        message = f"Error fetching positions from Lotek. Device: {device.nDeviceID}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
+        message = f"Error fetching positions from Lotek. Device: {device_id}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         logger.exception(message)
         await _try_log_activity(integration_id, action_id, message, LogLevel.ERROR)
         return None, False
 
 
-async def _deliver(cdip_positions, device, integration, action_id):
+async def _deliver(cdip_positions, device_id, integration, action_id):
     """Send one device's transformed positions to Gundi in batches.
 
     Returns (observations_sent, delivery_failed). Handled here rather than in
@@ -600,14 +1216,14 @@ async def _deliver(cdip_positions, device, integration, action_id):
     observations_sent = 0
     try:
         if cdip_positions:
-            logger.info(f"{len(cdip_positions)} observations pulled successfully for device {device.nDeviceID} integration ID: {integration.id}.")
+            logger.info(f"{len(cdip_positions)} observations pulled successfully for device {device_id} integration ID: {integration.id}.")
             for i, batch in enumerate(generate_batches(cdip_positions)):
-                logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Device: {device.nDeviceID}')
+                logger.info(f'Sending observations batch #{i}: {len(batch)} observations. Device: {device_id}')
                 await gundi_tools.send_observations_to_gundi(observations=batch, integration_id=integration.id)
                 observations_sent += len(batch)
     except Exception as e:
         message = (
-            f"Error delivering observations for device {device.nDeviceID}. Integration ID: "
+            f"Error delivering observations for device {device_id}. Integration ID: "
             f"{integration.id} Exception: {describe_exception(e)}"
         )
         # needs_attention drives log-based alerting on delivery failures (template
@@ -625,7 +1241,7 @@ async def _deliver(cdip_positions, device, integration, action_id):
     return observations_sent, False
 
 
-async def _head_pass_device(device, state, is_new, integration, auth, action_config, present_time, guards, stale_drops=None):
+async def _head_pass_device(device_id, state, is_new, integration, auth, action_config, present_time, guards, stale_drops=None):
     """Fetch, deliver and checkpoint one device's freshest window.
 
     Returns (observations_sent, device_failed, transport_failure).
@@ -649,7 +1265,7 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
 
     lower_date = max(state.high_water - HEAD_LATE_UPLOAD_OVERLAP, freshness_floor)
     cdip_positions, transport_failure = await _fetch_window(
-        device, integration, auth, action_config, lower_date, present_time, guards, "pull_observations"
+        device_id, integration, auth, action_config, lower_date, present_time, guards, "pull_observations_shard"
     )
     if cdip_positions is None:
         return 0, True, transport_failure
@@ -659,9 +1275,9 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
         # device — on a mostly-dormant 400-device integration that was
         # hundreds of pubsub publishes per tick, the single largest
         # contributor to the publish congestion behind GUNDI-5602.
-        logger.info(f"No positions fetched for device {device.nDeviceID} integration ID: {integration.id}.")
+        logger.info(f"No positions fetched for device {device_id} integration ID: {integration.id}.")
 
-    observations_sent, delivery_failed = await _deliver(cdip_positions, device, integration, "pull_observations")
+    observations_sent, delivery_failed = await _deliver(cdip_positions, device_id, integration, "pull_observations_shard")
     if delivery_failed:
         # The breaker watches Lotek, not Gundi: a delivery failure is not
         # evidence of Lotek-wide degradation.
@@ -686,14 +1302,14 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
         updates["version"] = state.version
         init_only = {"gap_start": state.gap_start, "gap_end": state.gap_end}
     try:
-        await _save_device_state_fields(integration_id, device.nDeviceID, updates, init_only=init_only)
+        await _save_device_state_fields(integration_id, device_id, updates, init_only=init_only)
     except Exception as e:
         message = (
-            f"Error saving cursor for device {device.nDeviceID}. Integration ID: "
+            f"Error saving cursor for device {device_id}. Integration ID: "
             f"{integration.id} Exception: {describe_exception(e)}"
         )
         logger.exception(message)
-        await _try_log_activity(integration_id, "pull_observations", message, LogLevel.ERROR)
+        await _try_log_activity(integration_id, "pull_observations_shard", message, LogLevel.ERROR)
         return observations_sent, True, False
 
     if stale_from is not None:
@@ -704,11 +1320,11 @@ async def _head_pass_device(device, state, is_new, integration, auth, action_con
         # one end-of-run summary publish (review finding).
         logger.warning(
             f"Dropped stale range [{stale_from.isoformat()}, {freshness_floor.isoformat()}] "
-            f"permanently for device {device.nDeviceID}: older than max_data_age_hours="
+            f"permanently for device {device_id}: older than max_data_age_hours="
             f"{action_config.max_data_age_hours}. Integration ID: {integration_id}"
         )
         if stale_drops is not None:
-            stale_drops.append(device.nDeviceID)
+            stale_drops.append(device_id)
 
     return observations_sent, False, False
 
@@ -718,31 +1334,64 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     device's gap.
 
     Returns (observations_sent, device_failed, transport_failure, gap_closed,
-    windows_advanced). gap_start advances only past windows that were actually
-    delivered, so a failure re-fetches the same window next trigger (re-sends
-    are tolerated, silent skips are not). windows_advanced counts those
-    actually-delivered windows: the caller only keeps the self-retrigger
-    cascade going while some gap is really shrinking.
+    windows_advanced, cut_reason). gap_start advances only past windows that
+    were actually delivered, so a failure re-fetches the same window next
+    trigger (re-sends are tolerated, silent skips are not). windows_advanced
+    counts those actually-delivered windows: the caller only keeps the
+    self-retrigger cascade going while some gap is really shrinking.
+
+    cut_reason is None, "starved", "deadline", or "backend": a device that advanced at
+    least one window and THEN hit account saturation (or crossed the soft
+    deadline) on a later window's acquire. Letting those exceptions escape
+    discarded the whole result — the run reported zero progress for
+    observations already delivered and checkpointed, and skipped the
+    last_backfilled fairness save (Copilot rounds 10 and 12). Either cause
+    with NO progress still raises, keeping the traversal's narrow-deferral
+    contract. One field, not two booleans: the causes are mutually
+    exclusive and a reader should not have to check that both are not set.
     """
     integration_id = str(integration.id)
     observations_sent = 0
     device_failed = False
     transport_failure = False
     windows_advanced = 0
+    cut_reason = None
     for _ in range(BACKFILL_MAX_WINDOWS_PER_DEVICE):
         if not state.has_gap:
             break
         window_start = state.gap_start
         upper_date = min(state.gap_end, state.gap_start + BACKFILL_WINDOW)
 
-        cdip_positions, transport_failure = await _fetch_window(
-            device, integration, auth, pull_config, window_start, upper_date, guards, "backfill_observations"
-        )
+        try:
+            cdip_positions, transport_failure = await _fetch_window(
+                device.nDeviceID, integration, auth, pull_config, window_start, upper_date, guards, "backfill_observations"
+            )
+        except SlotBackendUnavailable:
+            # Redis-down after progress is reachable: the window-1 checkpoint
+            # save and window-2's acquire are not simultaneous, and a
+            # brownout can start in between (Copilot round 13 — the earlier
+            # "progress requires a successful save" rationale assumed they
+            # were). Zero progress still raises; partial progress is kept
+            # and reported as a backend cut.
+            if windows_advanced == 0:
+                raise
+            cut_reason = "backend"
+            break
+        except SlotWaitBudgetExhausted:
+            if windows_advanced == 0:
+                raise
+            cut_reason = "deadline"
+            break  # deadline mid-device: keep the progress; caller records the stop
+        except NoConnectionSlot:
+            if windows_advanced == 0:
+                raise
+            cut_reason = "starved"
+            break  # saturated mid-device: keep the progress, tell the caller to throttle
         if cdip_positions is None:
             device_failed = True
             break
 
-        sent, delivery_failed = await _deliver(cdip_positions, device, integration, "backfill_observations")
+        sent, delivery_failed = await _deliver(cdip_positions, device.nDeviceID, integration, "backfill_observations")
         observations_sent += sent
         if delivery_failed:
             device_failed = True
@@ -765,11 +1414,23 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     # deliberate LRS-fairness trade-off so one permanently-broken device
     # doesn't monopolize the front of the backfill queue. The zero-progress
     # raise is the actual safety net when it's the only gapped device.
-    state.last_backfilled = datetime.now(tz=timezone.utc)
-    await _save_device_state_fields(
-        integration_id, device.nDeviceID, {"last_backfilled": state.last_backfilled}
-    )
-    return observations_sent, device_failed, transport_failure, not state.has_gap, windows_advanced
+    #
+    # Skipped on a backend cut (Copilot round 15): this writes to the SAME
+    # Redis whose failure caused the cut, so during a real outage it raised
+    # and took the whole partial-progress return with it — the traversal saw
+    # a generic device failure and observations_sent, windows_advanced and
+    # the backend signal were all lost, making the partial-progress path
+    # inoperative in exactly the situation it exists for. Nothing is lost by
+    # skipping it: the gap checkpoint that matters was persisted before the
+    # failing acquire, and fairness self-corrects on the next run (this
+    # device keeps its older last_backfilled, so it stays at the front of
+    # the LRS queue — the right place after an interrupted run).
+    if cut_reason != "backend":
+        state.last_backfilled = datetime.now(tz=timezone.utc)
+        await _save_device_state_fields(
+            integration_id, device.nDeviceID, {"last_backfilled": state.last_backfilled}
+        )
+    return observations_sent, device_failed, transport_failure, not state.has_gap, windows_advanced, cut_reason
 
 
 @action_title("Backfill Observations")
@@ -784,6 +1445,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
     logger.info(f"Executing backfill_observations action for integration {integration.id}...")
     integration_id = str(integration.id)
     run_started = datetime.now(tz=timezone.utc)
+    _arm_publish_deadline()
     try:
         auth = get_auth_config(integration)
         pull_config = get_pull_config(integration)  # max_pdop applies to backfilled data too
@@ -798,10 +1460,13 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         )
         return {"skipped": True, "reason": "configuration_missing"}
 
-    if not pull_config.run_on_schedule:
+    if not pull_config.run_on_schedule and not action_config.manual_run:
         # The operator's pause toggle must also stop the cascade: internal
         # actions bypass the runner's skippable_pull pause check, and backfill
         # is only ever machine-triggered — a paused integration skips cleanly
+        # (review finding). manual_run exempts a backfill descending from an
+        # operator-triggered head pass: without it a Trigger on a paused
+        # integration pulled the head window but silently imported no history
         # (review finding).
         logger.info(f"Integration {integration_id} is paused (run_on_schedule=false); skipping backfill.")
         return {"skipped": True, "reason": "integration_paused"}
@@ -820,7 +1485,56 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         try:
             async for attempt in stamina.retry_context(on=RETRYABLE_ERRORS, attempts=RETRY_ATTEMPTS, wait_initial=RETRY_WAIT_INITIAL, wait_jitter=RETRY_WAIT_JITTER, wait_max=RETRY_WAIT_MAX):
                 with attempt:
-                    device_list = await client.get_devices(integration, auth)
+                    # Token outside the slot — see _fetch_window.
+                    await client.get_token(integration, auth)
+                    async with lotek_slot(
+                        auth.username, max_wait_seconds=_slot_wait_budget(run_started)
+                    ):
+                        device_list = await client.get_devices(integration, auth)
+        except SlotBackendUnavailable as e:
+            # REDIS failed, not the account budget (Copilot review, round 5) —
+            # the quiet skip below hid a persistent Redis outage from the
+            # portal health signal. ERROR + distinct reason; the lease still
+            # releases via the finally, and open gaps re-trigger on the next
+            # scheduled head pass. Ordered BEFORE NoConnectionSlot (subclass).
+            message = (
+                f"Skipping backfill for integration {integration_id}: could not reach "
+                f"Redis to acquire a Lotek connection slot: {describe_exception(e)}"
+            )
+            logger.error(message)
+            await _try_log_activity(
+                integration_id, "backfill_observations", message, LogLevel.ERROR
+            )
+            return {"skipped": True, "reason": "redis_unavailable"}
+        except SlotWaitBudgetExhausted as e:
+            # The run crossed its soft deadline before the listing finished —
+            # near-unreachable with the default 540s budget (the listing runs
+            # on a fresh ~432s budget) but MAX_ACTION_EXECUTION_TIME is
+            # env-configurable. This is DEADLINE policy, not capacity: the
+            # subclass fell into the quiet saturation catch below and
+            # reported "no_connection_slot" though no capacity check ever
+            # ran (Copilot round 11). A backfill deadline stop with zero
+            # progress alerts — same contract as the traversal's deadline
+            # stop. Ordered BEFORE NoConnectionSlot (subclass).
+            message = (
+                f"Backfill for integration {integration_id} exhausted its action "
+                f"budget before listing devices: {describe_exception(e)}. "
+                f"Open gaps are retried on the next trigger."
+            )
+            logger.error(message)
+            await _try_log_activity(
+                integration_id, "backfill_observations", message, LogLevel.ERROR
+            )
+            return {"skipped": True, "reason": "deadline_exhausted"}
+        except NoConnectionSlot:
+            # Account budget saturated by head-pass shards: back off quietly.
+            # The lease releases via the finally; open gaps re-trigger on the
+            # next scheduled head pass.
+            logger.info(
+                f"Skipping backfill for integration {integration_id}: Lotek connection "
+                f"budget exhausted; open gaps are retried on the next trigger."
+            )
+            return {"skipped": True, "reason": "no_connection_slot"}
         except httpx.TransportError as e:
             # Same WARNING classification as the head pass: an unreachable
             # Lotek must not mark the connection unhealthy. The early return
@@ -832,11 +1546,14 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 f"{integration_id}: {describe_exception(e)}. Open gaps are retried on the next trigger."
             )
             logger.warning(message)
-            await log_action_activity(
-                integration_id=integration_id,
-                action_id="backfill_observations",
-                title=message,
-                level=LogLevel.WARNING
+            await _bounded_publish(
+                log_action_activity(
+                    integration_id=integration_id,
+                    action_id="backfill_observations",
+                    title=message,
+                    level=LogLevel.WARNING
+                ),
+                "an activity-log event",
             )
             return {"skipped": True, "reason": "lotek_unreachable"}
         except Exception as e:
@@ -845,11 +1562,14 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 f"{integration_id} Exception: {describe_exception(e)}"
             )
             logger.exception(message)
-            await log_action_activity(
-                integration_id=integration_id,
-                action_id="backfill_observations",
-                title=message,
-                level=LogLevel.ERROR
+            await _bounded_publish(
+                log_action_activity(
+                    integration_id=integration_id,
+                    action_id="backfill_observations",
+                    title=message,
+                    level=LogLevel.ERROR
+                ),
+                "an activity-log event",
             )
             raise  # bare: preserve the original traceback
 
@@ -866,59 +1586,74 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         gapped.sort(key=lambda pair: pair[1].last_backfilled or epoch)
 
         guards = RunGuards(run_started)
+        traversal = DeviceTraversal(
+            integration, "backfill_observations", guards, concurrency=FETCH_CONCURRENCY,
+            log_activity=_try_log_activity,
+        )
         observations_extracted = 0
-        failed_devices = []
-        deferred_devices = []
-        serviced_devices = 0
         gaps_closed = 0
         windows_advanced_total = 0
-        for chunk_start in range(0, len(gapped), FETCH_CONCURRENCY):
-            if reason := guards.should_stop():
-                deferred_devices = [d.nDeviceID for d, _ in gapped[chunk_start:]]
-                await _log_deferral(integration, "backfill_observations", reason, deferred_devices)
-                break
-            chunk = gapped[chunk_start:chunk_start + FETCH_CONCURRENCY]
-            results = await asyncio.gather(
-                *(
-                    _backfill_device(device, state, integration, auth, pull_config, guards)
-                    for device, state in chunk
-                ),
-                # Collect every task's outcome rather than aborting the chunk
-                # on the first exception: per-device failures stay per-device.
-                return_exceptions=True,
+
+        async for (device, state), res in traversal.run(
+            gapped,
+            key=lambda pair: pair[0].nDeviceID,
+            process=lambda pair: _backfill_device(
+                pair[0], pair[1], integration, auth, pull_config, guards
+            ),
+        ):
+            sent, device_failed, transport_failure, gap_closed, windows_advanced, cut_reason = res
+            if cut_reason == "starved":
+                # Partial progress then saturation: the device returned a
+                # result instead of raising, so the traversal never saw the
+                # exception. Register it through the traversal's own
+                # bookkeeping (Copilot rounds 10+11): the cascade throttles
+                # via budget_starved, AND the device stays visible — in
+                # devices_deferred and the connection-budget WARNING —
+                # instead of the throttle being silent.
+                traversal.mark_slot_starved(device.nDeviceID)
+            elif cut_reason == "backend":
+                # Partial progress then Redis failure (Copilot round 13):
+                # remaining work defers, the backend stop is recorded, and
+                # the one-shot ERROR below moves the health signal — partial
+                # progress means the zero-progress ERROR cannot (round 5).
+                traversal.mark_backend_cut(device.nDeviceID)
+            elif cut_reason == "deadline":
+                # Partial progress then a soft-deadline crossing (Copilot
+                # round 12): register with the guard-stopped cohort so the
+                # device is reported deferred and the stop reason is
+                # recorded even when this was the last chunk. Deliberately
+                # does NOT touch budget_starved: a deadline is the
+                # fresh-budget continuation case, and the cascade must stay
+                # unthrottled.
+                traversal.mark_deadline_cut(device.nDeviceID)
+            # Single recording site, mirroring the head pass.
+            guards.record(transport_failure=transport_failure)
+            observations_extracted += sent
+            gaps_closed += int(gap_closed)
+            windows_advanced_total += windows_advanced
+            if device_failed:
+                traversal.mark_failed(device.nDeviceID)
+
+        failed_devices = traversal.failed_devices
+        # Union, for the overall count/result only (below); the two deferral
+        # logs each use their own reason-specific list so a slot-starved
+        # device is never logged under the stop_reason tail or vice versa
+        # (review finding — see traversal.py).
+        deferred_devices = traversal.deferred_devices
+
+        # Policy, deliberately NOT in the traversal (spec D6): unlike the shard,
+        # backfill never re-triggers its own tail from here — the cascade below
+        # owns that, throttled by gaps_remaining.
+        if traversal.stop_reason:
+            await _log_deferral(
+                integration, "backfill_observations", traversal.stop_reason,
+                traversal.guard_stopped_devices,
             )
-            # Credentials refused is integration-wide and fatal; re-raise it
-            # over any per-device outcomes in the same chunk. Cancellation
-            # must also propagate (see the head-pass loop).
-            for res in results:
-                if isinstance(res, (LotekUnauthorizedException, asyncio.CancelledError)):
-                    raise res
-            for (device, state), res in zip(chunk, results):
-                if isinstance(res, BaseException):
-                    message = (
-                        f"Failed to backfill device {device.nDeviceID} for integration "
-                        f"{integration_id}: {describe_exception(res)}"
-                    )
-                    logger.error(message, exc_info=res)
-                    await log_action_activity(
-                        integration_id=integration_id,
-                        action_id="backfill_observations",
-                        title=message,
-                        level=LogLevel.ERROR
-                    )
-                    failed_devices.append(device.nDeviceID)
-                    guards.record(transport_failure=False)
-                    continue
-                sent, device_failed, transport_failure, gap_closed, windows_advanced = res
-                # Single recording site, mirroring the head-pass loop.
-                guards.record(transport_failure=transport_failure)
-                observations_extracted += sent
-                gaps_closed += int(gap_closed)
-                windows_advanced_total += windows_advanced
-                if device_failed:
-                    failed_devices.append(device.nDeviceID)
-                else:
-                    serviced_devices += 1
+        if traversal.budget_starved:
+            await _log_deferral(
+                integration, "backfill_observations", "connection budget exhausted",
+                traversal.slot_starved_devices, disposition="to the next backfill trigger",
+            )
 
         if failed_devices:
             message = (
@@ -927,23 +1662,48 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 f"Their gaps are retried on the next trigger."
             )
             logger.warning(message)
-            await log_action_activity(
-                integration_id=integration_id,
-                action_id="backfill_observations",
-                title=message,
-                level=LogLevel.WARNING
+            await _bounded_publish(
+                log_action_activity(
+                    integration_id=integration_id,
+                    action_id="backfill_observations",
+                    title=message,
+                    level=LogLevel.WARNING
+                ),
+                "an activity-log event",
             )
 
-        if gapped and serviced_devices == 0 and observations_extracted == 0:
-            # Same systemic-degradation contract as the head pass. The raise
-            # also breaks the self-retrigger cascade below — a wholly-failing
-            # backfill must not re-trigger itself forever.
-            raise LotekException(
-                message=(
-                    f"No devices could be backfilled for integration {integration_id}: "
-                    f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
-                    f"{len(gapped)}. See the per-device errors in this action's activity log."
-                )
+        # Backfill's suppression policy differs from the shard's and is
+        # preserved exactly: ONLY starvation explains a no-progress run here (a
+        # budget-starved run is a clean back-off, not degradation). Deadline and
+        # breaker stops must still alert. And as in the shard, starvation
+        # explains the run only when nothing FAILED (PR #20 review): one
+        # starved device used to silence the alert for a run whose other
+        # devices genuinely failed.
+        zero_progress = (
+            gapped and traversal.serviced_devices == 0
+            and observations_extracted == 0
+            and not (traversal.budget_starved and not failed_devices)
+        )
+        if zero_progress and not traversal.backend_unavailable:
+            # See the head pass's twin: the dedicated Redis ERROR above is the
+            # single action-level event for a backend outage, so this generic
+            # one is skipped when that fired (Copilot round 14). zero_progress
+            # stays true for the result flag and the cascade gate.
+            #
+            # Same systemic-degradation contract as the head pass. Reported, NOT
+            # raised: raising routes through the runner's generic _handle_error,
+            # which publishes config_data containing every integration
+            # configuration — the auth action's plaintext Lotek password
+            # included (GUNDI-5628). An ERROR activity event carries the same
+            # health signal without the credential exposure (spec D7).
+            message = (
+                f"No devices could be backfilled for integration {integration_id}: "
+                f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
+                f"{len(gapped)}. See the per-device errors in this action's activity log."
+            )
+            logger.error(message)
+            await _try_log_activity(
+                integration_id, "backfill_observations", message, LogLevel.ERROR
             )
 
         # _backfill_device mutates the states in place, so this reflects
@@ -956,11 +1716,43 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         # retriggering on has_gap alone spun an unthrottled tight loop that
         # re-fetched and re-sent the same window forever (review finding) —
         # no-progress runs now wait for the next head-pass cadence instead.
+        if traversal.backend_unavailable:
+            # One action-level ERROR per run for a shared-backend outage
+            # (Copilot round 13): the traversal already stopped after the
+            # chunk that hit it, and per-device ERRORs cover that chunk; this
+            # is the health-signal summary — and the only ERROR at all when
+            # partial progress suppressed the zero-progress one.
+            message = (
+                f"Redis unavailable during backfill for integration {integration_id}: "
+                f"stopped after the current chunk; {len(traversal.deferred_devices)} device(s) deferred."
+            )
+            logger.error(message)
+            await _try_log_activity(
+                integration_id, "backfill_observations", message, LogLevel.ERROR
+            )
+
         breaker_hot = guards.consecutive_transport_failures >= BREAKER_THRESHOLD
         gaps_remaining = (
             any(state.has_gap for _, state in gapped)
             and not breaker_hot
             and windows_advanced_total > 0
+            # Budget starvation suppresses the cascade for the same reason a hot
+            # breaker does (Copilot review): a run that advanced a window and
+            # then starved would re-trigger straight back into a saturated
+            # account budget, competing with the head-pass shards that are
+            # holding it. Unlike the shard cascade this one has no generation
+            # cap, so the throttle has to come from here; the next scheduled
+            # head pass re-triggers it once the budget frees up.
+            and not traversal.budget_starved
+            # A wholly-failing backfill must not re-trigger itself forever. The
+            # removed raise used to guarantee this by unwinding before the
+            # re-trigger below; now it has to be explicit (spec D7).
+            and not zero_progress
+            # Re-triggering into a dead Redis is pointless — the next run's
+            # own lease acquire would fail against the same outage (Copilot
+            # round 13). The next scheduled head pass re-triggers once Redis
+            # is back.
+            and not traversal.backend_unavailable
         )
         result = {
             'observations_extracted': observations_extracted,
@@ -968,6 +1760,11 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             'devices_deferred': deferred_devices,
             'gaps_closed': gaps_closed,
         }
+        if zero_progress:
+            # Only present on the bad path (like `skipped`/`reason` elsewhere),
+            # so the systemic-degradation signal is machine-readable in the
+            # completion event without changing every healthy result's shape.
+            result['zero_progress'] = True
     finally:
         # Ownership-checked release: an unconditional DEL could outlive this
         # run's TTL (e.g. retried through a Redis blip after a cancellation)
@@ -990,9 +1787,16 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         # continuously instead of waiting for the next head-pass tick. Runs
         # AFTER the lease release so the next run doesn't skip on our own lease.
         try:
-            await trigger_action(
-                integration_id, "backfill_observations",
-                config=BackfillObservationsConfig(triggered_by="backfill_observations")
+            await _bounded_publish(
+                trigger_action(
+                    integration_id, "backfill_observations",
+                    config=BackfillObservationsConfig(
+                        triggered_by="backfill_observations",
+                        manual_run=action_config.manual_run,
+                    )
+                ),
+                "the backfill self-retrigger",
+                required=True,
             )
         except Exception as e:
             # The next head pass will re-trigger; losing one cascade step is fine.

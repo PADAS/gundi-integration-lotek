@@ -1,9 +1,73 @@
 import datetime
 import json
 
+import fakeredis
+import fakeredis.commands_mixins.scripting_mixin as _fakeredis_scripting_mixin
 import pytest
+import stamina
 from app.conftest import async_return
-from app.services.state import IntegrationStateManager, _MERGE_STATE_SCRIPT
+from app.services.state import (
+    IntegrationStateManager,
+    _ACQUIRE_LEASE_SCRIPT,
+    _INCREMENT_COUNTER_SCRIPT,
+    _MERGE_STATE_SCRIPT,
+    _RELEASE_LEASE_SCRIPT,
+)
+
+
+@pytest.fixture
+def real_lua_redis(monkeypatch):
+    """A fakeredis client with real Lua script execution (fakeredis[lua],
+    backed by the lupa Lua engine), for running the actual
+    _INCREMENT_COUNTER_SCRIPT / _ACQUIRE_LEASE_SCRIPT text below -- not a
+    hand-rolled reimplementation of Lua semantics.
+
+    Also works around a real fakeredis bug so the genuine script text can run
+    unmodified: fakeredis's own redis.pcall() error path
+    (ScriptingCommandsMixin._lua_redis_pcall) boxes the exception message as
+    a plain Python `str` into a Lua table, but the LuaRuntime backing it is
+    constructed with encoding=None, under which a raw (non-bytes) Python str
+    is not auto-coerced into a Lua string -- it comes back into the script as
+    opaque userdata rather than a string. Real Redis always hands pcall's
+    `err` field back as a genuine Lua string (fakeredis's own
+    redis.error_reply gets this right by contrast). Unpatched, that mismatch
+    makes `string.lower(result.err)` -- a line in the real production script
+    -- raise a spurious "bad argument #1 to 'lower' (string expected, got
+    userdata)" on ANY redis.pcall failure, regardless of what a test is
+    trying to exercise. Confirmed present in fakeredis 2.37.1 (the version
+    pinned here) and still present on fakeredis's master branch. Encoding the
+    message as bytes before boxing it -- matching how error_reply already
+    behaves -- is the minimal fix to make the emulation match real Redis.
+    """
+    def _fixed_lua_redis_pcall(self, lua_runtime, expected_globals, op, *args):
+        try:
+            return self._lua_redis_call(lua_runtime, expected_globals, op, *args)
+        except Exception as ex:
+            return lua_runtime.table_from({b"err": str(ex).encode()})
+
+    monkeypatch.setattr(
+        _fakeredis_scripting_mixin.ScriptingCommandsMixin,
+        "_lua_redis_pcall",
+        _fixed_lua_redis_pcall,
+    )
+    return fakeredis.FakeRedis()
+
+
+def _fast_stamina(monkeypatch):
+    """Zero the (real) stamina retry loop's waits, per the fast_retry_context
+    idiom this module lends its name to (see test_lotek_connections.py) —
+    keeps a real retry_context from actually sleeping through
+    wait_initial/wait_max while still exercising it for real (`on=redis.
+    RedisError` must match a real RedisError instance, not a mock)."""
+    real_retry_context = stamina.retry_context
+
+    def fast_retry_context(*args, **kwargs):
+        kwargs["wait_initial"] = 0
+        kwargs["wait_max"] = 0
+        kwargs["wait_jitter"] = 0
+        return real_retry_context(*args, **kwargs)
+
+    monkeypatch.setattr(stamina, "retry_context", fast_retry_context)
 
 
 @pytest.mark.asyncio
@@ -235,6 +299,319 @@ async def test_delete_state_source_state(mocker, mock_redis, integration_v2, moc
     mock_redis.Redis.return_value.delete.assert_called_once_with(
         f"integration_state.{integration_id}.pull_observations.{source_id}"
     )
+
+
+@pytest.mark.asyncio
+async def test_increment_counter_calls_the_atomic_script_and_returns_its_value(mocker, mock_redis, integration_v2):
+    """increment_counter is a single, unretried eval of _INCREMENT_COUNTER_SCRIPT
+    (self-heal + INCR + EXPIRE all inside one Redis-side script — review
+    finding: doing those steps as separate client-side calls let two callers
+    racing a legacy value interleave, and could leave a freshly-incremented
+    key with no TTL if the process died between steps). Not wrapped in a
+    stamina retry either: a lost reply after the script actually ran would
+    make a retry double-count the streak (same reasoning as every other
+    non-idempotent write in this module)."""
+    mocker.patch("app.services.state.redis", mock_redis)
+    mock_redis.Redis.return_value.eval.return_value = async_return(3)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+
+    value = await state_manager.increment_counter(
+        integration_id, "pull_observations", source_id="slot_skip_streak", ttl_seconds=3600
+    )
+
+    assert value == 3
+    mock_redis.Redis.return_value.eval.assert_called_once_with(
+        _INCREMENT_COUNTER_SCRIPT,
+        1,
+        f"integration_state.{integration_id}.pull_observations.slot_skip_streak",
+        3600,
+    )
+
+
+@pytest.mark.asyncio
+async def test_increment_counter_script_is_never_retried(mocker, integration_v2):
+    """A Redis error from the script call must propagate immediately, with no
+    stamina retry: retrying a non-idempotent increment risks double-counting
+    the streak on a lost reply after the server actually applied it (review
+    finding)."""
+    from redis.exceptions import RedisError
+
+    state_manager = IntegrationStateManager()
+    state_manager.db_client = mocker.MagicMock()
+    state_manager.db_client.eval = mocker.AsyncMock(side_effect=RedisError("blip"))
+    integration_id = str(integration_v2.id)
+
+    with pytest.raises(RedisError):
+        await state_manager.increment_counter(
+            integration_id, "pull_observations", source_id="slot_skip_streak", ttl_seconds=3600
+        )
+
+    assert state_manager.db_client.eval.await_count == 1
+
+
+def test_increment_counter_script_self_heals_before_expiring():
+    """Script-text pin (fakeredis/a real Lua engine isn't available in this
+    suite, so — in the style of the lotek_connections.py Lua tests — this
+    pins the guarantee at the source level): the self-heal (DEL + re-INCR on
+    a "not an integer" legacy value) must happen before the unconditional
+    EXPIRE, and EXPIRE must run on every path (fresh INCR or self-healed),
+    so a key is never observed as incremented with no TTL (review finding).
+    An unrelated error must not trigger the self-heal — it returns an error
+    reply instead, surfacing as a ResponseError to the caller untouched."""
+    script = _INCREMENT_COUNTER_SCRIPT
+
+    not_an_integer_at = script.lower().find("not an integer")
+    del_at = script.find("redis.call('DEL'")
+    error_reply_at = script.find("redis.error_reply")
+    expire_at = script.find("redis.call('EXPIRE'")
+
+    assert -1 not in (not_an_integer_at, del_at, error_reply_at, expire_at)
+    # An unrelated error is rejected (error_reply) before the legacy value is
+    # ever assumed and dropped.
+    assert error_reply_at < del_at
+    # The self-heal runs before EXPIRE, and EXPIRE is unconditional (outside
+    # any per-branch guard) so it is reached on every path.
+    assert del_at < expire_at
+    assert script.rstrip().splitlines()[-2].strip().startswith("redis.call('EXPIRE'")
+
+
+def test_increment_counter_script_self_heals_a_legacy_value_when_actually_run(real_lua_redis):
+    """Behavioral counterpart to the text-pin above, executing the real
+    script (not a hand-copied transliteration of it) against a real Lua
+    engine (fakeredis[lua], backed by lupa). A legacy JSON value must
+    self-heal into 1, not raise, and the key must come out with the caller's
+    TTL — this is exactly the guarantee the deleted
+    test_increment_counter_self_heals_a_legacy_json_value covered before the
+    self-heal moved server-side into this script (review finding: `redis.
+    pcall` regressing to `redis.call` here would make the self-heal dead and
+    the DISPATCHER_SKIP_WARN_AFTER diagnostic permanently unreachable)."""
+    real_lua_redis.set("k", '{"streak": 2}')
+
+    value = real_lua_redis.eval(_INCREMENT_COUNTER_SCRIPT, 1, "k", 3600)
+
+    assert value == 1
+    assert real_lua_redis.ttl("k") == 3600
+
+
+def test_increment_counter_script_expires_with_the_given_ttl_when_actually_run(real_lua_redis):
+    """The EXPIRE call must use the caller's ttl_seconds (ARGV[1]), not a
+    hardcoded literal — a streak counter TTL'd out after a fixed 1 second
+    could never accumulate past 1 (review finding). Executed via the real
+    script, as above."""
+    value = real_lua_redis.eval(_INCREMENT_COUNTER_SCRIPT, 1, "k", 3600)
+
+    assert value == 1
+    assert real_lua_redis.ttl("k") == 3600
+
+
+def test_increment_counter_script_rejects_an_unrelated_error_when_actually_run(real_lua_redis):
+    """Only the specific "not an integer" legacy-value error self-heals; any
+    other INCR failure must surface untouched (as redis.error_reply, which
+    redis-py raises as a ResponseError) rather than being treated as a
+    legacy value and silently dropped. INCR against a list key is a genuine,
+    reproducible INCR failure (WRONGTYPE) whose message does not mention
+    "not an integer"."""
+    from redis.exceptions import ResponseError
+
+    real_lua_redis.rpush("k", "x")
+
+    with pytest.raises(ResponseError, match="WRONGTYPE"):
+        real_lua_redis.eval(_INCREMENT_COUNTER_SCRIPT, 1, "k", 3600)
+
+    # The self-heal must not have fired: the original value is untouched.
+    assert real_lua_redis.type("k") == b"list"
+    assert real_lua_redis.lrange("k", 0, -1) == [b"x"]
+
+
+@pytest.mark.asyncio
+async def test_increment_counter_reraises_unrelated_response_error(mocker, integration_v2):
+    """A genuine server-side ResponseError (not the specific legacy-value
+    message) must surface to the caller untouched — the real Lua script does
+    this via redis.error_reply, which redis-py raises as a ResponseError;
+    simulated here directly against the client since the script itself only
+    has coverage-by-inspection above."""
+    from redis.exceptions import ResponseError
+
+    state_manager = IntegrationStateManager()
+    state_manager.db_client = mocker.MagicMock()
+    state_manager.db_client.eval = mocker.AsyncMock(
+        side_effect=ResponseError("ERR some unrelated server problem")
+    )
+    integration_id = str(integration_v2.id)
+
+    with pytest.raises(ResponseError):
+        await state_manager.increment_counter(
+            integration_id, "pull_observations", source_id="slot_skip_streak", ttl_seconds=3600
+        )
+
+    assert state_manager.db_client.eval.await_count == 1
+
+
+
+@pytest.mark.asyncio
+async def test_acquire_lease_calls_the_atomic_script(mocker, mock_redis, integration_v2):
+    mocker.patch("app.services.state.redis", mock_redis)
+    mocker.patch("app.services.state.uuid.uuid4", return_value="fixed-token")
+    mock_redis.Redis.return_value.eval.return_value = async_return(1)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+
+    token = await state_manager.acquire_lease(
+        integration_id, "backfill_observations", ttl_seconds=540, source_id="backfill_trigger_claim"
+    )
+
+    assert token == "fixed-token"
+    mock_redis.Redis.return_value.eval.assert_called_once_with(
+        _ACQUIRE_LEASE_SCRIPT,
+        1,
+        f"integration_state.{integration_id}.backfill_observations.backfill_trigger_claim",
+        json.dumps("fixed-token"),
+        540,
+    )
+
+
+@pytest.mark.asyncio
+async def test_acquire_lease_returns_none_when_a_different_token_already_holds_it(mocker, mock_redis, integration_v2):
+    mocker.patch("app.services.state.redis", mock_redis)
+    mock_redis.Redis.return_value.eval.return_value = async_return(0)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+
+    token = await state_manager.acquire_lease(
+        integration_id, "backfill_observations", ttl_seconds=540, source_id="backfill_trigger_claim"
+    )
+
+    assert token is None
+
+
+def test_acquire_lease_script_recognizes_its_own_token_before_the_generic_refusal():
+    """Script-text pin (no real Lua engine in this suite — same style as the
+    other Lua tests): a lost reply on the attempt that actually won must not
+    make a stamina retry of the SAME call see its own token and report
+    "already held" by someone else (review finding). The same-token branch
+    must be checked, and must return success (1), before falling through to
+    the generic "someone else holds it" refusal.
+
+    (Renamed from ...before_the_ceiling_check: _ACQUIRE_LEASE_SCRIPT has no
+    ceiling check — that phrase was copy-pasted from the connection-slot
+    test — it only has the same-token fast path and a generic refusal.)"""
+    script = _ACQUIRE_LEASE_SCRIPT
+
+    absent_at = script.find("current == false")
+    same_token_at = script.find("current == ARGV[1]")
+    refusal_at = script.rstrip().splitlines()[-1].strip()
+
+    assert -1 not in (absent_at, same_token_at)
+    assert absent_at < same_token_at
+    assert refusal_at == "return 0"
+    # Both the fresh-acquire and same-token branches return success.
+    assert script.count("return 1") == 2
+
+
+def test_acquire_lease_script_sets_ttl_from_argv_when_actually_run(real_lua_redis):
+    """Behavioral counterpart to the text-pin above, executing the real
+    script against a real Lua engine (fakeredis[lua]). The fresh-acquire
+    branch's SET must carry an expiry from ARGV[2] — dropping 'EX', ARGV[2]
+    would leave the claim permanently set, permanently suppressing the
+    backfill trigger for that integration (review finding)."""
+    value = real_lua_redis.eval(_ACQUIRE_LEASE_SCRIPT, 1, "k", "tok-a", 540)
+
+    assert value == 1
+    assert real_lua_redis.get("k") == b"tok-a"
+    assert real_lua_redis.ttl("k") == 540
+
+
+def test_acquire_lease_script_recognizes_its_own_token_when_actually_run(real_lua_redis):
+    """A retry that presents the SAME token as the key's current holder must
+    succeed (and refresh the TTL from ARGV[2]) rather than falling through to
+    the generic refusal — the same-token fast path this whole script exists
+    to add. Executed via the real script, as above."""
+    real_lua_redis.set("k", "tok-a", ex=1)
+
+    value = real_lua_redis.eval(_ACQUIRE_LEASE_SCRIPT, 1, "k", "tok-a", 540)
+
+    assert value == 1
+    assert real_lua_redis.ttl("k") == 540
+
+
+def test_acquire_lease_script_refuses_a_different_token_when_actually_run(real_lua_redis):
+    """A different caller's token against an already-held key must be
+    refused (0), not silently granted."""
+    real_lua_redis.set("k", "tok-other")
+
+    value = real_lua_redis.eval(_ACQUIRE_LEASE_SCRIPT, 1, "k", "tok-a", 540)
+
+    assert value == 0
+    assert real_lua_redis.get("k") == b"tok-other"
+
+
+@pytest.mark.asyncio
+async def test_acquire_lease_retries_present_the_identical_token_on_every_attempt(
+    mocker, integration_v2, monkeypatch
+):
+    """The token is generated once, before the retry loop (review finding):
+    moving `token = str(uuid.uuid4())` inside the loop would make a
+    lost-reply retry present a FRESH token on the second attempt, so the
+    script's same-token fast path no longer recognizes it as the same caller
+    and falsely reports "already held" by someone else — exactly the failure
+    the fast path exists to fix. A lost reply is simulated as a RedisError on
+    the first eval (the real call may have succeeded server-side; the client
+    just never saw the reply), then a real reply on the retry."""
+    from redis.exceptions import RedisError
+
+    _fast_stamina(monkeypatch)
+    state_manager = IntegrationStateManager()
+    state_manager.db_client = mocker.MagicMock()
+    state_manager.db_client.eval = mocker.AsyncMock(side_effect=[RedisError("blip"), 1])
+    integration_id = str(integration_v2.id)
+
+    token = await state_manager.acquire_lease(
+        integration_id, "backfill_observations", ttl_seconds=540, source_id="backfill_trigger_claim"
+    )
+
+    assert token is not None
+    assert state_manager.db_client.eval.await_count == 2
+    first_argv1 = state_manager.db_client.eval.await_args_list[0].args[3]
+    second_argv1 = state_manager.db_client.eval.await_args_list[1].args[3]
+    assert first_argv1 == second_argv1
+
+
+@pytest.mark.asyncio
+async def test_release_lease_is_compare_and_delete(mocker, mock_redis, integration_v2):
+    mocker.patch("app.services.state.redis", mock_redis)
+    mock_redis.Redis.return_value.eval.return_value = async_return(1)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+
+    deleted = await state_manager.release_lease(
+        integration_id, "backfill_observations", "my-token", source_id="backfill_trigger_claim"
+    )
+
+    assert deleted is True
+    mock_redis.Redis.return_value.eval.assert_called_once_with(
+        _RELEASE_LEASE_SCRIPT,
+        1,
+        f"integration_state.{integration_id}.backfill_observations.backfill_trigger_claim",
+        json.dumps("my-token"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_lease_does_not_delete_a_successors_lease(mocker, mock_redis, integration_v2):
+    """A stale releaser (its own lease already expired and re-acquired by
+    someone else) must not delete the new holder's lease — the script only
+    deletes when the stored token still matches the caller's."""
+    mocker.patch("app.services.state.redis", mock_redis)
+    mock_redis.Redis.return_value.eval.return_value = async_return(0)
+    state_manager = IntegrationStateManager()
+    integration_id = str(integration_v2.id)
+
+    deleted = await state_manager.release_lease(
+        integration_id, "backfill_observations", "stale-token", source_id="backfill_trigger_claim"
+    )
+
+    assert deleted is False
 
 
 @pytest.mark.asyncio

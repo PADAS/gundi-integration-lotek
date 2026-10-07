@@ -139,3 +139,6 @@ sample-docs
 local/docker-compose.override.yml
 local/.env
 local/.env.prod-peninsula
+
+# SDD scratch workspace (ledger, briefs, review packages)
+.superpowers/
