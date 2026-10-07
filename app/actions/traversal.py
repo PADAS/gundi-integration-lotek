@@ -27,11 +27,14 @@ class DeviceTraversal:
     makes one traversal serve both without a flag soup.
     """
 
-    def __init__(self, integration, action_id, guards, *, concurrency=1):
+    def __init__(self, integration, action_id, guards, *, concurrency=1, log_activity=None):
         self.integration = integration
         self.integration_id = str(integration.id)
         self.action_id = action_id
         self.guards = guards
+        # Handlers supply their deadline-aware best-effort publisher so error
+        # reporting cannot consume the budget reserved for stopping the run.
+        self.log_activity = log_activity if log_activity is not None else log_action_activity
         # Chunk width: run() gathers one coroutine per device in a chunk, so
         # this DOES bound in-flight requests for this invocation (PR #20
         # review — this comment previously denied being a concurrency limit,
@@ -192,7 +195,7 @@ class DeviceTraversal:
                         f"{self.integration.id}: {describe_exception(res)}"
                     )
                     logger.error(message, exc_info=res)
-                    await log_action_activity(
+                    await self.log_activity(
                         integration_id=self.integration_id,
                         action_id=self.action_id,
                         title=message,

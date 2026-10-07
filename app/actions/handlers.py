@@ -208,15 +208,12 @@ def _arm_publish_deadline():
     )
 
 
-async def _bounded_publish(coro, what):
+async def _bounded_publish(coro, what, *, required=False):
     """Await a best-effort publish under the remaining hard-deadline budget.
 
-    Every caller is best-effort — deferral WARNINGs, summaries, re-trigger
-    publishes and zero-progress events all tolerate a failed publish — so a
-    timeout here degrades exactly like a dropped event, and unlike an
-    unbounded await it cannot carry the action past its hard timeout. Applied
-    at this chokepoint rather than per call site so publishes added later are
-    covered by construction.
+    Activity events tolerate being dropped. Command callers pass required=True
+    so a skipped or timed-out command remains a failure: their existing error
+    paths record undispatched work and release unconsumed trigger claims.
     """
     deadline = _publish_deadline.get()
     if deadline is None:
@@ -225,10 +222,14 @@ async def _bounded_publish(coro, what):
     if budget <= 0:
         coro.close()
         logger.warning(f"Skipping {what}: no action budget left before the hard timeout.")
+        if required:
+            raise asyncio.TimeoutError(f"No action budget left for {what}")
         return None
     try:
         return await asyncio.wait_for(coro, timeout=budget)
     except asyncio.TimeoutError:
+        if required:
+            raise
         logger.warning(
             f"Gave up on {what} after {budget:.1f}s: the action budget is nearly spent "
             f"and the hard timeout must not be reached."
@@ -575,6 +576,7 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                     )
                 ),
                 "a shard dispatch",
+                required=True,
             )
             return None
         except Exception as e:
@@ -712,6 +714,7 @@ async def _retrigger_shard(integration, device_ids, generation, manual_run=False
                 )
             ),
             "a shard re-trigger",
+            required=True,
         )
         return RETRIGGER_HANDED_OFF
     except Exception as e:
@@ -783,7 +786,8 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
 
     guards = RunGuards(run_started)
     traversal = DeviceTraversal(
-        integration, "pull_observations_shard", guards, concurrency=FETCH_CONCURRENCY
+        integration, "pull_observations_shard", guards, concurrency=FETCH_CONCURRENCY,
+        log_activity=_try_log_activity,
     )
     observations_extracted = 0
     stale_drops = []
@@ -996,6 +1000,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
                         )
                     ),
                     "the backfill trigger",
+                    required=True,
                 )
                 published = True
         except Exception as e:
@@ -1582,7 +1587,8 @@ async def action_backfill_observations(integration, action_config: BackfillObser
 
         guards = RunGuards(run_started)
         traversal = DeviceTraversal(
-            integration, "backfill_observations", guards, concurrency=FETCH_CONCURRENCY
+            integration, "backfill_observations", guards, concurrency=FETCH_CONCURRENCY,
+            log_activity=_try_log_activity,
         )
         observations_extracted = 0
         gaps_closed = 0
@@ -1790,6 +1796,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                     )
                 ),
                 "the backfill self-retrigger",
+                required=True,
             )
         except Exception as e:
             # The next head pass will re-trigger; losing one cascade step is fine.

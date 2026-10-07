@@ -380,7 +380,9 @@ async def test_backfill_zero_progress_backend_outage_alerts_exactly_once(
 
     assert result["zero_progress"] is True     # flag preserved for the result
     trigger.assert_not_awaited()               # cascade still suppressed
-    error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
+    # Count action summaries separately from traversal's per-device events,
+    # which now use the same bounded publisher with keyword arguments.
+    error_calls = [c for c in try_log.await_args_list if c.args and c.args[3] is LogLevel.ERROR]
     assert len(error_calls) == 1
     assert "Redis unavailable" in error_calls[0].args[2]
 

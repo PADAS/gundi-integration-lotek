@@ -22,6 +22,114 @@ def _plain_state():
     return DeviceState(high_water=datetime.now(tz=timezone.utc))
 
 
+def _fail_command_publishes(mocker, failure):
+    """Exercise both provider timeouts and the local action publish cutoff."""
+    import time
+    import app.actions.handlers as handlers
+
+    async def publish(*args, **kwargs):
+        if failure == "timeout":
+            raise asyncio.TimeoutError("commands topic unavailable")
+        await asyncio.sleep(3600)
+
+    mocker.patch("app.actions.handlers.trigger_action", side_effect=publish)
+    if failure != "timeout":
+        remaining = -1 if failure == "skipped" else 0.01
+        mocker.patch(
+            "app.actions.handlers._arm_publish_deadline",
+            side_effect=lambda: handlers._publish_deadline.set(time.monotonic() + remaining),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "skipped", "deadline"])
+async def test_failed_command_publish_reports_undispatched_devices(
+    mocker, lotek_integration, pull_config, mock_redis, failure
+):
+    _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    _fail_command_publishes(mocker, failure)
+
+    result = await action_pull_observations(lotek_integration, pull_config)
+
+    assert result["shards_triggered"] == 0
+    assert result["devices_undispatched"] == ["1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "skipped", "deadline"])
+async def test_failed_tail_publish_does_not_report_a_successful_handoff(
+    mocker, lotek_integration, pull_config, mock_redis, failure
+):
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
+    _fail_command_publishes(mocker, failure)
+
+    result = await action_pull_observations_shard(
+        lotek_integration, PullObservationsShardConfig(devices=["1"])
+    )
+
+    assert result["devices_deferred"] == ["1"]
+    assert result["zero_progress"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "skipped", "deadline"])
+async def test_failed_backfill_publish_releases_the_trigger_claim(
+    mocker, lotek_integration, pull_config, mock_redis, failure
+):
+    from app.services.state import IntegrationStateManager
+    from app.actions.handlers import BACKFILL_TRIGGER_CLAIM_SOURCE
+
+    _setup_pull_mocks(mocker, mock_redis, [], saved_state=None)
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch.object(IntegrationStateManager, "acquire_lease", new=AsyncMock(return_value="claim-token"))
+    release = mocker.patch.object(IntegrationStateManager, "release_lease", new=AsyncMock())
+    _fail_command_publishes(mocker, failure)
+
+    await action_pull_observations_shard(
+        lotek_integration, PullObservationsShardConfig(devices=["1"])
+    )
+
+    release.assert_awaited_once_with(
+        str(lotek_integration.id), "backfill_observations", "claim-token",
+        source_id=BACKFILL_TRIGGER_CLAIM_SOURCE,
+    )
+
+
+@pytest.mark.asyncio
+async def test_traversal_error_publishes_respect_the_handler_deadline(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    import time
+    import app.actions.handlers as handlers
+    from app.services.lotek_connections import SlotBackendUnavailable
+
+    _setup_pull_mocks(mocker, mock_redis, [])
+    mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
+    mocker.patch("app.actions.handlers._head_pass_device", side_effect=SlotBackendUnavailable("Redis down"))
+    mocker.patch(
+        "app.actions.handlers._arm_publish_deadline",
+        side_effect=lambda: handlers._publish_deadline.set(time.monotonic() - 1),
+    )
+
+    async def hanging_publish(*args, **kwargs):
+        await asyncio.sleep(3600)
+
+    mocker.patch("app.actions.traversal.log_action_activity", side_effect=hanging_publish)
+    mocker.patch("app.actions.handlers.log_action_activity", side_effect=hanging_publish)
+
+    result = await asyncio.wait_for(
+        action_pull_observations_shard(
+            lotek_integration, PullObservationsShardConfig(devices=["1", "2", "3", "4", "5"])
+        ),
+        timeout=0.5,
+    )
+
+    assert result["devices_failed"] == ["1", "2", "3", "4", "5"]
+    assert result["zero_progress"] is True
+
+
 # --- Parent dispatcher -------------------------------------------------------
 
 
@@ -158,7 +266,9 @@ async def test_shard_backend_outage_defers_tail_and_alerts_once(
     # Only the first chunk was attempted; the tail deferred without grinding.
     assert len(attempted) == 5
     assert len(result["devices_deferred"]) == 5
-    error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
+    # Action summaries use positional arguments; traversal's per-device
+    # events use keyword arguments through the same bounded publisher.
+    error_calls = [c for c in try_log.await_args_list if c.args and c.args[3] is LogLevel.ERROR]
     assert any("edis" in c.args[2] for c in error_calls)  # action-level Redis ERROR present
     # Copilot round 14: this run IS zero-progress (every attempted device hit
     # the outage), so the generic zero-progress ERROR used to fire too —
@@ -362,7 +472,6 @@ async def test_post_deadline_publishes_are_bounded_by_the_hard_timeout(
 
     mocker.patch("app.actions.handlers.trigger_action", side_effect=hanging_publish)
     mocker.patch("app.actions.handlers.log_action_activity", side_effect=hanging_publish)
-    mocker.patch("app.actions.handlers._try_log_activity", side_effect=hanging_publish)
     # Arm the publish deadline in the past so the bound engages immediately —
     # the same state a run that has burned its budget would be in.
     import time as _t
@@ -370,8 +479,11 @@ async def test_post_deadline_publishes_are_bounded_by_the_hard_timeout(
     mocker.patch("app.actions.handlers._arm_publish_deadline",
                  side_effect=lambda: _h._publish_deadline.set(_t.monotonic() - 1))
 
-    result = await action_pull_observations_shard(
-        lotek_integration, PullObservationsShardConfig(devices=devices)
+    result = await asyncio.wait_for(
+        action_pull_observations_shard(
+            lotek_integration, PullObservationsShardConfig(devices=devices)
+        ),
+        timeout=0.5,
     )
 
     # Returned a result instead of hanging into the hard timeout.
@@ -400,7 +512,7 @@ async def test_shard_zero_progress_without_backend_outage_still_alerts(
     )
 
     assert result["zero_progress"] is True
-    error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
+    error_calls = [c for c in try_log.await_args_list if c.args and c.args[3] is LogLevel.ERROR]
     assert any("No devices could be serviced" in c.args[2] for c in error_calls)
 
 
