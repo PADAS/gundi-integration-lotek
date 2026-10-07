@@ -99,8 +99,13 @@ async def test_forward_posts_payload_with_metadata(mocker):
     assert body["device"] == "collar-1"
     metadata = body["__gundi_diagnostic_metadata"]
     assert metadata["integration_id"] == "abc-123"
-    # received_at is a valid, timezone-aware ISO-8601 timestamp.
-    parsed = datetime.datetime.fromisoformat(metadata["received_at"])
+    # received_at is a valid, timezone-aware ISO-8601 timestamp with a "Z"
+    # suffix (the template normalises "+00:00" to "Z", GUNDI-5515). Parsed via
+    # "+00:00" because fromisoformat only accepts "Z" from Python 3.11 and
+    # the service runs on 3.10.
+    received_at = metadata["received_at"]
+    assert received_at.endswith("Z")
+    parsed = datetime.datetime.fromisoformat(received_at.replace("Z", "+00:00"))
     assert parsed.tzinfo is not None
 
 
@@ -205,3 +210,10 @@ async def test_process_webhook_schedules_diagnostic_forward(
     assert forward.call_args.kwargs["destination_url"] == (
         "https://diagnostics.example.com/webhook-dump"
     )
+    # The spawned task is bound to this test's event loop. Left in the
+    # module-level set it outlives the loop, and the next test to drain
+    # _background_tasks (test_diagnostic_url_validation) awaits a task whose
+    # loop is closed. Clearing on entry alone is not enough.
+    for task in list(webhooks._background_tasks):
+        task.cancel()
+    webhooks._background_tasks.clear()
