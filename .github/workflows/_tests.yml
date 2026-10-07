@@ -16,7 +16,9 @@ jobs:
       - name: Settle pip version (for pip-tools compatibility)
         run: python -m pip install --upgrade "pip<25.3"
       - name: Install pip-tools
-        run: python -m pip install --upgrade "pip-tools"
+        # typing_extensions listed explicitly: pip-tools 7.6.0 imports it on
+        # Python 3.10 without declaring it as a dependency
+        run: python -m pip install --upgrade pip-tools typing_extensions
       - name: Install compile dependencies
         run: pip-compile --output-file=requirements.txt requirements-base.in requirements-dev.in requirements.in
       - name: Install dependencies

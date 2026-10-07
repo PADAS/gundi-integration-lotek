@@ -205,3 +205,10 @@ async def test_process_webhook_schedules_diagnostic_forward(
     assert forward.call_args.kwargs["destination_url"] == (
         "https://diagnostics.example.com/webhook-dump"
     )
+    # The spawned task is bound to this test's event loop. Left in the
+    # module-level set it outlives the loop, and the next test to drain
+    # _background_tasks (test_diagnostic_url_validation) awaits a task whose
+    # loop is closed. Clearing on entry alone is not enough.
+    for task in list(webhooks._background_tasks):
+        task.cancel()
+    webhooks._background_tasks.clear()
