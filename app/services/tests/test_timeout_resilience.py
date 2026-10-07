@@ -136,9 +136,11 @@ async def test_internal_asyncio_timeout_is_not_labeled_as_action_deadline(
     assert failed, "an action failure event must still be published"
     error_text = failed[-1].payload.error
     # The handler died ~instantly, nowhere near the deadline — the error must
-    # say so instead of masquerading as the wait_for ceiling.
-    assert "deadline" in error_text
-    assert f"Action 'pull_observations' timed out" not in error_text
+    # not masquerade as the runner's own ceiling. The template classifies a
+    # dependency timeout as a connectivity failure (errors.classify_error),
+    # which points the operator at the provider rather than at the deadline.
+    assert "Could not reach the provider" in error_text
+    assert "Action timed out" not in error_text
 
 
 @pytest.mark.asyncio
@@ -163,7 +165,10 @@ async def test_wait_for_ceiling_is_still_reported_as_timeout(
 
     failed = _failed_events(mock_publish_event)
     assert failed
-    assert "Action 'pull_observations' timed out" in failed[-1].payload.error
+    # The template reports its own cap as ActionTimeoutError, naming the limit.
+    error_text = failed[-1].payload.error
+    assert "Action timed out" in error_text
+    assert "execution limit" in error_text
 
 
 @pytest.mark.asyncio

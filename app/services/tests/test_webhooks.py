@@ -226,8 +226,11 @@ async def test_process_webhook_handles_no_integration_gracefully(
     mock_logger.warning.assert_called_once()
     warning_call = mock_logger.warning.call_args[0][0]
     assert "No integration found for webhook request" in warning_call
-    assert "headers:" in warning_call
-    assert "query_params:" in warning_call
+    # The template names the specific lookup keys rather than dumping every
+    # header (which put auth headers in the log); assert the current shape.
+    assert "consumer_username:" in warning_call
+    assert "integration_id header:" in warning_call
+    assert "integration_id param:" in warning_call
 
 
 @pytest.mark.asyncio
