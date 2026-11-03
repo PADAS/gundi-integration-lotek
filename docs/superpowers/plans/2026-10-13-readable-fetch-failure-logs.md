@@ -72,6 +72,15 @@ The existing zero-progress ERROR stays, right away, but says what happened in pl
 
 Deferred devices are added as "N postponed to a later run" when there are any. The message names its scope ("in this batch" for a shard), because it describes one shard only. The backfill's zero-progress ERROR gets the same treatment, scoped "with missing history".
 
+## Other activity-log messages
+
+Every other message this runner writes to the activity log gets the same plain wording, with no change to its level, its values or the logic around it. Portal titles leave out internal terms (shard, Redis, cursor, budget, circuit breaker), exception text and "will be retried"; the technical detail stays in the server log line. Examples:
+
+- Stopped early: "Gundi stopped this run early because Lotek kept failing, so 3 device(s) weren't checked: …" (also "it ran out of time", "of an internal storage problem", "too many requests to Lotek were already in progress").
+- Device list: "Gundi couldn't get the device list from Lotek because it couldn't connect to Lotek."
+- Per device: "Lotek didn't send data for device 88630 because it answered with an error (HTTP 404)."
+- Too old: "Data older than 72 hours wasn't imported for 2 device(s): …"
+
 ## Changes
 
 ### `app/actions/failures.py` (new)
