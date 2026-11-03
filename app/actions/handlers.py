@@ -1336,8 +1336,11 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     if cdip_positions is None:
         escalated = False
         # A brand-new device has no saved document to record this in; its
-        # clock starts after its first successful save.
-        if fetch.failure_reason in TEMPORARY_REASONS and not is_new:
+        # clock starts after its first successful save. A legacy-migrated
+        # device is also is_new but does have a saved document (its old
+        # cursor), so it is tracked like any other.
+        has_saved_state = not is_new or state.migrated_from_legacy
+        if fetch.failure_reason in TEMPORARY_REASONS and has_saved_state:
             escalated = await _track_failing_since(integration_id, device_id, state, present_time)
         return HeadPassResult(0, fetch.transport_failure, fetch.failure_reason, escalated)
 
@@ -1367,10 +1370,10 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     # finding). Everything else belongs to the backfill (merge-save, see
     # _save_device_state_fields); last_backfilled is deliberately never
     # written here.
-    updates = {"high_water": state.high_water}
-    if state.failing_since is not None:
-        # Working again: end the run of temporary failures in the same save.
-        updates["failing_since"] = None
+    # Working again: end any run of temporary failures in the same save.
+    # Always written, not only when this run loaded one: an overlapping head
+    # pass may have started a clock after this run loaded its state.
+    updates = {"high_water": state.high_water, "failing_since": None}
     init_only = None
     if is_new:
         updates["version"] = state.version

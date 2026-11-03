@@ -1857,3 +1857,40 @@ async def test_new_device_failure_saves_nothing(
     await run_head_pass(lotek_integration, pull_config)
 
     assert _saved_states(set_state, "1") == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_migrated_device_failure_starts_the_clock(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # A lagging legacy cursor loads as is_new (gap migration) but does have a
+    # saved document, so its temporary failures are tracked like any other.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    behind = datetime.now(timezone.utc) - timedelta(days=3)
+    get_positions, _, set_state, _ = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1"), saved_state={"updated_at": behind.isoformat()}
+    )
+    get_positions.side_effect = httpx.ReadTimeout("")
+
+    await run_head_pass(lotek_integration, pull_config)
+
+    [saved] = _saved_states(set_state, "1")
+    assert "failing_since" in saved
+
+
+@pytest.mark.asyncio
+async def test_success_always_clears_failing_since(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Even when this run loaded no clock: an overlapping head pass may have
+    # started one after this run read its state.
+    recent = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    _, _, set_state, _ = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1"), saved_state={"high_water": recent}
+    )
+
+    await run_head_pass(lotek_integration, pull_config)
+
+    [saved] = _saved_states(set_state, "1")
+    assert "failing_since" in saved and saved["failing_since"] is None
