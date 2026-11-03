@@ -31,7 +31,7 @@ Each failed device gets exactly one reason. Reasons and messages live in one mod
 | `save_failed` | saving the head cursor or the backfill gap failed after delivery | error | Gundi got the latest data for {count} but couldn't save how far it got. |
 | `unexpected` | other 4xx, data-shape errors, and exceptions caught by the traversal | error | Something unexpected went wrong getting data for {count}. The error for each device is in this log. |
 
-`{count}` reads "3 of 25 devices (88634, 88635, 88643)", using `_summarize_ids` for the ids. The total is the shard's device count for the head pass and the gapped device count for the backfill.
+`{count}` reads "3 of 55 devices (88634, 88635, 88643)", using `_summarize_ids` for the ids. The total is the connection's device count: the dispatcher passes it to each shard as `total_devices` on `PullObservationsShardConfig` (a shard without it falls back to its own size), and the backfill counts against all listed devices.
 
 The backfill uses the same messages; the activity log already shows which action wrote them.
 
@@ -68,9 +68,9 @@ The route stays unhealthy while the problem lasts and recovers on its own once t
 
 The existing zero-progress ERROR stays, right away, but says what happened in plain words, grouped by reason:
 
-> None of the 25 devices could be updated in this run: 20 because the connection timed out, 5 because Lotek rejected Gundi's login.
+> None of the 25 devices in this batch could be updated in this run: 20 because the connection timed out, 5 because Lotek rejected Gundi's login.
 
-Deferred devices are added as "N were postponed to a later run" when there are any. The backfill's zero-progress ERROR gets the same treatment.
+Deferred devices are added as "N postponed to a later run" when there are any. The message names its scope ("in this batch" for a shard), because it describes one shard only. The backfill's zero-progress ERROR gets the same treatment, scoped "with missing history".
 
 ## Changes
 
