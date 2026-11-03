@@ -13,6 +13,10 @@ from app.services.lotek_connections import (
 
 logger = logging.getLogger(__name__)
 
+# Failure reason for anything without a more specific one, including the
+# exceptions run() catches itself. The other reasons live with the handlers.
+FAILURE_UNEXPECTED = "unexpected"
+
 
 class DeviceTraversal:
     """Shared chunked-device-loop mechanics for the head pass and the backfill.
@@ -45,6 +49,10 @@ class DeviceTraversal:
         # width; the default of 1 means "one device per chunk".
         self.concurrency = concurrency
         self.failed_devices = []
+        # Why each failed device failed, so the handlers can say it in the
+        # portal. Kept beside failed_devices, which stays a plain list for the
+        # result payload and the zero-progress check.
+        self.failure_reasons = {}
         # Two reason-specific lists, not one combined `deferred_devices`:
         # guard_stopped_devices is the unreached tail cut short by
         # should_stop() (deadline/breaker/cap); slot_starved_devices is
@@ -114,11 +122,21 @@ class DeviceTraversal:
         self.guard_stopped_devices.append(device_id)
         self.stop_reason = self.stop_reason or "deadline"
 
-    def mark_failed(self, device_id):
+    def mark_failed(self, device_id, reason=FAILURE_UNEXPECTED):
         """Caller-side failure: the device produced a result, but the result
         says it failed (e.g. delivery rejected)."""
         self.failed_devices.append(device_id)
+        self.failure_reasons[device_id] = reason
         self._marked_failed += 1
+
+    def failed_by_reason(self):
+        """Failed devices grouped by reason, reasons in the order they first
+        occurred, devices in the order they failed."""
+        grouped = {}
+        for device_id in self.failed_devices:
+            reason = self.failure_reasons.get(device_id, FAILURE_UNEXPECTED)
+            grouped.setdefault(reason, []).append(device_id)
+        return grouped
 
     async def run(self, work, key, process):
         work = list(work)
@@ -202,6 +220,7 @@ class DeviceTraversal:
                         level=LogLevel.ERROR,
                     )
                     self.failed_devices.append(device_id)
+                    self.failure_reasons[device_id] = FAILURE_UNEXPECTED
                     self.guards.record(transport_failure=False)
                     continue
                 self._yielded += 1

@@ -303,7 +303,7 @@ async def test_mixed_breaker_and_starvation_still_alerts(
         # (sent=0, device_failed=True, transport_failure=True). That last flag
         # is what feeds the breaker; a RAISED timeout would be recorded as
         # transport_failure=False and never trip it.
-        return (0, True, True)
+        return (0, True, True, "timeout")
 
     _setup_pull_mocks(mocker, mock_redis, _devices(*devices))
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
@@ -462,7 +462,7 @@ async def test_post_deadline_publishes_are_bounded_by_the_hard_timeout(
     devices = ["dev0", "dev1"]
     _setup_pull_mocks(mocker, mock_redis, _devices(*devices))
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
-    mocker.patch("app.actions.handlers._head_pass_device", return_value=(0, False, False))
+    mocker.patch("app.actions.handlers._head_pass_device", return_value=(0, False, False, None))
     # Force the deadline branch, then make every post-work publish hang the
     # way a degraded commands topic would.
     mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
@@ -556,7 +556,7 @@ async def test_shard_loads_device_states_concurrently(
         return (_plain_state(), False)
 
     mocker.patch("app.actions.handlers._load_device_state", side_effect=slow_load)
-    mocker.patch("app.actions.handlers._head_pass_device", return_value=(0, False, False))
+    mocker.patch("app.actions.handlers._head_pass_device", return_value=(0, False, False, None))
 
     await action_pull_observations_shard(
         lotek_integration, _shard_config(*(f"dev{i}" for i in range(10)))
@@ -614,7 +614,7 @@ async def test_starved_device_does_not_abort_the_whole_shard(
         calls.append(device_id)
         if device_id == "dev0":
             raise NoConnectionSlot("saturated")
-        return (5, False, False)
+        return (5, False, False, None)
 
     mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
     mocker.patch("app.actions.handlers._retrigger_shard", return_value="handed_off")
@@ -649,7 +649,7 @@ async def test_quiet_success_beside_a_failed_device_is_not_zero_progress(
     async def fake_head_pass(device_id, *args, **kwargs):
         if device_id == "boom":
             raise ValueError("delivery rejected")
-        return (0, False, False)  # serviced, but nothing new to send
+        return (0, False, False, None)  # serviced, but nothing new to send
 
     mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
 
@@ -1117,7 +1117,7 @@ async def test_shard_keeps_slot_starved_and_guard_stopped_devices_disjoint(
     async def fake_head_pass(device_id, *args, **kwargs):
         if device_id == "3":
             raise NoConnectionSlot("saturated")
-        return (1, False, False)
+        return (1, False, False, None)
 
     mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
 

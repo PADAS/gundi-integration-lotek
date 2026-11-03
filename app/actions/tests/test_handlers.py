@@ -387,10 +387,8 @@ async def test_action_pull_observations_summary_names_failed_devices(
     await run_head_pass(lotek_integration, pull_config)
 
     warnings = [c.kwargs["title"] for c in mock_log_action_activity.call_args_list
-                if c.kwargs.get("level") == LogLevel.WARNING and "failing" in c.kwargs["title"]]
-    assert warnings, "no failure summary was logged"
-    assert "1 of 2" in warnings[0]
-    assert "2" in warnings[0]
+                if c.kwargs.get("level") == LogLevel.WARNING and "didn't send data" in c.kwargs["title"]]
+    assert warnings == ["Lotek didn't send data for device(s) 2 because the connection timed out."]
 
 
 @pytest.mark.asyncio
@@ -755,9 +753,9 @@ async def test_action_pull_observations_emits_summary_before_all_failed_raise(
     assert result["zero_progress"] is True
 
     warnings = [c.kwargs["title"] for c in mock_log_action_activity.call_args_list
-                if c.kwargs.get("level") == LogLevel.WARNING and "failing" in c.kwargs["title"]]
+                if c.kwargs.get("level") == LogLevel.WARNING and "didn't send data" in c.kwargs["title"]]
     assert warnings, "summary was not emitted before the all-failed raise"
-    assert "2 of 2" in warnings[0]
+    assert "1" in warnings[0] and "2" in warnings[0]
 
 
 @pytest.mark.asyncio
@@ -1029,7 +1027,7 @@ async def test_transient_fetch_failure_logs_warning_not_error(
     assert device_1_publishes == []
     summaries = [
         c for c in log.await_args_list
-        if "failing for integration" in c.kwargs.get("title", "")
+        if "didn't send data" in c.kwargs.get("title", "")
     ]
     assert summaries and all(c.kwargs["level"] == LogLevel.WARNING for c in summaries)
 
@@ -1596,3 +1594,80 @@ async def test_fetch_error_publish_failure_stays_contained_to_the_device(
     result = await run_head_pass(lotek_integration, pull_config)
     assert result["devices_failed"] == ["1"]
     assert get_positions.await_count == 3, "device 2 was never serviced"
+
+
+# --- Readable fetch-failure logs ------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error, expected", [
+    (httpx.ReadTimeout(""), "Lotek didn't send data for device(s) 1 because the connection timed out."),
+    (httpx.ConnectError(""), "Lotek didn't send data for device(s) 1 because Gundi couldn't connect to it."),
+    (LotekException(message="down", status_code=503), "Lotek didn't send data for device(s) 1 because its server returned an error."),
+    (LotekException(message="slow down", status_code=429), "Lotek didn't send data for device(s) 1 because its server returned an error."),
+    (LotekException(message="bad request", status_code=404), "Something unexpected went wrong getting data for device(s) 1. See the error above in this log."),
+    (KeyError("RecDateTime"), "Something unexpected went wrong getting data for device(s) 1. See the error above in this log."),
+])
+async def test_fetch_failure_summary_names_the_reason(
+    mocker, lotek_integration, pull_config, mock_redis, error, expected
+):
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    get_positions, _, _, log = _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
+
+    async def get_positions_side_effect(device_id, *args, **kwargs):
+        if device_id == "1":
+            raise error
+        return []
+
+    get_positions.side_effect = get_positions_side_effect
+    result = await run_head_pass(lotek_integration, pull_config)
+
+    assert result["devices_failed"] == ["1"]
+    summaries = [
+        c.kwargs["title"] for c in log.await_args_list
+        if c.kwargs.get("level") == LogLevel.WARNING
+        and ("didn't send data" in c.kwargs["title"] or "unexpected" in c.kwargs["title"])
+    ]
+    assert summaries == [expected]
+
+
+@pytest.mark.asyncio
+async def test_persistent_token_rejection_is_a_warning_not_an_error(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # Re-login keeps working, so Gundi can still get tokens: the device is
+    # reported in the login-rejected warning and nothing marks the
+    # integration unhealthy.
+    from app.actions.client import LotekTokenExpiredException
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    get_positions, _, _, log = _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
+
+    async def get_positions_side_effect(device_id, *args, **kwargs):
+        if device_id == "1":
+            raise LotekTokenExpiredException(message="401 Response from Lotek API")
+        return []
+
+    get_positions.side_effect = get_positions_side_effect
+    result = await run_head_pass(lotek_integration, pull_config)
+
+    assert result["devices_failed"] == ["1"]
+    assert [c for c in log.await_args_list if c.kwargs.get("level") == LogLevel.ERROR] == []
+    warnings = [c.kwargs["title"] for c in log.await_args_list if c.kwargs.get("level") == LogLevel.WARNING]
+    assert "Lotek didn't send data for device(s) 1 because it rejected Gundi's login." in warnings
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_summary_says_gundi_could_not_receive(
+    mocker, lotek_integration, pull_config, mock_redis, lotek_position
+):
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    _, _, _, log = _setup_pull_mocks(mocker, mock_redis, _devices("1"), positions=[lotek_position])
+    mocker.patch("app.services.gundi.send_observations_to_gundi", new=AsyncMock(side_effect=RuntimeError("down")))
+
+    await run_head_pass(lotek_integration, pull_config)
+
+    warnings = [c.kwargs["title"] for c in log.await_args_list if c.kwargs.get("level") == LogLevel.WARNING]
+    assert "Lotek sent data for device(s) 1, but Gundi couldn't receive it." in warnings

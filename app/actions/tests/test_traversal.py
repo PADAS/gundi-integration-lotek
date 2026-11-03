@@ -312,3 +312,34 @@ async def test_slot_starvation_and_guard_stop_stay_in_separate_lists(integration
     assert sorted(t.deferred_devices) == ["1", "3", "4"]  # union
     assert t.budget_starved is True
     assert t.stop_reason == "deadline"
+
+
+def test_mark_failed_records_reason_with_unexpected_default(integration):
+    t = DeviceTraversal(integration, "act", FakeGuards())
+    t.mark_failed("1", "timeout")
+    t.mark_failed("2")
+    assert t.failed_devices == ["1", "2"]
+    assert t.failure_reasons == {"1": "timeout", "2": "unexpected"}
+
+
+@pytest.mark.asyncio
+async def test_exception_in_run_is_recorded_as_unexpected(integration, mocker):
+    mocker.patch("app.actions.traversal.log_action_activity", new=AsyncMock())
+
+    async def process(i):
+        raise ValueError("boom")
+
+    t = DeviceTraversal(integration, "act", FakeGuards())
+    _ = [item async for item, _ in t.run([1], key=str, process=process)]
+    assert t.failed_by_reason() == {"unexpected": ["1"]}
+
+
+def test_failed_by_reason_groups_in_first_seen_order(integration):
+    t = DeviceTraversal(integration, "act", FakeGuards())
+    t.mark_failed("1", "login_rejected")
+    t.mark_failed("2", "timeout")
+    t.mark_failed("3", "login_rejected")
+    assert list(t.failed_by_reason().items()) == [
+        ("login_rejected", ["1", "3"]),
+        ("timeout", ["2"]),
+    ]
