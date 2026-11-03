@@ -29,6 +29,10 @@ class DeviceState(pydantic.BaseModel):
     gap_start: Optional[datetime] = None
     gap_end: Optional[datetime] = None
     last_backfilled: Optional[datetime] = None
+    # Start of the device's current run of temporary head-pass failures
+    # (timeouts, Lotek errors, rejected logins); None while it works. Lets a
+    # failure that lasts become an ERROR (see app/actions/failures.py).
+    failing_since: Optional[datetime] = None
     # In-memory marker, never persisted (exclude=True): tells the loader this
     # state was parsed from a pre-5602 cursor blob, so a cursor lagging beyond
     # the freshness floor gets its owed range carried over as a gap instead of
@@ -47,7 +51,7 @@ class DeviceState(pydantic.BaseModel):
         return values
 
     _tz = pydantic.validator(
-        "high_water", "gap_start", "gap_end", "last_backfilled", allow_reuse=True
+        "high_water", "gap_start", "gap_end", "last_backfilled", "failing_since", allow_reuse=True
     )(_ensure_utc)
 
     @property

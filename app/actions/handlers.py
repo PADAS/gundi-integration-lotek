@@ -13,6 +13,7 @@ import app.settings.integration as settings
 import time
 
 from datetime import datetime, timezone, timedelta
+from typing import NamedTuple, Optional
 
 from app.services.errors import ConfigurationNotFound
 from app.actions.client import LotekException, LotekTokenExpiredException, LotekUnauthorizedException
@@ -25,7 +26,11 @@ from app.actions.configurations import (
 )
 from app.actions.core import action_title, describe_exception
 from app.actions.device_state import DeviceState
-from app.actions.traversal import DeviceTraversal, FAILURE_UNEXPECTED
+from app.actions.traversal import DeviceTraversal
+from app.actions.failures import (
+    ESCALATION_AFTER, TEMPORARY_REASONS, FailureReason, device_count,
+    escalated_message, nothing_updated_message, warning_message,
+)
 from app.services.action_scheduler import trigger_action
 from app.services.lotek_connections import (
     lotek_slot, NoConnectionSlot, SlotBackendUnavailable, SlotWaitBudgetExhausted,
@@ -176,38 +181,62 @@ def _summarize_ids(ids):
     return listed
 
 
-# Why a device failed in a run. Each reason gets one plain-language portal
-# warning per run that says only what happened in that run.
-FAILURE_TIMEOUT = "timeout"
-FAILURE_NO_CONNECTION = "no_connection"
-FAILURE_LOTEK_ERROR = "lotek_error"
-FAILURE_LOGIN_REJECTED = "login_rejected"
-FAILURE_DELIVERY_FAILED = "delivery_failed"
-
-FAILURE_MESSAGES = {
-    FAILURE_TIMEOUT: "Lotek didn't send data for device(s) {ids} because the connection timed out.",
-    FAILURE_NO_CONNECTION: "Lotek didn't send data for device(s) {ids} because Gundi couldn't connect to it.",
-    FAILURE_LOTEK_ERROR: "Lotek didn't send data for device(s) {ids} because its server returned an error.",
-    FAILURE_LOGIN_REJECTED: "Lotek didn't send data for device(s) {ids} because it rejected Gundi's login.",
-    FAILURE_DELIVERY_FAILED: "Lotek sent data for device(s) {ids}, but Gundi couldn't receive it.",
-    FAILURE_UNEXPECTED: "Something unexpected went wrong getting data for device(s) {ids}. See the error above in this log.",
-}
+class FetchResult(NamedTuple):
+    """One window's fetch. positions is None when the fetch failed."""
+    positions: Optional[list]
+    transport_failure: bool = False
+    failure_reason: Optional[FailureReason] = None
 
 
-async def _log_failure_summary(integration_id, action_id, traversal):
-    """One portal WARNING per failure reason that occurred in this run."""
+class HeadPassResult(NamedTuple):
+    sent: int
+    transport_failure: bool = False
+    failure_reason: Optional[FailureReason] = None
+    # The device's temporary failures have lasted ESCALATION_AFTER.
+    escalated: bool = False
+
+    @property
+    def device_failed(self):
+        return self.failure_reason is not None
+
+
+class BackfillResult(NamedTuple):
+    sent: int
+    transport_failure: bool
+    gap_closed: bool
+    windows_advanced: int
+    cut_reason: Optional[str]
+    failure_reason: Optional[FailureReason] = None
+
+    @property
+    def device_failed(self):
+        return self.failure_reason is not None
+
+
+async def _log_failure_summary(integration_id, action_id, traversal, total, escalated=frozenset()):
+    """One portal message per failure reason that occurred in this run: a
+    WARNING, or an ERROR for devices whose temporary failures have lasted
+    ESCALATION_AFTER."""
     for reason, device_ids in traversal.failed_by_reason().items():
-        message = FAILURE_MESSAGES[reason].format(ids=_summarize_ids(device_ids))
-        logger.warning(f"{message} Integration ID: {integration_id}")
-        await _bounded_publish(
-            log_action_activity(
-                integration_id=integration_id,
-                action_id=action_id,
-                title=message,
-                level=LogLevel.WARNING
-            ),
-            "an activity-log event",
+        groups = (
+            ([d for d in device_ids if d not in escalated], LogLevel.WARNING, warning_message),
+            ([d for d in device_ids if d in escalated], LogLevel.ERROR, escalated_message),
         )
+        for ids, level, build in groups:
+            if not ids:
+                continue
+            message = build(reason, device_count(_summarize_ids(ids), len(ids), total))
+            log = logger.error if level == LogLevel.ERROR else logger.warning
+            log(f"{message} Integration ID: {integration_id}")
+            await _bounded_publish(
+                log_action_activity(
+                    integration_id=integration_id,
+                    action_id=action_id,
+                    title=message,
+                    level=level
+                ),
+                "an activity-log event",
+            )
 
 
 # Monotonic instant after which this action must not start another publish.
@@ -829,6 +858,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
     # the rails before its gap status is checked doesn't trigger backfill this
     # cycle. Self-correcting: the re-triggered tail (or the next tick) reaches it.
     any_open_gap = False
+    escalated_devices = set()
 
     async for (device_id, state, is_new), res in traversal.run(
         device_states,
@@ -838,15 +868,16 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             present_time, guards, stale_drops=stale_drops,
         ),
     ):
-        sent, device_failed, transport_failure, failure_reason = res
         # Single recording site: transport failures arm the breaker, anything
         # else (success included) breaks the consecutive streak.
-        guards.record(transport_failure=transport_failure)
-        observations_extracted += sent
+        guards.record(transport_failure=res.transport_failure)
+        observations_extracted += res.sent
         if state.has_gap:
             any_open_gap = True
-        if device_failed:
-            traversal.mark_failed(device_id, failure_reason)
+        if res.device_failed:
+            traversal.mark_failed(device_id, res.failure_reason)
+            if res.escalated:
+                escalated_devices.add(device_id)
 
     failed_devices = traversal.failed_devices
     # Union, for the overall count/result only (below). The retrigger and the
@@ -884,7 +915,10 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             traversal.slot_starved_devices, disposition="to the next scheduled run",
         )
 
-    await _log_failure_summary(integration_id, "pull_observations_shard", traversal)
+    await _log_failure_summary(
+        integration_id, "pull_observations_shard", traversal,
+        total=len(action_config.devices), escalated=escalated_devices,
+    )
 
     if stale_drops:
         # Permanent data loss must stay visible in the portal: one aggregated
@@ -964,12 +998,10 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         # tick. An ERROR activity event carries the same health signal (the
         # unhealthy-connection metric counts ERROR activity events) without the
         # credential exposure.
-        message = (
-            f"No devices could be serviced for integration {integration.id}: "
-            f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
-            f"{len(action_config.devices)}. See the per-device errors in this action's activity log."
+        message = nothing_updated_message(
+            len(action_config.devices), traversal.failed_by_reason(), len(deferred_devices),
         )
-        logger.error(message)
+        logger.error(f"{message} Integration ID: {integration_id}")
         await _try_log_activity(
             integration_id, "pull_observations_shard", message, LogLevel.ERROR
         )
@@ -1143,10 +1175,10 @@ async def _save_device_state_fields(integration_id, device_id, updates, init_onl
 async def _fetch_window(device_id, integration, auth, config, lower_date, upper_date, guards, action_id):
     """Fetch + transform one window for one device.
 
-    Returns (cdip_positions | None, transport_failure, failure_reason). None
-    means the fetch failed — already logged and classified; the caller marks
-    the device failed with failure_reason and records transport_failure for
-    the circuit breaker. failure_reason is None on success. Raises only
+    Returns a FetchResult. positions is None when the fetch failed — already
+    logged and classified; the caller marks the device failed with
+    failure_reason and records transport_failure for the circuit breaker.
+    Raises only
     LotekUnauthorizedException (integration-wide) and NoConnectionSlot
     (account-wide budget, the caller defers and re-triggers).
     """
@@ -1171,7 +1203,7 @@ async def _fetch_window(device_id, integration, auth, config, lower_date, upper_
         logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device_id} between {lower_date} and {upper_date}.")
         # Transform inside the try: a malformed payload is a per-device, fetch-class
         # failure and must get the same device/date-window log and isolation.
-        return filter_and_transform_positions(positions, integration, config), False, None
+        return FetchResult(filter_and_transform_positions(positions, integration, config))
     except LotekUnauthorizedException:
         # Credentials are an integration-wide problem: every remaining device
         # would fail the same way, so fail fast instead of N identical errors.
@@ -1189,8 +1221,8 @@ async def _fetch_window(device_id, integration, auth, config, lower_date, upper_
         # (or the instance) was already drowning — a congestion feedback loop.
         message = f"Error fetching positions from Lotek. Device: {device_id}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         logger.warning(message, exc_info=True)
-        reason = FAILURE_TIMEOUT if isinstance(e, httpx.TimeoutException) else FAILURE_NO_CONNECTION
-        return None, True, reason
+        reason = FailureReason.TIMEOUT if isinstance(e, httpx.TimeoutException) else FailureReason.NO_CONNECTION
+        return FetchResult(None, True, reason)
     except LotekException as e:
         message = f"Error fetching positions from Lotek. Device: {device_id}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         if e.status_code >= 500 or e.status_code == 429:
@@ -1201,7 +1233,7 @@ async def _fetch_window(device_id, integration, auth, config, lower_date, upper_
             # never trip the breaker (review finding). Local log only — same
             # aggregation rationale as the transport branch above.
             logger.warning(message, exc_info=True)
-            return None, True, FAILURE_LOTEK_ERROR
+            return FetchResult(None, True, FailureReason.LOTEK_ERROR)
         if e.status_code == 401:
             # A token-expiry 401 that survived its retry. Each retry logged in
             # again successfully (a refused login raises
@@ -1209,12 +1241,12 @@ async def _fetch_window(device_id, integration, auth, config, lower_date, upper_
             # tokens: WARNING, reported only in the per-reason summary, so the
             # integration is not marked unhealthy. Not breaker-feeding.
             logger.warning(message, exc_info=True)
-            return None, False, FAILURE_LOGIN_REJECTED
+            return FetchResult(None, False, FailureReason.LOGIN_REJECTED)
         # Other 4xx: a per-device/API-contract problem that won't self-heal —
         # ERROR, and not breaker-feeding.
         logger.exception(message)
         await _try_log_activity(integration_id, action_id, message, LogLevel.ERROR)
-        return None, False, FAILURE_UNEXPECTED
+        return FetchResult(None, False, FailureReason.UNEXPECTED)
     except Exception as e:
         # Deliberately broad: malformed data from Lotek surfaces as KeyError or
         # pydantic.ValidationError out of the client's parsing, and those must
@@ -1227,7 +1259,7 @@ async def _fetch_window(device_id, integration, auth, config, lower_date, upper_
         message = f"Error fetching positions from Lotek. Device: {device_id}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         logger.exception(message)
         await _try_log_activity(integration_id, action_id, message, LogLevel.ERROR)
-        return None, False, FAILURE_UNEXPECTED
+        return FetchResult(None, False, FailureReason.UNEXPECTED)
 
 
 async def _deliver(cdip_positions, device_id, integration, action_id):
@@ -1272,8 +1304,9 @@ async def _deliver(cdip_positions, device_id, integration, action_id):
 async def _head_pass_device(device_id, state, is_new, integration, auth, action_config, present_time, guards, stale_drops=None):
     """Fetch, deliver and checkpoint one device's freshest window.
 
-    Returns (observations_sent, device_failed, transport_failure,
-    failure_reason); failure_reason is None unless device_failed.
+    Returns a HeadPassResult; failure_reason is None unless the device
+    failed. Temporary failures are tracked in state.failing_since so one
+    that lasts ESCALATION_AFTER is reported as escalated.
     Raises only for integration-wide problems; per-device problems are
     reported through the returned flags so the caller can keep going (and
     record transport_failure for the circuit breaker in one place).
@@ -1293,11 +1326,15 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     stale_from = state.high_water if state.high_water < freshness_floor else None
 
     lower_date = max(state.high_water - HEAD_LATE_UPLOAD_OVERLAP, freshness_floor)
-    cdip_positions, transport_failure, failure_reason = await _fetch_window(
+    fetch = await _fetch_window(
         device_id, integration, auth, action_config, lower_date, present_time, guards, "pull_observations_shard"
     )
+    cdip_positions = fetch.positions
     if cdip_positions is None:
-        return 0, True, transport_failure, failure_reason
+        escalated = False
+        if fetch.failure_reason in TEMPORARY_REASONS:
+            escalated = await _track_failing_since(integration_id, device_id, state, is_new, present_time)
+        return HeadPassResult(0, fetch.transport_failure, fetch.failure_reason, escalated)
 
     if not cdip_positions:
         # Local log only. This used to publish a portal WARNING per quiet
@@ -1310,7 +1347,7 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     if delivery_failed:
         # The breaker watches Lotek, not Gundi: a delivery failure is not
         # evidence of Lotek-wide degradation.
-        return observations_sent, True, False, FAILURE_DELIVERY_FAILED
+        return HeadPassResult(observations_sent, False, FailureReason.DELIVERY_FAILED)
 
     # Advance the cursor to the queried upper bound (upload time), not recorded_at.
     # Queries are by upload date, so wall clock is the correct cursor, and it must
@@ -1326,6 +1363,9 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     # _save_device_state_fields); last_backfilled is deliberately never
     # written here.
     updates = {"high_water": state.high_water}
+    if state.failing_since is not None:
+        # Working again: end the run of temporary failures in the same save.
+        updates["failing_since"] = None
     init_only = None
     if is_new:
         updates["version"] = state.version
@@ -1339,7 +1379,7 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
         )
         logger.exception(message)
         await _try_log_activity(integration_id, "pull_observations_shard", message, LogLevel.ERROR)
-        return observations_sent, True, False, FAILURE_UNEXPECTED
+        return HeadPassResult(observations_sent, False, FailureReason.SAVE_FAILED)
 
     if stale_from is not None:
         # Only now is the drop real: the cursor advanced past the owed range.
@@ -1355,16 +1395,44 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
         if stale_drops is not None:
             stale_drops.append(device_id)
 
-    return observations_sent, False, False, None
+    state.failing_since = None
+    return HeadPassResult(observations_sent)
+
+
+async def _track_failing_since(integration_id, device_id, state, is_new, now):
+    """Start or continue the device's run of temporary failures. Returns True
+    once it has lasted ESCALATION_AFTER.
+
+    Best effort: if the save fails, the run just starts again next time.
+    """
+    if state.failing_since is not None:
+        return now - state.failing_since >= ESCALATION_AFTER
+    state.failing_since = now
+    updates = {"failing_since": now}
+    init_only = None
+    if is_new:
+        # A new device has no saved document yet, and one holding only
+        # failing_since would not parse (high_water is required). Save the
+        # first-run state as the successful path would, minus the cursor
+        # advance; the gap stays create-only.
+        updates.update({"high_water": state.high_water, "version": state.version})
+        init_only = {"gap_start": state.gap_start, "gap_end": state.gap_end}
+    try:
+        await _save_device_state_fields(integration_id, device_id, updates, init_only=init_only)
+    except Exception as e:
+        logger.warning(
+            f"Couldn't save when device {device_id} started failing. Integration ID: "
+            f"{integration_id} Exception: {describe_exception(e)}"
+        )
+    return False
 
 
 async def _backfill_device(device, state, integration, auth, pull_config, guards):
     """Close up to BACKFILL_MAX_WINDOWS_PER_DEVICE oldest windows of one
     device's gap.
 
-    Returns (observations_sent, device_failed, transport_failure, gap_closed,
-    windows_advanced, cut_reason, failure_reason); failure_reason is None
-    unless device_failed. gap_start advances only past windows that
+    Returns a BackfillResult; failure_reason is None unless the device
+    failed. gap_start advances only past windows that
     were actually delivered, so a failure re-fetches the same window next
     trigger (re-sends are tolerated, silent skips are not). windows_advanced
     counts those actually-delivered windows: the caller only keeps the
@@ -1382,7 +1450,6 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     """
     integration_id = str(integration.id)
     observations_sent = 0
-    device_failed = False
     transport_failure = False
     windows_advanced = 0
     cut_reason = None
@@ -1394,9 +1461,10 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
         upper_date = min(state.gap_end, state.gap_start + BACKFILL_WINDOW)
 
         try:
-            cdip_positions, transport_failure, failure_reason = await _fetch_window(
+            fetch = await _fetch_window(
                 device.nDeviceID, integration, auth, pull_config, window_start, upper_date, guards, "backfill_observations"
             )
+            cdip_positions, transport_failure, failure_reason = fetch
         except SlotBackendUnavailable:
             # Redis-down after progress is reachable: the window-1 checkpoint
             # save and window-2's acquire are not simultaneous, and a
@@ -1419,27 +1487,40 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
             cut_reason = "starved"
             break  # saturated mid-device: keep the progress, tell the caller to throttle
         if cdip_positions is None:
-            device_failed = True
             break
 
         sent, delivery_failed = await _deliver(cdip_positions, device.nDeviceID, integration, "backfill_observations")
         observations_sent += sent
         if delivery_failed:
-            device_failed = True
-            failure_reason = FAILURE_DELIVERY_FAILED
+            failure_reason = FailureReason.DELIVERY_FAILED
             break
 
         # Advance the gap only past the delivered window; close it when done.
         # The backfill owns only the gap fields (merge-save): a concurrent head
         # pass advancing high_water must survive this write.
+        saved_gap = (state.gap_start, state.gap_end)
         state.gap_start = upper_date
         if not state.has_gap:
             state.gap_start = None
             state.gap_end = None
-        await _save_device_state_fields(
-            integration_id, device.nDeviceID,
-            {"gap_start": state.gap_start, "gap_end": state.gap_end}
-        )
+        try:
+            await _save_device_state_fields(
+                integration_id, device.nDeviceID,
+                {"gap_start": state.gap_start, "gap_end": state.gap_end}
+            )
+        except Exception as e:
+            # The window was delivered but its checkpoint wasn't saved, so the
+            # next trigger re-fetches and re-sends it (re-sends are tolerated).
+            # Returned rather than raised so observations_sent still counts.
+            state.gap_start, state.gap_end = saved_gap
+            message = (
+                f"Error saving backfill progress for device {device.nDeviceID}. Integration ID: "
+                f"{integration.id} Exception: {describe_exception(e)}"
+            )
+            logger.exception(message)
+            await _try_log_activity(integration_id, "backfill_observations", message, LogLevel.ERROR)
+            failure_reason = FailureReason.SAVE_FAILED
+            break
         windows_advanced += 1
 
     # Advances even on zero progress (device_failed on the first window):
@@ -1457,12 +1538,18 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     # failing acquire, and fairness self-corrects on the next run (this
     # device keeps its older last_backfilled, so it stays at the front of
     # the LRS queue — the right place after an interrupted run).
-    if cut_reason != "backend":
+    #
+    # Skipped after a failed progress save for the same reason: it writes to
+    # the store that just failed, and a raise here would discard the
+    # delivered-but-unsaved outcome.
+    if cut_reason != "backend" and failure_reason != FailureReason.SAVE_FAILED:
         state.last_backfilled = datetime.now(tz=timezone.utc)
         await _save_device_state_fields(
             integration_id, device.nDeviceID, {"last_backfilled": state.last_backfilled}
         )
-    return observations_sent, device_failed, transport_failure, not state.has_gap, windows_advanced, cut_reason, failure_reason
+    return BackfillResult(
+        observations_sent, transport_failure, not state.has_gap, windows_advanced, cut_reason, failure_reason,
+    )
 
 
 @action_title("Backfill Observations")
@@ -1633,7 +1720,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 pair[0], pair[1], integration, auth, pull_config, guards
             ),
         ):
-            sent, device_failed, transport_failure, gap_closed, windows_advanced, cut_reason, failure_reason = res
+            cut_reason = res.cut_reason
             if cut_reason == "starved":
                 # Partial progress then saturation: the device returned a
                 # result instead of raising, so the traversal never saw the
@@ -1659,12 +1746,12 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 # unthrottled.
                 traversal.mark_deadline_cut(device.nDeviceID)
             # Single recording site, mirroring the head pass.
-            guards.record(transport_failure=transport_failure)
-            observations_extracted += sent
-            gaps_closed += int(gap_closed)
-            windows_advanced_total += windows_advanced
-            if device_failed:
-                traversal.mark_failed(device.nDeviceID, failure_reason)
+            guards.record(transport_failure=res.transport_failure)
+            observations_extracted += res.sent
+            gaps_closed += int(res.gap_closed)
+            windows_advanced_total += res.windows_advanced
+            if res.device_failed:
+                traversal.mark_failed(device.nDeviceID, res.failure_reason)
 
         failed_devices = traversal.failed_devices
         # Union, for the overall count/result only (below); the two deferral
@@ -1687,7 +1774,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 traversal.slot_starved_devices, disposition="to the next backfill trigger",
             )
 
-        await _log_failure_summary(integration_id, "backfill_observations", traversal)
+        await _log_failure_summary(integration_id, "backfill_observations", traversal, total=len(gapped))
 
         # Backfill's suppression policy differs from the shard's and is
         # preserved exactly: ONLY starvation explains a no-progress run here (a
@@ -1713,12 +1800,10 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             # configuration — the auth action's plaintext Lotek password
             # included (GUNDI-5628). An ERROR activity event carries the same
             # health signal without the credential exposure (spec D7).
-            message = (
-                f"No devices could be backfilled for integration {integration_id}: "
-                f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
-                f"{len(gapped)}. See the per-device errors in this action's activity log."
+            message = nothing_updated_message(
+                len(gapped), traversal.failed_by_reason(), len(deferred_devices), done="backfilled",
             )
-            logger.error(message)
+            logger.error(f"{message} Integration ID: {integration_id}")
             await _try_log_activity(
                 integration_id, "backfill_observations", message, LogLevel.ERROR
             )

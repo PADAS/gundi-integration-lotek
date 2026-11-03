@@ -6,16 +6,13 @@ from gundi_core.events import LogLevel
 
 from app.actions.client import LotekUnauthorizedException
 from app.actions.core import describe_exception
+from app.actions.failures import FailureReason
 from app.services.activity_logger import log_action_activity
 from app.services.lotek_connections import (
     NoConnectionSlot, SlotBackendUnavailable, SlotWaitBudgetExhausted,
 )
 
 logger = logging.getLogger(__name__)
-
-# Failure reason for anything without a more specific one, including the
-# exceptions run() catches itself. The other reasons live with the handlers.
-FAILURE_UNEXPECTED = "unexpected"
 
 
 class DeviceTraversal:
@@ -122,7 +119,7 @@ class DeviceTraversal:
         self.guard_stopped_devices.append(device_id)
         self.stop_reason = self.stop_reason or "deadline"
 
-    def mark_failed(self, device_id, reason=FAILURE_UNEXPECTED):
+    def mark_failed(self, device_id, reason=FailureReason.UNEXPECTED):
         """Caller-side failure: the device produced a result, but the result
         says it failed (e.g. delivery rejected)."""
         self.failed_devices.append(device_id)
@@ -134,7 +131,7 @@ class DeviceTraversal:
         occurred, devices in the order they failed."""
         grouped = {}
         for device_id in self.failed_devices:
-            reason = self.failure_reasons.get(device_id, FAILURE_UNEXPECTED)
+            reason = self.failure_reasons.get(device_id, FailureReason.UNEXPECTED)
             grouped.setdefault(reason, []).append(device_id)
         return grouped
 
@@ -220,7 +217,7 @@ class DeviceTraversal:
                         level=LogLevel.ERROR,
                     )
                     self.failed_devices.append(device_id)
-                    self.failure_reasons[device_id] = FAILURE_UNEXPECTED
+                    self.failure_reasons[device_id] = FailureReason.UNEXPECTED
                     self.guards.record(transport_failure=False)
                     continue
                 self._yielded += 1
