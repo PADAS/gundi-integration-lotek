@@ -192,7 +192,7 @@ class HeadPassResult(NamedTuple):
     sent: int
     transport_failure: bool = False
     failure_reason: Optional[FailureReason] = None
-    # The device's temporary failures have lasted ESCALATION_AFTER.
+    # The device has gone ESCALATION_AFTER without a successful pull.
     escalated: bool = False
 
     @property
@@ -1295,8 +1295,8 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     """Fetch, deliver and checkpoint one device's freshest window.
 
     Returns a HeadPassResult; failure_reason is None unless the device
-    failed. Temporary failures are tracked in state.failing_since so one
-    that lasts ESCALATION_AFTER is reported as escalated.
+    failed. A temporary failure on a device whose last successful pull
+    (high_water) is more than ESCALATION_AFTER old is reported as escalated.
     Raises only for integration-wide problems; per-device problems are
     reported through the returned flags so the caller can keep going (and
     record transport_failure for the circuit breaker in one place).
@@ -1321,14 +1321,14 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     )
     cdip_positions = fetch.positions
     if cdip_positions is None:
-        escalated = False
-        # A brand-new device has no saved document to record this in; its
-        # clock starts after its first successful save. A legacy-migrated
-        # device is also is_new but does have a saved document (its old
-        # cursor), so it is tracked like any other.
-        has_saved_state = not is_new or state.migrated_from_legacy
-        if fetch.failure_reason in TEMPORARY_REASONS and has_saved_state:
-            escalated = await _track_failing_since(integration_id, device_id, state, present_time)
+        # high_water only moves on a successful pull, so its age is how long
+        # the device has gone without one. A new or just-migrated device
+        # (is_new) has a starting high_water, not a real last success.
+        escalated = (
+            fetch.failure_reason in TEMPORARY_REASONS
+            and not is_new
+            and present_time - state.high_water >= ESCALATION_AFTER
+        )
         return HeadPassResult(0, fetch.transport_failure, fetch.failure_reason, escalated)
 
     if not cdip_positions:
@@ -1357,10 +1357,7 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     # finding). Everything else belongs to the backfill (merge-save, see
     # _save_device_state_fields); last_backfilled is deliberately never
     # written here.
-    # Working again: end any run of temporary failures in the same save.
-    # Always written, not only when this run loaded one: an overlapping head
-    # pass may have started a clock after this run loaded its state.
-    updates = {"high_water": state.high_water, "failing_since": None}
+    updates = {"high_water": state.high_water}
     init_only = None
     if is_new:
         updates["version"] = state.version
@@ -1391,27 +1388,7 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
         if stale_drops is not None:
             stale_drops.append(device_id)
 
-    state.failing_since = None
     return HeadPassResult(observations_sent)
-
-
-async def _track_failing_since(integration_id, device_id, state, now):
-    """Start or continue the device's run of temporary failures. Returns True
-    once it has lasted ESCALATION_AFTER.
-
-    Best effort: if the save fails, the run just starts again next time.
-    """
-    if state.failing_since is not None:
-        return now - state.failing_since >= ESCALATION_AFTER
-    state.failing_since = now
-    try:
-        await _save_device_state_fields(integration_id, device_id, {"failing_since": now})
-    except Exception as e:
-        logger.warning(
-            f"Couldn't save when device {device_id} started failing. Integration ID: "
-            f"{integration_id} Exception: {describe_exception(e)}"
-        )
-    return False
 
 
 async def _backfill_device(device, state, integration, auth, pull_config, guards):

@@ -850,10 +850,6 @@ def _saved_states(set_state, device_id):
     return [c.args[-2] for c in set_state.await_args_list if c.args[-1] == device_id]
 
 
-def _as_dt(value):
-    return value if isinstance(value, datetime) else datetime.fromisoformat(value)
-
-
 def _setup_pull_mocks(mocker, mock_redis, devices, positions=None, saved_state=None):
     mocker.patch("app.services.state.redis", mock_redis)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
@@ -1054,10 +1050,7 @@ async def test_failed_head_fetch_does_not_advance_high_water(
     # single device, nothing serviced → reported via zero_progress, not raised
     result = await run_head_pass(lotek_integration, pull_config)
     assert result["zero_progress"] is True
-    # Only the start of the failure is saved, never a new cursor.
-    [saved] = _saved_states(set_state, "1")
-    assert "failing_since" in saved
-    assert _as_dt(saved["high_water"]) == _as_dt(recent)
+    set_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1568,9 +1561,7 @@ async def test_no_stale_drop_warning_when_the_fetch_fails(
     # which publishes every integration config (auth included) (review finding).
     result = await run_head_pass(lotek_integration, pull_config)
     assert result["zero_progress"] is True
-    [saved] = _saved_states(set_state, "1")
-    assert "failing_since" in saved
-    assert _as_dt(saved["high_water"]) == _as_dt(stale)
+    set_state.assert_not_awaited()
     assert not any(
         "stale range" in c.kwargs.get("title", "").lower() for c in log.await_args_list
     )
@@ -1702,31 +1693,7 @@ async def test_failed_cursor_save_summary_says_progress_was_not_saved(
     assert "Gundi got the latest data for 1 of 1 device (1) but couldn't save how far it got." in warnings
 
 
-# --- Escalating temporary failures that last ------------------------------
-
-
-@pytest.mark.asyncio
-async def test_first_temporary_failure_records_when_it_started(
-    mocker, lotek_integration, pull_config, mock_redis
-):
-    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
-    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
-    recent = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    get_positions, _, set_state, log = _setup_pull_mocks(
-        mocker, mock_redis, _devices("1", "2"), saved_state={"high_water": recent}
-    )
-
-    async def get_positions_side_effect(device_id, *args, **kwargs):
-        if device_id == "1":
-            raise httpx.ReadTimeout("")
-        return []
-
-    get_positions.side_effect = get_positions_side_effect
-    await run_head_pass(lotek_integration, pull_config)
-
-    [saved] = _saved_states(set_state, "1")
-    assert abs(_as_dt(saved["failing_since"]) - datetime.now(timezone.utc)) < timedelta(minutes=1)
-    assert [c for c in log.await_args_list if c.kwargs.get("level") == LogLevel.ERROR] == []
+# --- Escalating when a device has gone an hour without a successful pull ---
 
 
 @pytest.mark.asyncio
@@ -1737,10 +1704,7 @@ async def test_failure_lasting_over_an_hour_is_an_error(
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     now = datetime.now(timezone.utc)
-    saved_state = {
-        "high_water": (now - timedelta(hours=2)).isoformat(),
-        "failing_since": (now - timedelta(minutes=61)).isoformat(),
-    }
+    saved_state = {"high_water": (now - timedelta(minutes=61)).isoformat()}
     get_positions, _, set_state, log = _setup_pull_mocks(
         mocker, mock_redis, _devices("1", "2"), saved_state=saved_state
     )
@@ -1757,7 +1721,7 @@ async def test_failure_lasting_over_an_hour_is_an_error(
     assert errors == [
         "Lotek hasn't sent data for 1 of 2 devices (1) for over 1 hour because it keeps rejecting Gundi's login."
     ]
-    # The start time is kept, not reset, while the failure lasts.
+    # Nothing is saved for a failed device; the cursor stays put.
     assert _saved_states(set_state, "1") == []
 
 
@@ -1768,10 +1732,7 @@ async def test_failure_under_an_hour_stays_a_warning(
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     now = datetime.now(timezone.utc)
-    saved_state = {
-        "high_water": (now - timedelta(hours=2)).isoformat(),
-        "failing_since": (now - timedelta(minutes=50)).isoformat(),
-    }
+    saved_state = {"high_water": (now - timedelta(minutes=50)).isoformat()}
     get_positions, _, _, log = _setup_pull_mocks(
         mocker, mock_redis, _devices("1", "2"), saved_state=saved_state
     )
@@ -1785,23 +1746,6 @@ async def test_failure_under_an_hour_stays_a_warning(
     await run_head_pass(lotek_integration, pull_config)
 
     assert [c for c in log.await_args_list if c.kwargs.get("level") == LogLevel.ERROR] == []
-
-
-@pytest.mark.asyncio
-async def test_success_clears_failing_since(
-    mocker, lotek_integration, pull_config, mock_redis
-):
-    now = datetime.now(timezone.utc)
-    saved_state = {
-        "high_water": (now - timedelta(hours=2)).isoformat(),
-        "failing_since": (now - timedelta(hours=3)).isoformat(),
-    }
-    _, _, set_state, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1"), saved_state=saved_state)
-
-    await run_head_pass(lotek_integration, pull_config)
-
-    [saved] = _saved_states(set_state, "1")
-    assert saved["failing_since"] is None
 
 
 @pytest.mark.asyncio
@@ -1847,8 +1791,8 @@ async def test_shard_counts_against_the_whole_fleet(
 async def test_new_device_failure_saves_nothing(
     mocker, lotek_integration, pull_config, mock_redis
 ):
-    # No saved document yet: the failure clock starts only after the device's
-    # first successful save, so a failed first run writes no state at all.
+    # A new device's starting high_water is not a real last success, so its
+    # failure is a warning, and a failed first run writes no state at all.
     mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
     mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
     get_positions, _, set_state, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1"))
@@ -1857,40 +1801,3 @@ async def test_new_device_failure_saves_nothing(
     await run_head_pass(lotek_integration, pull_config)
 
     assert _saved_states(set_state, "1") == []
-
-
-@pytest.mark.asyncio
-async def test_legacy_migrated_device_failure_starts_the_clock(
-    mocker, lotek_integration, pull_config, mock_redis
-):
-    # A lagging legacy cursor loads as is_new (gap migration) but does have a
-    # saved document, so its temporary failures are tracked like any other.
-    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
-    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
-    behind = datetime.now(timezone.utc) - timedelta(days=3)
-    get_positions, _, set_state, _ = _setup_pull_mocks(
-        mocker, mock_redis, _devices("1"), saved_state={"updated_at": behind.isoformat()}
-    )
-    get_positions.side_effect = httpx.ReadTimeout("")
-
-    await run_head_pass(lotek_integration, pull_config)
-
-    [saved] = _saved_states(set_state, "1")
-    assert "failing_since" in saved
-
-
-@pytest.mark.asyncio
-async def test_success_always_clears_failing_since(
-    mocker, lotek_integration, pull_config, mock_redis
-):
-    # Even when this run loaded no clock: an overlapping head pass may have
-    # started one after this run read its state.
-    recent = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    _, _, set_state, _ = _setup_pull_mocks(
-        mocker, mock_redis, _devices("1"), saved_state={"high_water": recent}
-    )
-
-    await run_head_pass(lotek_integration, pull_config)
-
-    [saved] = _saved_states(set_state, "1")
-    assert "failing_since" in saved and saved["failing_since"] is None

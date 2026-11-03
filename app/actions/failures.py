@@ -17,8 +17,8 @@ class FailureReason(str, Enum):
     UNEXPECTED = "unexpected"
 
 
-# Temporary reasons are WARNINGs until the same device has kept failing for
-# ESCALATION_AFTER; the rest are errors right away (they get their own
+# Temporary reasons are WARNINGs until the device has gone ESCALATION_AFTER
+# without a successful pull; the rest are errors right away (they get their own
 # per-device ERROR line where they happen).
 TEMPORARY_REASONS = frozenset({
     FailureReason.TIMEOUT,
