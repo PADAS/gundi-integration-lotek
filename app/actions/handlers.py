@@ -635,7 +635,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 trigger_action(
                     integration_id, "pull_observations_shard",
                     config=PullObservationsShardConfig(
-                        devices=shard, triggered_by="pull_observations", manual_run=manual_run
+                        devices=shard, triggered_by="pull_observations", manual_run=manual_run,
+                        total_devices=len(all_ids),
                     )
                 ),
                 "a shard dispatch",
@@ -731,7 +732,7 @@ async def _reset_dispatcher_skip_streak(integration_id):
         )
 
 
-async def _retrigger_shard(integration, device_ids, generation, manual_run=False):
+async def _retrigger_shard(integration, device_ids, generation, manual_run=False, total_devices=None):
     """Re-dispatch deferred devices as a fresh shard with its own budget,
     instead of parking them until the next scheduled tick.
 
@@ -774,6 +775,7 @@ async def _retrigger_shard(integration, device_ids, generation, manual_run=False
                     triggered_by="pull_observations_shard",
                     generation=generation + 1,
                     manual_run=manual_run,
+                    total_devices=total_devices,
                 )
             ),
             "a shard re-trigger",
@@ -895,7 +897,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
     if traversal.stop_reason == "deadline" and traversal.guard_stopped_devices:
         retrigger_outcome = await _retrigger_shard(
             integration, traversal.guard_stopped_devices, action_config.generation,
-            manual_run=action_config.manual_run,
+            manual_run=action_config.manual_run, total_devices=action_config.total_devices,
         )
     if traversal.stop_reason:
         await _log_deferral(
@@ -917,7 +919,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
 
     await _log_failure_summary(
         integration_id, "pull_observations_shard", traversal,
-        total=len(action_config.devices), escalated=escalated_devices,
+        total=action_config.total_devices or len(action_config.devices), escalated=escalated_devices,
     )
 
     if stale_drops:
@@ -1000,6 +1002,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         # credential exposure.
         message = nothing_updated_message(
             len(action_config.devices), traversal.failed_by_reason(), len(deferred_devices),
+            group="in this batch",
         )
         logger.error(f"{message} Integration ID: {integration_id}")
         await _try_log_activity(
@@ -1774,7 +1777,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 traversal.slot_starved_devices, disposition="to the next backfill trigger",
             )
 
-        await _log_failure_summary(integration_id, "backfill_observations", traversal, total=len(gapped))
+        await _log_failure_summary(integration_id, "backfill_observations", traversal, total=len(device_list))
 
         # Backfill's suppression policy differs from the shard's and is
         # preserved exactly: ONLY starvation explains a no-progress run here (a
@@ -1802,6 +1805,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             # health signal without the credential exposure (spec D7).
             message = nothing_updated_message(
                 len(gapped), traversal.failed_by_reason(), len(deferred_devices), done="backfilled",
+                group="with missing history",
             )
             logger.error(f"{message} Integration ID: {integration_id}")
             await _try_log_activity(

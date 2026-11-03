@@ -81,7 +81,7 @@ def escalated_message(reason, count):
     return template.format(count=count)
 
 
-def nothing_updated_message(total, failed_by_reason, deferred, done="updated"):
+def nothing_updated_message(total, failed_by_reason, deferred, done="updated", group=""):
     """One line for a run where no device got through, e.g. "None of the 25
     devices could be updated in this run: 20 because the connection timed
     out, 5 because Lotek rejected Gundi's login." """
@@ -90,7 +90,8 @@ def nothing_updated_message(total, failed_by_reason, deferred, done="updated"):
         detail = f" because {' and '.join(reasons)}" if reasons else ""
         if deferred:
             detail = " because it was postponed to a later run"
-        return f"The device couldn't be {done} in this run{detail}."
+        subject = f"The device {group}" if group else "The device"
+        return f"{subject} couldn't be {done} in this run{detail}."
     parts = [
         f"{len(ids)} because {_LABELS[as_reason(reason)]}"
         for reason, ids in failed_by_reason.items()
@@ -98,4 +99,5 @@ def nothing_updated_message(total, failed_by_reason, deferred, done="updated"):
     if deferred:
         parts.append(f"{deferred} postponed to a later run")
     detail = f": {', '.join(parts)}" if parts else ""
-    return f"None of the {total} devices could be {done} in this run{detail}."
+    subject = f"None of the {total} devices {group}" if group else f"None of the {total} devices"
+    return f"{subject} could be {done} in this run{detail}."

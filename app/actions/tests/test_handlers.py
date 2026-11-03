@@ -1823,4 +1823,26 @@ async def test_all_failed_error_names_the_reasons(
 
     assert result["zero_progress"] is True
     errors = [c.args[2] for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
-    assert "None of the 2 devices could be updated in this run: 2 because the connection timed out." in errors
+    assert "None of the 2 devices in this batch could be updated in this run: 2 because the connection timed out." in errors
+
+
+@pytest.mark.asyncio
+async def test_shard_counts_against_the_whole_fleet(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    get_positions, _, _, log = _setup_pull_mocks(mocker, mock_redis, _devices("1", "2"))
+
+    async def get_positions_side_effect(device_id, *args, **kwargs):
+        if device_id == "1":
+            raise httpx.ReadTimeout("")
+        return []
+
+    get_positions.side_effect = get_positions_side_effect
+    config = PullObservationsShardConfig(devices=["1", "2"], total_devices=55)
+    with _patch("app.actions.handlers.get_pull_config", return_value=pull_config):
+        await action_pull_observations_shard(lotek_integration, config)
+
+    warnings = [c.kwargs["title"] for c in log.await_args_list if c.kwargs.get("level") == LogLevel.WARNING]
+    assert "Lotek didn't send data for 1 of 55 devices (1) because the connection timed out." in warnings

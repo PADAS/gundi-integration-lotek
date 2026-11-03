@@ -152,6 +152,8 @@ async def test_pull_observations_dispatches_shards(mocker, lotek_integration, pu
     dispatched = [d for c in shard_calls for d in c.kwargs["config"].devices]
     assert sorted(dispatched) == sorted(device_ids)  # every device exactly once
     assert all(len(c.kwargs["config"].devices) <= SHARD_SIZE for c in shard_calls)
+    # Each shard knows the whole fleet's size for its "N of M devices" messages.
+    assert {c.kwargs["config"].total_devices for c in shard_calls} == {len(device_ids)}
 
 
 @pytest.mark.asyncio
