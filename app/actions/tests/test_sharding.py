@@ -3,6 +3,8 @@ import pytest
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock
+from app.actions.handlers import HeadPassResult
+from app.actions.failures import FailureReason
 
 from gundi_core.schemas.v2 import LogLevel
 from app.actions.configurations import PullObservationsShardConfig
@@ -150,6 +152,8 @@ async def test_pull_observations_dispatches_shards(mocker, lotek_integration, pu
     dispatched = [d for c in shard_calls for d in c.kwargs["config"].devices]
     assert sorted(dispatched) == sorted(device_ids)  # every device exactly once
     assert all(len(c.kwargs["config"].devices) <= SHARD_SIZE for c in shard_calls)
+    # Each shard knows the whole fleet's size for its "N of M devices" messages.
+    assert {c.kwargs["config"].total_devices for c in shard_calls} == {len(device_ids)}
 
 
 @pytest.mark.asyncio
@@ -269,14 +273,14 @@ async def test_shard_backend_outage_defers_tail_and_alerts_once(
     # Action summaries use positional arguments; traversal's per-device
     # events use keyword arguments through the same bounded publisher.
     error_calls = [c for c in try_log.await_args_list if c.args and c.args[3] is LogLevel.ERROR]
-    assert any("edis" in c.args[2] for c in error_calls)  # action-level Redis ERROR present
+    assert any("internal storage problem" in c.args[2] for c in error_calls)  # action-level Redis ERROR present
     # Copilot round 14: this run IS zero-progress (every attempted device hit
     # the outage), so the generic zero-progress ERROR used to fire too —
     # double-counting one incident in the ERROR-driven health metric and
     # breaking the "one action-level ERROR per run" contract the backend
     # branch introduced. Exactly one, and it is the diagnostic Redis one.
     assert len(error_calls) == 1
-    assert "No devices could be serviced" not in error_calls[0].args[2]
+    assert "be updated in this run" not in error_calls[0].args[2]
 
 
 @pytest.mark.asyncio
@@ -303,7 +307,7 @@ async def test_mixed_breaker_and_starvation_still_alerts(
         # (sent=0, device_failed=True, transport_failure=True). That last flag
         # is what feeds the breaker; a RAISED timeout would be recorded as
         # transport_failure=False and never trip it.
-        return (0, True, True)
+        return HeadPassResult(0, True, FailureReason.TIMEOUT)
 
     _setup_pull_mocks(mocker, mock_redis, _devices(*devices))
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
@@ -318,7 +322,7 @@ async def test_mixed_breaker_and_starvation_still_alerts(
     assert result["devices_failed"]                 # real Lotek failures happened
     assert result.get("zero_progress") is True      # must NOT be suppressed
     error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
-    assert any("No devices could be serviced" in c.args[2] for c in error_calls)
+    assert any("be updated in this run" in c.args[2] for c in error_calls)
 
 
 @pytest.mark.asyncio
@@ -349,7 +353,7 @@ async def test_pure_starvation_with_no_failures_still_suppresses(
     assert result["devices_failed"] == []
     assert "zero_progress" not in result            # suppressed, as designed
     error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
-    assert not any("No devices could be serviced" in c.args[2] for c in error_calls)
+    assert not any("be updated in this run" in c.args[2] for c in error_calls)
 
 
 @pytest.mark.asyncio
@@ -462,7 +466,7 @@ async def test_post_deadline_publishes_are_bounded_by_the_hard_timeout(
     devices = ["dev0", "dev1"]
     _setup_pull_mocks(mocker, mock_redis, _devices(*devices))
     mocker.patch("app.actions.handlers.get_pull_config", return_value=pull_config)
-    mocker.patch("app.actions.handlers._head_pass_device", return_value=(0, False, False))
+    mocker.patch("app.actions.handlers._head_pass_device", return_value=HeadPassResult(0))
     # Force the deadline branch, then make every post-work publish hang the
     # way a degraded commands topic would.
     mocker.patch("app.actions.handlers._deadline_exceeded", return_value=True)
@@ -513,7 +517,7 @@ async def test_shard_zero_progress_without_backend_outage_still_alerts(
 
     assert result["zero_progress"] is True
     error_calls = [c for c in try_log.await_args_list if c.args and c.args[3] is LogLevel.ERROR]
-    assert any("No devices could be serviced" in c.args[2] for c in error_calls)
+    assert any("be updated in this run" in c.args[2] for c in error_calls)
 
 
 @pytest.mark.asyncio
@@ -556,7 +560,7 @@ async def test_shard_loads_device_states_concurrently(
         return (_plain_state(), False)
 
     mocker.patch("app.actions.handlers._load_device_state", side_effect=slow_load)
-    mocker.patch("app.actions.handlers._head_pass_device", return_value=(0, False, False))
+    mocker.patch("app.actions.handlers._head_pass_device", return_value=HeadPassResult(0))
 
     await action_pull_observations_shard(
         lotek_integration, _shard_config(*(f"dev{i}" for i in range(10)))
@@ -614,7 +618,7 @@ async def test_starved_device_does_not_abort_the_whole_shard(
         calls.append(device_id)
         if device_id == "dev0":
             raise NoConnectionSlot("saturated")
-        return (5, False, False)
+        return HeadPassResult(5)
 
     mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
     mocker.patch("app.actions.handlers._retrigger_shard", return_value="handed_off")
@@ -649,7 +653,7 @@ async def test_quiet_success_beside_a_failed_device_is_not_zero_progress(
     async def fake_head_pass(device_id, *args, **kwargs):
         if device_id == "boom":
             raise ValueError("delivery rejected")
-        return (0, False, False)  # serviced, but nothing new to send
+        return HeadPassResult(0)  # serviced, but nothing new to send
 
     mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
 
@@ -874,7 +878,7 @@ async def test_dispatcher_skip_streak_warns_after_consecutive_skips(
 
     warnings = lambda: [
         c for c in log.await_args_list
-        if c.kwargs.get("level") == LogLevel.WARNING and "consecutive ticks" in c.kwargs.get("title", "")
+        if c.kwargs.get("level") == LogLevel.WARNING and "Gundi skipped the last" in c.kwargs.get("title", "")
     ]
     for tick in range(1, DISPATCHER_SKIP_WARN_AFTER + 1):
         result = await action_pull_observations(lotek_integration, pull_config)
@@ -1033,7 +1037,7 @@ async def test_retrigger_cap_does_not_also_emit_zero_progress(
     assert "zero_progress" not in result
     errors = [c.kwargs["title"] for c in log.await_args_list if c.kwargs.get("level") == LogLevel.ERROR]
     assert len(errors) == 1
-    assert "re-trigger cap" in errors[0]
+    assert "ran out of time to check" in errors[0]
 
 
 @pytest.mark.asyncio
@@ -1117,7 +1121,7 @@ async def test_shard_keeps_slot_starved_and_guard_stopped_devices_disjoint(
     async def fake_head_pass(device_id, *args, **kwargs):
         if device_id == "3":
             raise NoConnectionSlot("saturated")
-        return (1, False, False)
+        return HeadPassResult(1)
 
     mocker.patch("app.actions.handlers._head_pass_device", side_effect=fake_head_pass)
 

@@ -85,6 +85,15 @@ class PullObservationsShardConfig(InternalActionConfiguration):
         title="Devices",
         description="Device ids this shard is responsible for.",
     )
+    total_devices: Optional[int] = pydantic.Field(
+        None,
+        title="Total Devices",
+        description=(
+            "How many devices the whole integration has, so a shard's portal "
+            "messages can say \"3 of 55 devices\" rather than counting only "
+            "its own share. Falls back to the shard's size when unset."
+        ),
+    )
     triggered_by: str = pydantic.Field(
         "pull_observations",
         title="Triggered By",

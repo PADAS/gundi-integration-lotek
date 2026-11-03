@@ -1,5 +1,7 @@
 import pytest
 import httpx
+from app.actions.handlers import BackfillResult, FetchResult
+from app.actions.failures import FailureReason
 
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
@@ -132,14 +134,15 @@ async def test_backfill_device_keeps_window_one_progress_when_window_two_starves
 
     fetch = mocker.patch(
         "app.actions.handlers._fetch_window",
-        new=AsyncMock(side_effect=[(["pos"], False), NoConnectionSlot("saturated")]),
+        new=AsyncMock(side_effect=[FetchResult(["pos"]), NoConnectionSlot("saturated")]),
     )
     mocker.patch("app.actions.handlers._deliver", new=AsyncMock(return_value=(7, False)))
     save = mocker.patch("app.actions.handlers._save_device_state_fields", new=AsyncMock())
 
     result = await _backfill_device(device, state, lotek_integration, object(), object(), object())
 
-    sent, device_failed, transport_failure, gap_closed, windows_advanced, cut_reason = result
+    sent, transport_failure, gap_closed, windows_advanced, cut_reason, failure_reason = result
+    device_failed = result.device_failed
     assert (sent, windows_advanced, cut_reason) == (7, 1, "starved")
     assert device_failed is False
     # Window 1's checkpoint AND the fairness save both happened.
@@ -192,7 +195,7 @@ async def test_partial_starvation_still_throttles_the_cascade(
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
     mocker.patch(
         "app.actions.handlers._backfill_device",
-        new=AsyncMock(return_value=(7, False, False, False, 1, "starved")),  # partial + starved
+        new=AsyncMock(return_value=BackfillResult(7, False, False, 1, "starved")),  # partial + starved
     )
 
     result = await action_backfill_observations(
@@ -225,7 +228,7 @@ async def test_partial_deadline_cut_is_reported_as_deferred(
     trigger = mocker.patch("app.actions.handlers.trigger_action", new=AsyncMock())
     mocker.patch(
         "app.actions.handlers._backfill_device",
-        new=AsyncMock(return_value=(7, False, False, False, 1, "deadline")),
+        new=AsyncMock(return_value=BackfillResult(7, False, False, 1, "deadline")),
     )
 
     result = await action_backfill_observations(
@@ -260,13 +263,14 @@ async def test_backfill_device_keeps_progress_when_redis_dies_before_window_two(
 
     mocker.patch(
         "app.actions.handlers._fetch_window",
-        new=AsyncMock(side_effect=[(["pos"], False), SlotBackendUnavailable("redis down")]),
+        new=AsyncMock(side_effect=[FetchResult(["pos"]), SlotBackendUnavailable("redis down")]),
     )
     mocker.patch("app.actions.handlers._deliver", new=AsyncMock(return_value=(7, False)))
     mocker.patch("app.actions.handlers._save_device_state_fields", new=AsyncMock())
 
     result = await _backfill_device(device, state, lotek_integration, object(), object(), object())
-    sent, device_failed, transport_failure, gap_closed, windows_advanced, cut_reason = result
+    sent, transport_failure, gap_closed, windows_advanced, cut_reason, failure_reason = result
+    device_failed = result.device_failed
     assert (sent, windows_advanced, cut_reason) == (7, 1, "backend")
     assert device_failed is False
 
@@ -297,7 +301,7 @@ async def test_backend_cut_progress_survives_a_dead_redis_fairness_write(
 
     mocker.patch(
         "app.actions.handlers._fetch_window",
-        new=AsyncMock(side_effect=[(["pos"], False), SlotBackendUnavailable("redis down")]),
+        new=AsyncMock(side_effect=[FetchResult(["pos"]), SlotBackendUnavailable("redis down")]),
     )
     mocker.patch("app.actions.handlers._deliver", new=AsyncMock(return_value=(7, False)))
 
@@ -313,7 +317,8 @@ async def test_backend_cut_progress_survives_a_dead_redis_fairness_write(
     mocker.patch("app.actions.handlers._save_device_state_fields", side_effect=flaky_save)
 
     result = await _backfill_device(device, state, lotek_integration, object(), object(), object())
-    sent, device_failed, transport_failure, gap_closed, windows_advanced, cut_reason = result
+    sent, transport_failure, gap_closed, windows_advanced, cut_reason, failure_reason = result
+    device_failed = result.device_failed
 
     assert (sent, windows_advanced, cut_reason) == (7, 1, "backend")
     assert not any("last_backfilled" in f for f in saves)  # never attempted
@@ -337,7 +342,7 @@ async def test_partial_backend_cut_defers_and_alerts_once(
     try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
     mocker.patch(
         "app.actions.handlers._backfill_device",
-        new=AsyncMock(return_value=(7, False, False, False, 1, "backend")),
+        new=AsyncMock(return_value=BackfillResult(7, False, False, 1, "backend")),
     )
 
     result = await action_backfill_observations(
@@ -403,7 +408,7 @@ async def test_backfill_mixed_failure_and_starvation_still_alerts(
 
     async def fake_backfill_device(device, *args, **kwargs):
         if device.nDeviceID == "1":
-            return (0, True, True, False, 0, None)    # failed, no progress
+            return BackfillResult(0, True, False, 0, None, FailureReason.TIMEOUT)    # failed, no progress
         # Zero-progress starvation RAISES (the round-10 contract); only
         # partial progress returns a "starved" cut_reason. The traversal
         # catches this and sets budget_starved.
@@ -419,7 +424,7 @@ async def test_backfill_mixed_failure_and_starvation_still_alerts(
     assert result["devices_failed"] == ["1"]
     assert result.get("zero_progress") is True
     error_calls = [c for c in try_log.await_args_list if c.args[3] is LogLevel.ERROR]
-    assert any("No devices could be backfilled" in c.args[2] for c in error_calls)
+    assert any("be backfilled in this run" in c.args[2] for c in error_calls)
 
 
 @pytest.mark.asyncio
@@ -633,7 +638,7 @@ async def test_backfill_malformed_data_failure_logs_error_not_warning(
         lotek_integration, BackfillObservationsConfig()
     )
     assert result["zero_progress"] is True
-    device_logs = [c for c in log.await_args_list if "Device: 1" in c.kwargs.get("title", "")]
+    device_logs = [c for c in log.await_args_list if "device 1" in c.kwargs.get("title", "")]
     assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
 
 
@@ -759,7 +764,7 @@ async def test_backfill_zero_progress_reports_and_still_releases_the_lease(
     zero_progress_errors = [
         c for c in log.await_args_list
         if c.kwargs.get("level") == LogLevel.ERROR
-        and "No devices could be backfilled" in c.kwargs.get("title", "")
+        and "be backfilled in this run" in c.kwargs.get("title", "")
     ]
     assert zero_progress_errors, "the health signal must still reach the activity feed"
     release.assert_awaited_once()
@@ -894,7 +899,7 @@ def _zero_progress_errors(log):
     return [
         c for c in log.await_args_list
         if c.kwargs.get("level") == LogLevel.ERROR
-        and "No devices could be backfilled" in c.kwargs.get("title", "")
+        and "be backfilled in this run" in c.kwargs.get("title", "")
     ]
 
 
@@ -927,7 +932,7 @@ async def test_breaker_stop_still_publishes_the_zero_progress_error(
     breaker_deferrals = [
         c for c in log.await_args_list
         if c.kwargs.get("level") == LogLevel.WARNING
-        and "circuit breaker" in c.kwargs.get("title", "")
+        and "Lotek kept failing" in c.kwargs.get("title", "")
     ]
     assert breaker_deferrals, "the breaker stop must be the reason the tail deferred"
     assert result["zero_progress"] is True
@@ -980,3 +985,35 @@ async def test_backfill_device_listing_requests_a_bounded_wait_on_the_slot(
     assert len(_grant_connection_slots) == 1
     recorded = _grant_connection_slots[0]
     assert 0 < recorded["max_wait_seconds"] <= DEADLINE_FRACTION * app_settings.MAX_ACTION_EXECUTION_TIME
+
+
+@pytest.mark.asyncio
+async def test_backfill_failure_summary_says_why_each_device_failed(
+    mocker, lotek_integration, mock_redis
+):
+    _setup_backfill_mocks(
+        mocker, mock_redis, _devices("1", "2", "3"),
+        {d: _gap_state(days_back_start=20, days_back_end=1) for d in ("1", "2", "3")},
+    )
+    log = mocker.patch("app.actions.handlers.log_action_activity", new=AsyncMock())
+    mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
+    reasons = {"1": "timeout", "2": "login_rejected", "3": "timeout"}
+
+    async def fake_backfill_device(device, *args, **kwargs):
+        return BackfillResult(0, False, False, 0, None, reasons[device.nDeviceID])
+
+    mocker.patch("app.actions.handlers._backfill_device", side_effect=fake_backfill_device)
+
+    await action_backfill_observations(
+        lotek_integration, BackfillObservationsConfig(triggered_by="test")
+    )
+
+    warnings = sorted(
+        c.kwargs["title"] for c in log.await_args_list
+        if c.kwargs.get("level") == LogLevel.WARNING and "Lotek didn't send data" in c.kwargs["title"]
+    )
+    assert warnings == [
+        "Lotek didn't send data for 1 of 3 devices (2) because it rejected Gundi's login.",
+        "Lotek didn't send data for 2 of 3 devices (1, 3) because the connection timed out.",
+    ]
+

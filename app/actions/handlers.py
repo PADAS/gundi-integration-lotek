@@ -13,6 +13,7 @@ import app.settings.integration as settings
 import time
 
 from datetime import datetime, timezone, timedelta
+from typing import NamedTuple, Optional
 
 from app.services.errors import ConfigurationNotFound
 from app.actions.client import LotekException, LotekTokenExpiredException, LotekUnauthorizedException
@@ -26,6 +27,10 @@ from app.actions.configurations import (
 from app.actions.core import action_title, describe_exception
 from app.actions.device_state import DeviceState
 from app.actions.traversal import DeviceTraversal
+from app.actions.failures import (
+    ESCALATION_AFTER, TEMPORARY_REASONS, FailureReason, device_count,
+    escalated_message, nothing_updated_message, warning_message,
+)
 from app.services.action_scheduler import trigger_action
 from app.services.lotek_connections import (
     lotek_slot, NoConnectionSlot, SlotBackendUnavailable, SlotWaitBudgetExhausted,
@@ -176,6 +181,64 @@ def _summarize_ids(ids):
     return listed
 
 
+class FetchResult(NamedTuple):
+    """One window's fetch. positions is None when the fetch failed."""
+    positions: Optional[list]
+    transport_failure: bool = False
+    failure_reason: Optional[FailureReason] = None
+
+
+class HeadPassResult(NamedTuple):
+    sent: int
+    transport_failure: bool = False
+    failure_reason: Optional[FailureReason] = None
+    # The device has gone ESCALATION_AFTER without a successful pull.
+    escalated: bool = False
+
+    @property
+    def device_failed(self):
+        return self.failure_reason is not None
+
+
+class BackfillResult(NamedTuple):
+    sent: int
+    transport_failure: bool
+    gap_closed: bool
+    windows_advanced: int
+    cut_reason: Optional[str]
+    failure_reason: Optional[FailureReason] = None
+
+    @property
+    def device_failed(self):
+        return self.failure_reason is not None
+
+
+async def _log_failure_summary(integration_id, action_id, traversal, total, escalated=frozenset()):
+    """One portal message per failure reason that occurred in this run: a
+    WARNING, or an ERROR for devices whose temporary failures have lasted
+    ESCALATION_AFTER."""
+    for reason, device_ids in traversal.failed_by_reason().items():
+        groups = (
+            ([d for d in device_ids if d not in escalated], LogLevel.WARNING, warning_message),
+            ([d for d in device_ids if d in escalated], LogLevel.ERROR, escalated_message),
+        )
+        for ids, level, build in groups:
+            if not ids:
+                continue
+            message = build(reason, device_count(_summarize_ids(ids), len(ids), total))
+            log = logger.error if level == LogLevel.ERROR else logger.warning
+            log(f"{message} Integration ID: {integration_id}")
+            await _bounded_publish(
+                log_action_activity(
+                    integration_id=integration_id,
+                    action_id=action_id,
+                    title=message,
+                    level=level
+                ),
+                "an activity-log event",
+            )
+
+
 # Monotonic instant after which this action must not start another publish.
 # Set once per handler invocation; a ContextVar rather than a module global so
 # concurrently-running actions in one worker each see their own value (asyncio
@@ -237,17 +300,22 @@ async def _bounded_publish(coro, what, *, required=False):
         return None
 
 
-async def _log_deferral(integration, action_id, reason, deferred_ids, disposition="to the next run"):
-    # disposition tells the operator what actually happens to the tail: a
-    # deadline-cut shard hands it to a re-triggered shard immediately, while a
-    # breaker stop really does wait for the next scheduled tick (Copilot
-    # review: the fixed "to the next run" text was misleading under deadline
-    # pressure).
+# Plain "because ..." wording for each stop reason. Says only what happened in
+# this run, not what the next run will do.
+_STOP_REASON_WORDING = {
+    "deadline": "it ran out of time",
+    "circuit breaker": "Lotek kept failing",
+    "redis unavailable": "of an internal storage problem",
+    "connection budget exhausted": "too many requests to Lotek were already in progress",
+}
+
+
+async def _log_deferral(integration, action_id, reason, deferred_ids):
     message = (
-        f"Stopping early ({reason}) for integration {integration.id}: deferring "
-        f"{len(deferred_ids)} device(s) {disposition}: {_summarize_ids(deferred_ids)}."
+        f"Gundi stopped this run early because {_STOP_REASON_WORDING.get(reason, reason)}, "
+        f"so {len(deferred_ids)} device(s) weren't checked: {_summarize_ids(deferred_ids)}."
     )
-    logger.warning(message)
+    logger.warning(f"{message} Integration ID: {integration.id}")
     await _bounded_publish(
         log_action_activity(
             integration_id=str(integration.id),
@@ -443,11 +511,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         # ERROR too — via the raise into _handle_error this branch exists to
         # avoid), skip the Redis-backed streak counter, and return a distinct
         # reason. Ordered BEFORE NoConnectionSlot — it is a subclass.
-        message = (
-            f"Skipping pull for integration {integration_id}: could not reach Redis "
-            f"to acquire a Lotek connection slot: {describe_exception(e)}"
-        )
-        logger.error(message)
+        message = "Gundi skipped this run because of an internal storage problem."
+        logger.error(f"{message} Integration ID: {integration_id} Exception: {describe_exception(e)}")
         await _try_log_activity(
             integration_id, "pull_observations", message, LogLevel.ERROR
         )
@@ -459,16 +524,13 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         # single skip stays out of the portal, but a STREAK of skipped ticks
         # means the account has been saturated for tens of minutes and must
         # not stay invisible (review finding: this was logger.info only).
-        message = (
-            f"Skipping pull for integration {integration_id}: Lotek connection budget "
-            f"exhausted; the next scheduled tick will retry."
-        )
-        logger.info(message)
+        message = "Gundi skipped this run because too many requests to Lotek were already in progress."
+        logger.info(f"{message} Integration ID: {integration_id}")
         streak = await _bump_dispatcher_skip_streak(integration_id)
         if streak >= DISPATCHER_SKIP_WARN_AFTER:
             await _try_log_activity(
                 integration_id, "pull_observations",
-                f"{message} ({streak} consecutive ticks skipped on connection-budget exhaustion.)",
+                f"Gundi skipped the last {streak} runs because too many requests to Lotek were already in progress.",
                 LogLevel.WARNING,
             )
         return {"skipped": True, "reason": "no_connection_slot"}
@@ -478,11 +540,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         # connection unhealthy during fleet-wide Lotek congestion even though
         # the next tick usually succeeds (GUNDI-5602 prod finding 2026-08-16).
         # Clean return: the run made no progress but the schedule retries it.
-        message = (
-            f"Lotek API unreachable while listing devices for integration {integration.id}: "
-            f"{describe_exception(e)}. The run will be retried on the next schedule."
-        )
-        logger.warning(message)
+        message = "Gundi couldn't get the device list from Lotek because it couldn't connect to Lotek."
+        logger.warning(f"{message} Integration ID: {integration.id} Exception: {describe_exception(e)}")
         await _bounded_publish(
             log_action_activity(
                 integration_id=integration_id,
@@ -503,8 +562,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
             "reason": "lotek_unreachable",
         }
     except Exception as e:
-        message = f"Error fetching devices from Lotek. Integration ID: {integration.id} Exception: {describe_exception(e)}"
-        logger.exception(message)
+        message = "Gundi couldn't get the device list from Lotek because something unexpected went wrong."
+        logger.exception(f"{message} Integration ID: {integration.id} Exception: {describe_exception(e)}")
         await _bounded_publish(
             log_action_activity(
                 integration_id=integration_id,
@@ -572,7 +631,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 trigger_action(
                     integration_id, "pull_observations_shard",
                     config=PullObservationsShardConfig(
-                        devices=shard, triggered_by="pull_observations", manual_run=manual_run
+                        devices=shard, triggered_by="pull_observations", manual_run=manual_run,
+                        total_devices=len(all_ids),
                     )
                 ),
                 "a shard dispatch",
@@ -614,11 +674,10 @@ async def action_pull_observations(integration, action_config: PullObservationsC
                 undispatched_devices.extend(outcome)
     if undispatched_devices:
         message = (
-            f"Dispatched {dispatched} of {len(shards)} shard(s) for integration "
-            f"{integration_id}; {len(undispatched_devices)} device(s) get no pull this "
-            f"tick and are retried on the next schedule: {_summarize_ids(undispatched_devices)}."
+            f"Gundi couldn't start getting data for {len(undispatched_devices)} device(s) "
+            f"in this run: {_summarize_ids(undispatched_devices)}."
         )
-        logger.warning(message)
+        logger.warning(f"{message} Integration ID: {integration_id}")
         await _try_log_activity(integration_id, "pull_observations", message, LogLevel.WARNING)
     if shards and dispatched == 0:
         # Nothing was handed off at all: systemic (commands topic down). ERROR
@@ -626,11 +685,8 @@ async def action_pull_observations(integration, action_config: PullObservationsC
         # zero-progress path — a raise routes through the runner's generic
         # _handle_error, which publishes every integration configuration
         # (plaintext Lotek password included) into the event payload.
-        message = (
-            f"Could not dispatch any of {len(shards)} shard(s) for integration "
-            f"{integration_id}; see the application log for the publish errors."
-        )
-        logger.error(message)
+        message = "Gundi couldn't start getting data for any device in this run."
+        logger.error(f"{message} Integration ID: {integration_id}")
         await _try_log_activity(integration_id, "pull_observations", message, LogLevel.ERROR)
     result = {"devices_found": len(device_list), "shards_triggered": dispatched}
     if undispatched_devices:
@@ -668,7 +724,7 @@ async def _reset_dispatcher_skip_streak(integration_id):
         )
 
 
-async def _retrigger_shard(integration, device_ids, generation, manual_run=False):
+async def _retrigger_shard(integration, device_ids, generation, manual_run=False, total_devices=None):
     """Re-dispatch deferred devices as a fresh shard with its own budget,
     instead of parking them until the next scheduled tick.
 
@@ -693,11 +749,10 @@ async def _retrigger_shard(integration, device_ids, generation, manual_run=False
         # fleet or something is systemically slow. The data self-heals on the
         # next tick; the signal must not.
         message = (
-            f"Shard re-trigger cap ({SHARD_RETRIGGER_CAP}) reached for integration "
-            f"{integration_id}: deferring {len(device_ids)} device(s) to the next "
-            f"scheduled tick: {_summarize_ids(device_ids)}."
+            f"Gundi ran out of time to check {len(device_ids)} device(s) in this run: "
+            f"{_summarize_ids(device_ids)}."
         )
-        logger.error(message)
+        logger.error(f"{message} Integration ID: {integration_id} (re-trigger cap {SHARD_RETRIGGER_CAP})")
         await _try_log_activity(
             integration_id, "pull_observations_shard", message, LogLevel.ERROR
         )
@@ -711,6 +766,7 @@ async def _retrigger_shard(integration, device_ids, generation, manual_run=False
                     triggered_by="pull_observations_shard",
                     generation=generation + 1,
                     manual_run=manual_run,
+                    total_devices=total_devices,
                 )
             ),
             "a shard re-trigger",
@@ -795,6 +851,7 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
     # the rails before its gap status is checked doesn't trigger backfill this
     # cycle. Self-correcting: the re-triggered tail (or the next tick) reaches it.
     any_open_gap = False
+    escalated_devices = set()
 
     async for (device_id, state, is_new), res in traversal.run(
         device_states,
@@ -804,15 +861,16 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
             present_time, guards, stale_drops=stale_drops,
         ),
     ):
-        sent, device_failed, transport_failure = res
         # Single recording site: transport failures arm the breaker, anything
         # else (success included) breaks the consecutive streak.
-        guards.record(transport_failure=transport_failure)
-        observations_extracted += sent
+        guards.record(transport_failure=res.transport_failure)
+        observations_extracted += res.sent
         if state.has_gap:
             any_open_gap = True
-        if device_failed:
-            traversal.mark_failed(device_id)
+        if res.device_failed:
+            traversal.mark_failed(device_id, res.failure_reason)
+            if res.escalated:
+                escalated_devices.add(device_id)
 
     failed_devices = traversal.failed_devices
     # Union, for the overall count/result only (below). The retrigger and the
@@ -830,42 +888,25 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
     if traversal.stop_reason == "deadline" and traversal.guard_stopped_devices:
         retrigger_outcome = await _retrigger_shard(
             integration, traversal.guard_stopped_devices, action_config.generation,
-            manual_run=action_config.manual_run,
+            manual_run=action_config.manual_run, total_devices=action_config.total_devices,
         )
     if traversal.stop_reason:
         await _log_deferral(
             integration, "pull_observations_shard", traversal.stop_reason,
             traversal.guard_stopped_devices,
-            disposition=(
-                "to an immediately re-triggered shard"
-                if retrigger_outcome == RETRIGGER_HANDED_OFF
-                else "to the next scheduled run"
-            ),
         )
     if traversal.budget_starved:
         # Portal WARNING like every other deferral cause: a starved tail must
         # not park with zero portal visibility (review finding).
         await _log_deferral(
             integration, "pull_observations_shard", "connection budget exhausted",
-            traversal.slot_starved_devices, disposition="to the next scheduled run",
+            traversal.slot_starved_devices,
         )
 
-    if failed_devices:
-        message = (
-            f"Pulled observations with {len(failed_devices)} of {len(action_config.devices)} device(s) "
-            f"failing for integration {integration.id}: {_summarize_ids(failed_devices)}. "
-            f"They will be retried on the next run."
-        )
-        logger.warning(message)
-        await _bounded_publish(
-            log_action_activity(
-                integration_id=integration_id,
-                action_id="pull_observations_shard",
-                title=message,
-                level=LogLevel.WARNING
-            ),
-            "an activity-log event",
-        )
+    await _log_failure_summary(
+        integration_id, "pull_observations_shard", traversal,
+        total=action_config.total_devices or len(action_config.devices), escalated=escalated_devices,
+    )
 
     if stale_drops:
         # Permanent data loss must stay visible in the portal: one aggregated
@@ -873,11 +914,10 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         # finding on the publish-volume fix). Per-device ranges are in the
         # local log.
         message = (
-            f"Dropped data older than max_data_age_hours={pull_config.max_data_age_hours} "
-            f"permanently for {len(stale_drops)} device(s) on integration {integration.id}: "
-            f"{_summarize_ids(stale_drops)}. See the application log for per-device ranges."
+            f"Data older than {pull_config.max_data_age_hours} hours wasn't imported for "
+            f"{len(stale_drops)} device(s): {_summarize_ids(stale_drops)}."
         )
-        logger.warning(message)
+        logger.warning(f"{message} Integration ID: {integration.id}")
         await _bounded_publish(
             log_action_activity(
                 integration_id=integration_id,
@@ -908,10 +948,10 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         # One action-level ERROR per run for a shared-backend outage (Copilot
         # round 13); see the backfill handler's twin for the rationale.
         message = (
-            f"Redis unavailable during shard for integration {integration.id}: "
-            f"stopped after the current chunk; {len(traversal.deferred_devices)} device(s) deferred."
+            f"Gundi stopped this run early because of an internal storage problem, so "
+            f"{len(traversal.deferred_devices)} device(s) weren't checked."
         )
-        logger.error(message)
+        logger.error(f"{message} Integration ID: {integration.id}")
         await _try_log_activity(
             integration_id, "pull_observations_shard", message, LogLevel.ERROR
         )
@@ -945,12 +985,11 @@ async def action_pull_observations_shard(integration, action_config: PullObserva
         # tick. An ERROR activity event carries the same health signal (the
         # unhealthy-connection metric counts ERROR activity events) without the
         # credential exposure.
-        message = (
-            f"No devices could be serviced for integration {integration.id}: "
-            f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
-            f"{len(action_config.devices)}. See the per-device errors in this action's activity log."
+        message = nothing_updated_message(
+            len(action_config.devices), traversal.failed_by_reason(), len(deferred_devices),
+            group="in this batch",
         )
-        logger.error(message)
+        logger.error(f"{message} Integration ID: {integration_id}")
         await _try_log_activity(
             integration_id, "pull_observations_shard", message, LogLevel.ERROR
         )
@@ -1064,11 +1103,10 @@ async def _read_device_state(integration_id, device_id, action_id="pull_observat
         return DeviceState.parse_obj(saved)
     except pydantic.ValidationError as e:
         message = (
-            f"Discarding unparseable saved state for device {device_id}: the cursor "
-            f"resets and the lookback window will re-import. Integration ID: "
-            f"{integration_id} Error: {describe_exception(e)}"
+            f"Gundi couldn't read its saved progress for device {device_id}, so it "
+            f"started over from the configured lookback."
         )
-        logger.warning(message)
+        logger.warning(f"{message} Integration ID: {integration_id} Error: {describe_exception(e)}")
         if not quiet:
             await _try_log_activity(integration_id, action_id, message, LogLevel.WARNING)
         return None
@@ -1124,9 +1162,10 @@ async def _save_device_state_fields(integration_id, device_id, updates, init_onl
 async def _fetch_window(device_id, integration, auth, config, lower_date, upper_date, guards, action_id):
     """Fetch + transform one window for one device.
 
-    Returns (cdip_positions | None, transport_failure). None means the fetch
-    failed — already logged and classified; the caller marks the device failed
-    and records transport_failure for the circuit breaker. Raises only
+    Returns a FetchResult. positions is None when the fetch failed — already
+    logged and classified; the caller marks the device failed with
+    failure_reason and records transport_failure for the circuit breaker.
+    Raises only
     LotekUnauthorizedException (integration-wide) and NoConnectionSlot
     (account-wide budget, the caller defers and re-triggers).
     """
@@ -1151,7 +1190,7 @@ async def _fetch_window(device_id, integration, auth, config, lower_date, upper_
         logger.info(f"Extracted {len(positions)} obs from Lotek for device: {device_id} between {lower_date} and {upper_date}.")
         # Transform inside the try: a malformed payload is a per-device, fetch-class
         # failure and must get the same device/date-window log and isolation.
-        return filter_and_transform_positions(positions, integration, config), False
+        return FetchResult(filter_and_transform_positions(positions, integration, config))
     except LotekUnauthorizedException:
         # Credentials are an integration-wide problem: every remaining device
         # would fail the same way, so fail fast instead of N identical errors.
@@ -1169,7 +1208,8 @@ async def _fetch_window(device_id, integration, auth, config, lower_date, upper_
         # (or the instance) was already drowning — a congestion feedback loop.
         message = f"Error fetching positions from Lotek. Device: {device_id}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         logger.warning(message, exc_info=True)
-        return None, True
+        reason = FailureReason.TIMEOUT if isinstance(e, httpx.TimeoutException) else FailureReason.NO_CONNECTION
+        return FetchResult(None, True, reason)
     except LotekException as e:
         message = f"Error fetching positions from Lotek. Device: {device_id}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         if e.status_code >= 500 or e.status_code == 429:
@@ -1180,13 +1220,21 @@ async def _fetch_window(device_id, integration, auth, config, lower_date, upper_
             # never trip the breaker (review finding). Local log only — same
             # aggregation rationale as the transport branch above.
             logger.warning(message, exc_info=True)
-            return None, True
-        # Other 4xx (incl. a token-expiry 401 that survived its retry): a
-        # per-device/API-contract problem that won't self-heal — ERROR, and
-        # not breaker-feeding.
+            return FetchResult(None, True, FailureReason.LOTEK_ERROR)
+        if e.status_code == 401:
+            # A token-expiry 401 that survived its retry. Each retry logged in
+            # again successfully (a refused login raises
+            # LotekUnauthorizedException above), so Gundi can still get
+            # tokens: WARNING, reported only in the per-reason summary, so the
+            # integration is not marked unhealthy. Not breaker-feeding.
+            logger.warning(message, exc_info=True)
+            return FetchResult(None, False, FailureReason.LOGIN_REJECTED)
+        # Other 4xx: a per-device/API-contract problem that won't self-heal —
+        # ERROR, and not breaker-feeding.
         logger.exception(message)
-        await _try_log_activity(integration_id, action_id, message, LogLevel.ERROR)
-        return None, False
+        title = f"Lotek didn't send data for device {device_id} because it answered with an error (HTTP {e.status_code})."
+        await _try_log_activity(integration_id, action_id, title, LogLevel.ERROR)
+        return FetchResult(None, False, FailureReason.UNEXPECTED)
     except Exception as e:
         # Deliberately broad: malformed data from Lotek surfaces as KeyError or
         # pydantic.ValidationError out of the client's parsing, and those must
@@ -1198,8 +1246,9 @@ async def _fetch_window(device_id, integration, auth, config, lower_date, upper_
         # forever (review finding).
         message = f"Error fetching positions from Lotek. Device: {device_id}. Dates: [{lower_date},{upper_date}]. Integration ID: {integration_id} Exception: {describe_exception(e)}"
         logger.exception(message)
-        await _try_log_activity(integration_id, action_id, message, LogLevel.ERROR)
-        return None, False
+        title = f"Something unexpected went wrong reading Lotek's data for device {device_id}."
+        await _try_log_activity(integration_id, action_id, title, LogLevel.ERROR)
+        return FetchResult(None, False, FailureReason.UNEXPECTED)
 
 
 async def _deliver(cdip_positions, device_id, integration, action_id):
@@ -1236,7 +1285,8 @@ async def _deliver(cdip_positions, device_id, integration, action_id):
         # Guarded: an escaping publish here would discard observations_sent —
         # batches that DID land — and could flip a partially-delivered run
         # into the zero-progress ERROR raise (review finding).
-        await _try_log_activity(integration_id, action_id, message, LogLevel.ERROR)
+        title = f"Gundi couldn't receive the data Lotek sent for device {device_id}."
+        await _try_log_activity(integration_id, action_id, title, LogLevel.ERROR)
         return observations_sent, True
     return observations_sent, False
 
@@ -1244,7 +1294,9 @@ async def _deliver(cdip_positions, device_id, integration, action_id):
 async def _head_pass_device(device_id, state, is_new, integration, auth, action_config, present_time, guards, stale_drops=None):
     """Fetch, deliver and checkpoint one device's freshest window.
 
-    Returns (observations_sent, device_failed, transport_failure).
+    Returns a HeadPassResult; failure_reason is None unless the device
+    failed. A temporary failure on a device whose last successful pull
+    (high_water) is more than ESCALATION_AFTER old is reported as escalated.
     Raises only for integration-wide problems; per-device problems are
     reported through the returned flags so the caller can keep going (and
     record transport_failure for the circuit breaker in one place).
@@ -1264,11 +1316,22 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     stale_from = state.high_water if state.high_water < freshness_floor else None
 
     lower_date = max(state.high_water - HEAD_LATE_UPLOAD_OVERLAP, freshness_floor)
-    cdip_positions, transport_failure = await _fetch_window(
+    fetch = await _fetch_window(
         device_id, integration, auth, action_config, lower_date, present_time, guards, "pull_observations_shard"
     )
+    cdip_positions = fetch.positions
     if cdip_positions is None:
-        return 0, True, transport_failure
+        # high_water only moves on a successful pull, so its age is how long
+        # the device has gone without one. A brand-new device (is_new) has a
+        # starting high_water, not a real last success. A legacy-migrated
+        # device is also is_new, but its saved cursor is a real (old) last
+        # success, so it escalates like any other.
+        escalated = (
+            fetch.failure_reason in TEMPORARY_REASONS
+            and (not is_new or state.migrated_from_legacy)
+            and present_time - state.high_water >= ESCALATION_AFTER
+        )
+        return HeadPassResult(0, fetch.transport_failure, fetch.failure_reason, escalated)
 
     if not cdip_positions:
         # Local log only. This used to publish a portal WARNING per quiet
@@ -1281,7 +1344,7 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     if delivery_failed:
         # The breaker watches Lotek, not Gundi: a delivery failure is not
         # evidence of Lotek-wide degradation.
-        return observations_sent, True, False
+        return HeadPassResult(observations_sent, False, FailureReason.DELIVERY_FAILED)
 
     # Advance the cursor to the queried upper bound (upload time), not recorded_at.
     # Queries are by upload date, so wall clock is the correct cursor, and it must
@@ -1309,8 +1372,9 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
             f"{integration.id} Exception: {describe_exception(e)}"
         )
         logger.exception(message)
-        await _try_log_activity(integration_id, "pull_observations_shard", message, LogLevel.ERROR)
-        return observations_sent, True, False
+        title = f"Gundi got the latest data for device {device_id} but couldn't save how far it got."
+        await _try_log_activity(integration_id, "pull_observations_shard", title, LogLevel.ERROR)
+        return HeadPassResult(observations_sent, False, FailureReason.SAVE_FAILED)
 
     if stale_from is not None:
         # Only now is the drop real: the cursor advanced past the owed range.
@@ -1326,15 +1390,15 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
         if stale_drops is not None:
             stale_drops.append(device_id)
 
-    return observations_sent, False, False
+    return HeadPassResult(observations_sent)
 
 
 async def _backfill_device(device, state, integration, auth, pull_config, guards):
     """Close up to BACKFILL_MAX_WINDOWS_PER_DEVICE oldest windows of one
     device's gap.
 
-    Returns (observations_sent, device_failed, transport_failure, gap_closed,
-    windows_advanced, cut_reason). gap_start advances only past windows that
+    Returns a BackfillResult; failure_reason is None unless the device
+    failed. gap_start advances only past windows that
     were actually delivered, so a failure re-fetches the same window next
     trigger (re-sends are tolerated, silent skips are not). windows_advanced
     counts those actually-delivered windows: the caller only keeps the
@@ -1352,10 +1416,10 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     """
     integration_id = str(integration.id)
     observations_sent = 0
-    device_failed = False
     transport_failure = False
     windows_advanced = 0
     cut_reason = None
+    failure_reason = None
     for _ in range(BACKFILL_MAX_WINDOWS_PER_DEVICE):
         if not state.has_gap:
             break
@@ -1363,9 +1427,10 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
         upper_date = min(state.gap_end, state.gap_start + BACKFILL_WINDOW)
 
         try:
-            cdip_positions, transport_failure = await _fetch_window(
+            fetch = await _fetch_window(
                 device.nDeviceID, integration, auth, pull_config, window_start, upper_date, guards, "backfill_observations"
             )
+            cdip_positions, transport_failure, failure_reason = fetch
         except SlotBackendUnavailable:
             # Redis-down after progress is reachable: the window-1 checkpoint
             # save and window-2's acquire are not simultaneous, and a
@@ -1388,13 +1453,12 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
             cut_reason = "starved"
             break  # saturated mid-device: keep the progress, tell the caller to throttle
         if cdip_positions is None:
-            device_failed = True
             break
 
         sent, delivery_failed = await _deliver(cdip_positions, device.nDeviceID, integration, "backfill_observations")
         observations_sent += sent
         if delivery_failed:
-            device_failed = True
+            failure_reason = FailureReason.DELIVERY_FAILED
             break
 
         # Advance the gap only past the delivered window; close it when done.
@@ -1430,7 +1494,9 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
         await _save_device_state_fields(
             integration_id, device.nDeviceID, {"last_backfilled": state.last_backfilled}
         )
-    return observations_sent, device_failed, transport_failure, not state.has_gap, windows_advanced, cut_reason
+    return BackfillResult(
+        observations_sent, transport_failure, not state.has_gap, windows_advanced, cut_reason, failure_reason,
+    )
 
 
 @action_title("Backfill Observations")
@@ -1497,11 +1563,8 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             # portal health signal. ERROR + distinct reason; the lease still
             # releases via the finally, and open gaps re-trigger on the next
             # scheduled head pass. Ordered BEFORE NoConnectionSlot (subclass).
-            message = (
-                f"Skipping backfill for integration {integration_id}: could not reach "
-                f"Redis to acquire a Lotek connection slot: {describe_exception(e)}"
-            )
-            logger.error(message)
+            message = "Gundi skipped checking older data in this run because of an internal storage problem."
+            logger.error(f"{message} Integration ID: {integration_id} Exception: {describe_exception(e)}")
             await _try_log_activity(
                 integration_id, "backfill_observations", message, LogLevel.ERROR
             )
@@ -1516,12 +1579,8 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             # ran (Copilot round 11). A backfill deadline stop with zero
             # progress alerts — same contract as the traversal's deadline
             # stop. Ordered BEFORE NoConnectionSlot (subclass).
-            message = (
-                f"Backfill for integration {integration_id} exhausted its action "
-                f"budget before listing devices: {describe_exception(e)}. "
-                f"Open gaps are retried on the next trigger."
-            )
-            logger.error(message)
+            message = "Gundi ran out of time before it could check older data in this run."
+            logger.error(f"{message} Integration ID: {integration_id} Exception: {describe_exception(e)}")
             await _try_log_activity(
                 integration_id, "backfill_observations", message, LogLevel.ERROR
             )
@@ -1541,11 +1600,8 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             # releases the lease via the finally below, and skipping the
             # self-retrigger throttles the cascade to the head-pass cadence —
             # the open gaps re-trigger backfill on the next scheduled run.
-            message = (
-                f"Lotek API unreachable while listing devices for backfill on integration "
-                f"{integration_id}: {describe_exception(e)}. Open gaps are retried on the next trigger."
-            )
-            logger.warning(message)
+            message = "Gundi couldn't check older data because it couldn't connect to Lotek."
+            logger.warning(f"{message} Integration ID: {integration_id} Exception: {describe_exception(e)}")
             await _bounded_publish(
                 log_action_activity(
                     integration_id=integration_id,
@@ -1557,11 +1613,8 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             )
             return {"skipped": True, "reason": "lotek_unreachable"}
         except Exception as e:
-            message = (
-                f"Error fetching devices from Lotek for backfill. Integration ID: "
-                f"{integration_id} Exception: {describe_exception(e)}"
-            )
-            logger.exception(message)
+            message = "Gundi couldn't check older data because something unexpected went wrong getting the device list from Lotek."
+            logger.exception(f"{message} Integration ID: {integration_id} Exception: {describe_exception(e)}")
             await _bounded_publish(
                 log_action_activity(
                     integration_id=integration_id,
@@ -1601,7 +1654,7 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 pair[0], pair[1], integration, auth, pull_config, guards
             ),
         ):
-            sent, device_failed, transport_failure, gap_closed, windows_advanced, cut_reason = res
+            cut_reason = res.cut_reason
             if cut_reason == "starved":
                 # Partial progress then saturation: the device returned a
                 # result instead of raising, so the traversal never saw the
@@ -1627,12 +1680,12 @@ async def action_backfill_observations(integration, action_config: BackfillObser
                 # unthrottled.
                 traversal.mark_deadline_cut(device.nDeviceID)
             # Single recording site, mirroring the head pass.
-            guards.record(transport_failure=transport_failure)
-            observations_extracted += sent
-            gaps_closed += int(gap_closed)
-            windows_advanced_total += windows_advanced
-            if device_failed:
-                traversal.mark_failed(device.nDeviceID)
+            guards.record(transport_failure=res.transport_failure)
+            observations_extracted += res.sent
+            gaps_closed += int(res.gap_closed)
+            windows_advanced_total += res.windows_advanced
+            if res.device_failed:
+                traversal.mark_failed(device.nDeviceID, res.failure_reason)
 
         failed_devices = traversal.failed_devices
         # Union, for the overall count/result only (below); the two deferral
@@ -1652,25 +1705,10 @@ async def action_backfill_observations(integration, action_config: BackfillObser
         if traversal.budget_starved:
             await _log_deferral(
                 integration, "backfill_observations", "connection budget exhausted",
-                traversal.slot_starved_devices, disposition="to the next backfill trigger",
+                traversal.slot_starved_devices,
             )
 
-        if failed_devices:
-            message = (
-                f"Backfilled with {len(failed_devices)} of {len(gapped)} gapped device(s) "
-                f"failing for integration {integration_id}: {_summarize_ids(failed_devices)}. "
-                f"Their gaps are retried on the next trigger."
-            )
-            logger.warning(message)
-            await _bounded_publish(
-                log_action_activity(
-                    integration_id=integration_id,
-                    action_id="backfill_observations",
-                    title=message,
-                    level=LogLevel.WARNING
-                ),
-                "an activity-log event",
-            )
+        await _log_failure_summary(integration_id, "backfill_observations", traversal, total=len(device_list))
 
         # Backfill's suppression policy differs from the shard's and is
         # preserved exactly: ONLY starvation explains a no-progress run here (a
@@ -1696,12 +1734,11 @@ async def action_backfill_observations(integration, action_config: BackfillObser
             # configuration — the auth action's plaintext Lotek password
             # included (GUNDI-5628). An ERROR activity event carries the same
             # health signal without the credential exposure (spec D7).
-            message = (
-                f"No devices could be backfilled for integration {integration_id}: "
-                f"{len(failed_devices)} failed, {len(deferred_devices)} deferred of "
-                f"{len(gapped)}. See the per-device errors in this action's activity log."
+            message = nothing_updated_message(
+                len(gapped), traversal.failed_by_reason(), len(deferred_devices), done="backfilled",
+                group="with missing history",
             )
-            logger.error(message)
+            logger.error(f"{message} Integration ID: {integration_id}")
             await _try_log_activity(
                 integration_id, "backfill_observations", message, LogLevel.ERROR
             )
