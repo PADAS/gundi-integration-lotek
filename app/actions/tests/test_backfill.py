@@ -1017,33 +1017,3 @@ async def test_backfill_failure_summary_says_why_each_device_failed(
         "Lotek didn't send data for 2 of 3 devices (1, 3) because the connection timed out.",
     ]
 
-
-@pytest.mark.asyncio
-async def test_backfill_device_reports_a_failed_progress_save(mocker, lotek_integration):
-    # The window was delivered but its checkpoint wasn't saved: the sent count
-    # survives, the gap is unchanged, and the fairness save (same store) is
-    # skipped.
-    from app.actions.handlers import _backfill_device
-    from app.actions.device_state import DeviceState
-
-    now = datetime.now(timezone.utc)
-    gap_start, gap_end = now - timedelta(days=20), now - timedelta(days=1)
-    state = DeviceState(high_water=now, gap_start=gap_start, gap_end=gap_end)
-    device = _devices("d1")[0]
-
-    mocker.patch("app.actions.handlers._fetch_window", new=AsyncMock(return_value=FetchResult(["pos"])))
-    mocker.patch("app.actions.handlers._deliver", new=AsyncMock(return_value=(7, False)))
-    save = mocker.patch(
-        "app.actions.handlers._save_device_state_fields", new=AsyncMock(side_effect=RuntimeError("redis down"))
-    )
-    try_log = mocker.patch("app.actions.handlers._try_log_activity", new=AsyncMock())
-
-    result = await _backfill_device(device, state, lotek_integration, object(), object(), object())
-
-    sent, _, gap_closed, windows_advanced, _, failure_reason = result
-    device_failed = result.device_failed
-    assert (sent, device_failed, windows_advanced, failure_reason) == (7, True, 0, "save_failed")
-    assert gap_closed is False
-    assert (state.gap_start, state.gap_end) == (gap_start, gap_end)
-    assert save.await_count == 1
-    assert try_log.await_args.args[3] is LogLevel.ERROR

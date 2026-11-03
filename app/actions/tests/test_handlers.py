@@ -469,12 +469,7 @@ async def test_action_pull_observations_does_not_advance_state_for_failed_device
 
     advanced_devices = [call.args[-1] for call in mock_set_state.call_args_list]
     assert "1" in advanced_devices
-    # Device 2 only records when it started failing; its cursor stays at the
-    # first-run floor instead of moving to now.
-    floor = datetime.now(timezone.utc) - timedelta(hours=pull_config.max_data_age_hours)
-    for saved in _saved_states(mock_set_state, "2"):
-        assert "failing_since" in saved
-        assert _as_dt(saved["high_water"]) <= floor + timedelta(minutes=1)
+    assert "2" not in advanced_devices
 
 
 @pytest.mark.asyncio
@@ -1846,3 +1841,19 @@ async def test_shard_counts_against_the_whole_fleet(
 
     warnings = [c.kwargs["title"] for c in log.await_args_list if c.kwargs.get("level") == LogLevel.WARNING]
     assert "Lotek didn't send data for 1 of 55 devices (1) because the connection timed out." in warnings
+
+
+@pytest.mark.asyncio
+async def test_new_device_failure_saves_nothing(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # No saved document yet: the failure clock starts only after the device's
+    # first successful save, so a failed first run writes no state at all.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    get_positions, _, set_state, _ = _setup_pull_mocks(mocker, mock_redis, _devices("1"))
+    get_positions.side_effect = httpx.ReadTimeout("")
+
+    await run_head_pass(lotek_integration, pull_config)
+
+    assert _saved_states(set_state, "1") == []

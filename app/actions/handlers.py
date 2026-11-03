@@ -1335,8 +1335,10 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     cdip_positions = fetch.positions
     if cdip_positions is None:
         escalated = False
-        if fetch.failure_reason in TEMPORARY_REASONS:
-            escalated = await _track_failing_since(integration_id, device_id, state, is_new, present_time)
+        # A brand-new device has no saved document to record this in; its
+        # clock starts after its first successful save.
+        if fetch.failure_reason in TEMPORARY_REASONS and not is_new:
+            escalated = await _track_failing_since(integration_id, device_id, state, present_time)
         return HeadPassResult(0, fetch.transport_failure, fetch.failure_reason, escalated)
 
     if not cdip_positions:
@@ -1402,7 +1404,7 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     return HeadPassResult(observations_sent)
 
 
-async def _track_failing_since(integration_id, device_id, state, is_new, now):
+async def _track_failing_since(integration_id, device_id, state, now):
     """Start or continue the device's run of temporary failures. Returns True
     once it has lasted ESCALATION_AFTER.
 
@@ -1411,17 +1413,8 @@ async def _track_failing_since(integration_id, device_id, state, is_new, now):
     if state.failing_since is not None:
         return now - state.failing_since >= ESCALATION_AFTER
     state.failing_since = now
-    updates = {"failing_since": now}
-    init_only = None
-    if is_new:
-        # A new device has no saved document yet, and one holding only
-        # failing_since would not parse (high_water is required). Save the
-        # first-run state as the successful path would, minus the cursor
-        # advance; the gap stays create-only.
-        updates.update({"high_water": state.high_water, "version": state.version})
-        init_only = {"gap_start": state.gap_start, "gap_end": state.gap_end}
     try:
-        await _save_device_state_fields(integration_id, device_id, updates, init_only=init_only)
+        await _save_device_state_fields(integration_id, device_id, {"failing_since": now})
     except Exception as e:
         logger.warning(
             f"Couldn't save when device {device_id} started failing. Integration ID: "
@@ -1501,29 +1494,14 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
         # Advance the gap only past the delivered window; close it when done.
         # The backfill owns only the gap fields (merge-save): a concurrent head
         # pass advancing high_water must survive this write.
-        saved_gap = (state.gap_start, state.gap_end)
         state.gap_start = upper_date
         if not state.has_gap:
             state.gap_start = None
             state.gap_end = None
-        try:
-            await _save_device_state_fields(
-                integration_id, device.nDeviceID,
-                {"gap_start": state.gap_start, "gap_end": state.gap_end}
-            )
-        except Exception as e:
-            # The window was delivered but its checkpoint wasn't saved, so the
-            # next trigger re-fetches and re-sends it (re-sends are tolerated).
-            # Returned rather than raised so observations_sent still counts.
-            state.gap_start, state.gap_end = saved_gap
-            message = (
-                f"Error saving backfill progress for device {device.nDeviceID}. Integration ID: "
-                f"{integration.id} Exception: {describe_exception(e)}"
-            )
-            logger.exception(message)
-            await _try_log_activity(integration_id, "backfill_observations", message, LogLevel.ERROR)
-            failure_reason = FailureReason.SAVE_FAILED
-            break
+        await _save_device_state_fields(
+            integration_id, device.nDeviceID,
+            {"gap_start": state.gap_start, "gap_end": state.gap_end}
+        )
         windows_advanced += 1
 
     # Advances even on zero progress (device_failed on the first window):
@@ -1541,11 +1519,7 @@ async def _backfill_device(device, state, integration, auth, pull_config, guards
     # failing acquire, and fairness self-corrects on the next run (this
     # device keeps its older last_backfilled, so it stays at the front of
     # the LRS queue — the right place after an interrupted run).
-    #
-    # Skipped after a failed progress save for the same reason: it writes to
-    # the store that just failed, and a raise here would discard the
-    # delivered-but-unsaved outcome.
-    if cut_reason != "backend" and failure_reason != FailureReason.SAVE_FAILED:
+    if cut_reason != "backend":
         state.last_backfilled = datetime.now(tz=timezone.utc)
         await _save_device_state_fields(
             integration_id, device.nDeviceID, {"last_backfilled": state.last_backfilled}
