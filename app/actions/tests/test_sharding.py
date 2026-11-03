@@ -273,7 +273,7 @@ async def test_shard_backend_outage_defers_tail_and_alerts_once(
     # Action summaries use positional arguments; traversal's per-device
     # events use keyword arguments through the same bounded publisher.
     error_calls = [c for c in try_log.await_args_list if c.args and c.args[3] is LogLevel.ERROR]
-    assert any("edis" in c.args[2] for c in error_calls)  # action-level Redis ERROR present
+    assert any("internal storage problem" in c.args[2] for c in error_calls)  # action-level Redis ERROR present
     # Copilot round 14: this run IS zero-progress (every attempted device hit
     # the outage), so the generic zero-progress ERROR used to fire too —
     # double-counting one incident in the ERROR-driven health metric and
@@ -878,7 +878,7 @@ async def test_dispatcher_skip_streak_warns_after_consecutive_skips(
 
     warnings = lambda: [
         c for c in log.await_args_list
-        if c.kwargs.get("level") == LogLevel.WARNING and "consecutive ticks" in c.kwargs.get("title", "")
+        if c.kwargs.get("level") == LogLevel.WARNING and "Gundi skipped the last" in c.kwargs.get("title", "")
     ]
     for tick in range(1, DISPATCHER_SKIP_WARN_AFTER + 1):
         result = await action_pull_observations(lotek_integration, pull_config)
@@ -1037,7 +1037,7 @@ async def test_retrigger_cap_does_not_also_emit_zero_progress(
     assert "zero_progress" not in result
     errors = [c.kwargs["title"] for c in log.await_args_list if c.kwargs.get("level") == LogLevel.ERROR]
     assert len(errors) == 1
-    assert "re-trigger cap" in errors[0]
+    assert "ran out of time to check" in errors[0]
 
 
 @pytest.mark.asyncio

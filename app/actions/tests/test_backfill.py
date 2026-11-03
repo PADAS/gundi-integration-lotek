@@ -638,7 +638,7 @@ async def test_backfill_malformed_data_failure_logs_error_not_warning(
         lotek_integration, BackfillObservationsConfig()
     )
     assert result["zero_progress"] is True
-    device_logs = [c for c in log.await_args_list if "Device: 1" in c.kwargs.get("title", "")]
+    device_logs = [c for c in log.await_args_list if "device 1" in c.kwargs.get("title", "")]
     assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
 
 
@@ -932,7 +932,7 @@ async def test_breaker_stop_still_publishes_the_zero_progress_error(
     breaker_deferrals = [
         c for c in log.await_args_list
         if c.kwargs.get("level") == LogLevel.WARNING
-        and "circuit breaker" in c.kwargs.get("title", "")
+        and "Lotek kept failing" in c.kwargs.get("title", "")
     ]
     assert breaker_deferrals, "the breaker stop must be the reason the tail deferred"
     assert result["zero_progress"] is True

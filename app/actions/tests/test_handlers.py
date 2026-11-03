@@ -586,7 +586,7 @@ async def test_action_pull_observations_error(mocker, lotek_integration, pull_co
         integration_id=str(lotek_integration.id),
         action_id="pull_observations",
         level=LogLevel.ERROR,
-        title=f"Error fetching devices from Lotek. Integration ID: {str(lotek_integration.id)} Exception: 500: Lotek get_devices failed for user test_user. | Error: "
+        title="Gundi couldn't get the device list from Lotek because something unexpected went wrong."
     )
 
 
@@ -725,7 +725,7 @@ async def test_malformed_data_failure_logs_error_not_warning(
     get_positions.side_effect = get_positions_side_effect
     result = await run_head_pass(lotek_integration, pull_config)
     assert result["devices_failed"] == ["1"]
-    device_logs = [c for c in log.await_args_list if "Device: 1" in c.kwargs.get("title", "")]
+    device_logs = [c for c in log.await_args_list if "device 1" in c.kwargs.get("title", "")]
     assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
 
 
@@ -815,11 +815,11 @@ async def test_action_pull_observations_retries_token_expiry_and_recovers(
 
 
 @pytest.mark.asyncio
-async def test_get_devices_failure_logs_exception_type_when_message_is_empty(
+async def test_get_devices_connection_failure_reads_plainly(
     mocker, lotek_integration, pull_config, mock_redis
 ):
-    # httpx timeouts stringify to "" — the activity log must name the type,
-    # not render a bare ": ". (Transport failures classify WARNING and return
+    # The activity log says what happened in plain words; the exception type
+    # stays in the server log. (Transport failures classify WARNING and return
     # cleanly since the 2026-08-16 congestion fix, so no raise here.)
     mocker.patch("app.services.state.redis", mock_redis)
     mocker.patch("app.services.activity_logger.publish_event", new=AsyncMock())
@@ -834,7 +834,7 @@ async def test_get_devices_failure_logs_exception_type_when_message_is_empty(
     result = await action_pull_observations(lotek_integration, pull_config)
     assert result["reason"] == "lotek_unreachable"
     title = mock_log.call_args.kwargs["title"]
-    assert "ReadTimeout" in title
+    assert title == "Gundi couldn't get the device list from Lotek because it couldn't connect to Lotek."
 
 
 def test_retry_attempts_is_two():
@@ -980,7 +980,7 @@ async def test_stale_span_is_dropped_with_warning_and_not_added_to_gap(
     assert not any("Dropped stale range" in c.kwargs.get("title", "") for c in log.await_args_list)
     summaries = [
         c for c in log.await_args_list
-        if "Dropped data older than" in c.kwargs.get("title", "")
+        if "wasn't imported" in c.kwargs.get("title", "")
     ]
     assert len(summaries) == 1
     assert summaries[0].kwargs["level"] == LogLevel.WARNING
@@ -1075,7 +1075,7 @@ async def test_delivery_failure_stays_error_and_does_not_advance_high_water(
     assert result["devices_failed"] == ["1"]
     error_logs = [
         c for c in log.await_args_list
-        if c.kwargs["level"] == LogLevel.ERROR and "delivering" in c.kwargs["title"].lower()
+        if c.kwargs["level"] == LogLevel.ERROR and "couldn't receive the data" in c.kwargs["title"].lower()
     ]
     assert len(error_logs) == 1
     # only device 2's checkpoint was written
@@ -1162,7 +1162,7 @@ async def test_deadline_defers_remaining_devices_with_warning(
     assert result["devices_failed"] == []
     deferral_logs = [
         c for c in log.await_args_list
-        if c.kwargs["level"] == LogLevel.WARNING and "deadline" in c.kwargs["title"].lower()
+        if c.kwargs["level"] == LogLevel.WARNING and "ran out of time" in c.kwargs["title"].lower()
     ]
     assert len(deferral_logs) == 1
 
@@ -1219,7 +1219,7 @@ async def test_breaker_trips_after_three_consecutive_transport_failures(
     assert result["devices_deferred"] == ["6", "7", "8"]
     breaker_logs = [
         c for c in log.await_args_list
-        if c.kwargs["level"] == LogLevel.WARNING and "circuit breaker" in c.kwargs["title"].lower()
+        if c.kwargs["level"] == LogLevel.WARNING and "lotek kept failing" in c.kwargs["title"].lower()
     ]
     assert len(breaker_logs) == 1
 
@@ -1350,7 +1350,7 @@ async def test_unparseable_state_reset_is_surfaced_at_warning(
     await run_head_pass(lotek_integration, pull_config)
     reset_warnings = [
         c for c in log.await_args_list
-        if c.kwargs["level"] == LogLevel.WARNING and "unparseable" in c.kwargs["title"].lower()
+        if c.kwargs["level"] == LogLevel.WARNING and "saved progress" in c.kwargs["title"].lower()
     ]
     assert len(reset_warnings) == 1
     assert "device 1" in reset_warnings[0].kwargs["title"]
@@ -1471,13 +1471,13 @@ async def test_lotek_5xx_failures_feed_the_circuit_breaker(
     # boundary; devices 6-8 (chunk 2) are deferred and never dispatched
     deferral_logs = [
         c for c in log.await_args_list
-        if "circuit breaker" in c.kwargs.get("title", "").lower()
+        if "lotek kept failing" in c.kwargs.get("title", "").lower()
     ]
     assert len(deferral_logs) == 1
     assert get_positions.await_count == FETCH_CONCURRENCY
     # Outage (5xx/429) failures are local-log only (publish-volume fix): no
     # per-device portal publishes, and in particular no ERRORs.
-    device_logs = [c for c in log.await_args_list if "Device:" in c.kwargs.get("title", "")]
+    device_logs = [c for c in log.await_args_list if "for device " in c.kwargs.get("title", "")]
     assert device_logs == []
 
 
@@ -1497,7 +1497,7 @@ async def test_lotek_4xx_failure_stays_error_and_does_not_feed_breaker(
     result = await run_head_pass(lotek_integration, pull_config)
     assert result["zero_progress"] is True
     assert get_positions.await_count == 4, "4xx failures must not trip the breaker"
-    device_logs = [c for c in log.await_args_list if "Device:" in c.kwargs.get("title", "")]
+    device_logs = [c for c in log.await_args_list if "answered with an error" in c.kwargs.get("title", "")]
     assert device_logs and all(c.kwargs["level"] == LogLevel.ERROR for c in device_logs)
 
 

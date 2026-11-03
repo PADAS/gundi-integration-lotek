@@ -205,11 +205,11 @@ class DeviceTraversal:
                     self.budget_starved = True
                     continue
                 if isinstance(res, BaseException):
-                    message = (
-                        f"Failed to process device {device_id} for integration "
-                        f"{self.integration.id}: {describe_exception(res)}"
+                    message = f"Something unexpected went wrong with device {device_id}."
+                    logger.error(
+                        f"{message} Integration ID: {self.integration.id} Exception: {describe_exception(res)}",
+                        exc_info=res,
                     )
-                    logger.error(message, exc_info=res)
                     await self.log_activity(
                         integration_id=self.integration_id,
                         action_id=self.action_id,
