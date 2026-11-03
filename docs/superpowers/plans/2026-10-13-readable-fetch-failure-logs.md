@@ -28,7 +28,7 @@ Each failed device gets exactly one reason. Reasons and messages live in one mod
 | `lotek_error` | `LotekException` with 5xx or 429 | temporary | Lotek didn't send data for {count} because its server returned an error. |
 | `login_rejected` | `LotekException` with 401 (token expiry that survived its retry) | temporary | Lotek didn't send data for {count} because it rejected Gundi's login. |
 | `delivery_failed` | `_deliver` failed (sending to Gundi) | error | Lotek sent data for {count}, but Gundi couldn't receive it. |
-| `save_failed` | saving the head cursor or the backfill gap failed after delivery | error | Gundi got the latest data for {count} but couldn't save how far it got. |
+| `save_failed` | saving the head cursor failed after delivery | error | Gundi got the latest data for {count} but couldn't save how far it got. |
 | `unexpected` | other 4xx, data-shape errors, and exceptions caught by the traversal | error | Something unexpected went wrong getting data for {count}. The error for each device is in this log. |
 
 `{count}` reads "3 of 55 devices (88634, 88635, 88643)", using `_summarize_ids` for the ids. The total is the connection's device count: the dispatcher passes it to each shard as `total_devices` on `PullObservationsShardConfig` (a shard without it falls back to its own size), and the backfill counts against all listed devices.
@@ -49,7 +49,7 @@ A 401 on a data call already clears the cached token, logs in again and retries.
 
 The head pass keeps a per-device `failing_since` time in the device state (new optional field on `DeviceState`, no schema version bump):
 
-- On a temporary failure, if `failing_since` is empty it is set to now and saved.
+- On a temporary failure, if `failing_since` is empty it is set to now and saved. A brand-new device with no saved state yet is skipped; its clock starts after its first successful save.
 - On a successful head pass, `failing_since` is cleared in the same save that moves the cursor.
 - Error reasons don't change it.
 
@@ -83,7 +83,7 @@ Deferred devices are added as "N postponed to a later run" when there are any. T
 1. Named results instead of positional tuples: `FetchResult(positions, transport_failure, failure_reason)`, `HeadPassResult(sent, transport_failure, failure_reason, escalated)` and `BackfillResult(sent, transport_failure, gap_closed, windows_advanced, cut_reason, failure_reason)`. `device_failed` becomes a property (`failure_reason is not None`).
 2. `_fetch_window`: picks the reason from the `except` branch it falls into (table above). Retries and breaker feeding stay as they are. A 401 that survived its retry is split out of the "other 4xx" branch: local WARNING, no per-device ERROR activity log, not breaker-feeding.
 3. `_head_pass_device`: passes through the fetch reason, or `delivery_failed` / `save_failed`; tracks `failing_since` and sets `escalated`.
-4. `_backfill_device`: same reasons; a failed gap save is reported as `save_failed` instead of raising, so the delivered count is kept and the fairness save to the same store is skipped.
+4. `_backfill_device`: same reasons. Its progress-save handling is unchanged: a failed gap save still raises and is reported as `unexpected`.
 5. Head-pass and backfill loops: `traversal.mark_failed(device_id, reason)`; the head pass collects escalated devices.
 6. Replace the single "Pulled observations with N of M device(s) failing…" warning, and the matching "Backfilled with…" warning, with one message per reason that occurred: WARNING, or ERROR for escalated devices.
 7. Rewrite both zero-progress ERROR messages as above.
@@ -102,5 +102,5 @@ Deferred devices are added as "N postponed to a later run" when there are any. T
 - `test_traversal.py`: `mark_failed` with and without a reason; exceptions in `run()` are recorded as `unexpected`; `failed_by_reason()` grouping and order.
 - `test_failures.py`: message building, counts, and the unknown-reason fallback.
 - `test_handlers.py`: one test per reason (timeout, connect error, 5xx, 429, 401, other 4xx, malformed data, delivery, cursor save); a 401 that survived its retry writes no ERROR; `failing_since` is set on the first temporary failure, kept on the next, cleared on success; a device failing for over 1 hour gets the escalated ERROR; the zero-progress message names the reasons.
-- `test_backfill.py`: the backfill summary uses the same messages; a failed gap save keeps the sent count and skips the fairness save; updated mocks for the named results.
+- `test_backfill.py`: the backfill summary uses the same messages; updated mocks for the named results.
 - `test_sharding.py`: updated `_head_pass_device` mocks.
