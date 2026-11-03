@@ -1322,11 +1322,13 @@ async def _head_pass_device(device_id, state, is_new, integration, auth, action_
     cdip_positions = fetch.positions
     if cdip_positions is None:
         # high_water only moves on a successful pull, so its age is how long
-        # the device has gone without one. A new or just-migrated device
-        # (is_new) has a starting high_water, not a real last success.
+        # the device has gone without one. A brand-new device (is_new) has a
+        # starting high_water, not a real last success. A legacy-migrated
+        # device is also is_new, but its saved cursor is a real (old) last
+        # success, so it escalates like any other.
         escalated = (
             fetch.failure_reason in TEMPORARY_REASONS
-            and not is_new
+            and (not is_new or state.migrated_from_legacy)
             and present_time - state.high_water >= ESCALATION_AFTER
         )
         return HeadPassResult(0, fetch.transport_failure, fetch.failure_reason, escalated)

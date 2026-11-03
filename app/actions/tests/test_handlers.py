@@ -1801,3 +1801,32 @@ async def test_new_device_failure_saves_nothing(
     await run_head_pass(lotek_integration, pull_config)
 
     assert _saved_states(set_state, "1") == []
+
+
+@pytest.mark.asyncio
+async def test_stale_legacy_cursor_failure_escalates(
+    mocker, lotek_integration, pull_config, mock_redis
+):
+    # A lagging legacy cursor loads as is_new (gap migration) and a failed pull
+    # doesn't save the migration, so this repeats every run. Its old cursor is
+    # a real last success, so the failure escalates instead of staying a
+    # warning forever while the other device succeeds.
+    mocker.patch("app.actions.handlers.RETRY_WAIT_INITIAL", 0)
+    mocker.patch("app.actions.handlers.RETRY_WAIT_JITTER", 0)
+    behind = datetime.now(timezone.utc) - timedelta(days=3)
+    get_positions, _, _, log = _setup_pull_mocks(
+        mocker, mock_redis, _devices("1", "2"), saved_state={"updated_at": behind.isoformat()}
+    )
+
+    async def get_positions_side_effect(device_id, *args, **kwargs):
+        if device_id == "1":
+            raise httpx.ReadTimeout("")
+        return []
+
+    get_positions.side_effect = get_positions_side_effect
+    await run_head_pass(lotek_integration, pull_config)
+
+    errors = [c.kwargs["title"] for c in log.await_args_list if c.kwargs.get("level") == LogLevel.ERROR]
+    assert errors == [
+        "Lotek hasn't sent data for 1 of 2 devices (1) for over 1 hour because the connection keeps timing out."
+    ]
