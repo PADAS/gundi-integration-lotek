@@ -13,7 +13,7 @@ After this change:
 - Each warning says what happened, in plain words:
   > Lotek didn't send data for 1 of 25 devices (88630) because the connection timed out.
 - A real error is logged as an ERROR and makes the route unhealthy. Lesser situations are warnings.
-- A temporary failure becomes an ERROR only when the same device keeps failing for over 1 hour.
+- A temporary failure becomes an ERROR only when the device's last successful pull was over 1 hour ago.
 
 Messages report only what happened. They don't predict later runs (for example "will be retried" or "nothing was lost"), because a log can't know that, and old logs are never edited afterwards. Wording stays direct and non-technical.
 
@@ -47,13 +47,9 @@ A 401 on a data call already clears the cached token, logs in again and retries.
 
 ### Temporary failures that last over 1 hour
 
-The head pass keeps a per-device `failing_since` time in the device state (new optional field on `DeviceState`, no schema version bump):
+The rule uses the device's existing `high_water`, which only moves when a head pass succeeds, so its age is how long the device has gone without a successful pull. Nothing new is saved, and overlapping pulls have no extra value to race on.
 
-- On a temporary failure, if `failing_since` is empty it is set to now and saved. A brand-new device with no saved state yet is skipped; its clock starts after its first successful save.
-- On a successful head pass, `failing_since` is cleared in the same save that moves the cursor.
-- Error reasons don't change it.
-
-When a device's `failing_since` is more than 1 hour old, its temporary failure is escalated: instead of the WARNING, each run writes one ERROR per reason, grouped like the warnings:
+When a device's `high_water` is more than 1 hour old, its temporary failure is escalated. A new or just-migrated device (`is_new`) is never escalated, because its starting `high_water` isn't a real last success. When escalated, instead of the WARNING, each run writes one ERROR per reason, grouped like the warnings:
 
 | Reason | Escalated message |
 |---|---|
@@ -62,7 +58,7 @@ When a device's `failing_since` is more than 1 hour old, its temporary failure i
 | `lotek_error` | Lotek hasn't sent data for {count} for over 1 hour because its server keeps returning errors. |
 | `login_rejected` | Lotek hasn't sent data for {count} for over 1 hour because it keeps rejecting Gundi's login. |
 
-The route stays unhealthy while the problem lasts and recovers on its own once the devices work again. The time is measured from the first failure in a row, not by run count, so it doesn't depend on the schedule. Backfill failures don't escalate: the head pass is what keeps data current, so it is the one that decides.
+The route stays unhealthy while the problem lasts and recovers on its own once the devices work again. The time is measured from the last successful pull, not by run count, so it doesn't depend on the schedule. A connection re-enabled after a long pause gets the ERROR on its first temporary failure, because its last success really was over an hour ago. Backfill failures don't escalate: the head pass is what keeps data current, so it is the one that decides.
 
 ### Runs where no device succeeds
 
@@ -91,7 +87,7 @@ Every other message this runner writes to the activity log gets the same plain w
 
 1. Named results instead of positional tuples: `FetchResult(positions, transport_failure, failure_reason)`, `HeadPassResult(sent, transport_failure, failure_reason, escalated)` and `BackfillResult(sent, transport_failure, gap_closed, windows_advanced, cut_reason, failure_reason)`. `device_failed` becomes a property (`failure_reason is not None`).
 2. `_fetch_window`: picks the reason from the `except` branch it falls into (table above). Retries and breaker feeding stay as they are. A 401 that survived its retry is split out of the "other 4xx" branch: local WARNING, no per-device ERROR activity log, not breaker-feeding.
-3. `_head_pass_device`: passes through the fetch reason, or `delivery_failed` / `save_failed`; tracks `failing_since` and sets `escalated`.
+3. `_head_pass_device`: passes through the fetch reason, or `delivery_failed` / `save_failed`; sets `escalated` from the age of `high_water`.
 4. `_backfill_device`: same reasons. Its progress-save handling is unchanged: a failed gap save still raises and is reported as `unexpected`.
 5. Head-pass and backfill loops: `traversal.mark_failed(device_id, reason)`; the head pass collects escalated devices.
 6. Replace the single "Pulled observations with N of M device(s) failing…" warning, and the matching "Backfilled with…" warning, with one message per reason that occurred: WARNING, or ERROR for escalated devices.
@@ -110,6 +106,6 @@ Every other message this runner writes to the activity log gets the same plain w
 
 - `test_traversal.py`: `mark_failed` with and without a reason; exceptions in `run()` are recorded as `unexpected`; `failed_by_reason()` grouping and order.
 - `test_failures.py`: message building, counts, and the unknown-reason fallback.
-- `test_handlers.py`: one test per reason (timeout, connect error, 5xx, 429, 401, other 4xx, malformed data, delivery, cursor save); a 401 that survived its retry writes no ERROR; `failing_since` is set on the first temporary failure, kept on the next, cleared on success; a device failing for over 1 hour gets the escalated ERROR; the zero-progress message names the reasons.
+- `test_handlers.py`: one test per reason (timeout, connect error, 5xx, 429, 401, other 4xx, malformed data, delivery, cursor save); a 401 that survived its retry writes no ERROR; a device whose last successful pull is over 1 hour old gets the escalated ERROR, under 1 hour a WARNING, and a new device never escalates; the zero-progress message names the reasons.
 - `test_backfill.py`: the backfill summary uses the same messages; updated mocks for the named results.
 - `test_sharding.py`: updated `_head_pass_device` mocks.
