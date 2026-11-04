@@ -1,3 +1,4 @@
+import time
 import typing
 
 import pydantic
@@ -9,7 +10,7 @@ from app.services.redaction import (
     redact_secrets,
     secret_field_names,
 )
-from app.services.utils import FieldWithUIOptions, UIOptions
+from app.services.utils import FieldWithUIOptions, UIOptions, UISchemaModelMixin
 
 
 def test_redacts_values_under_sensitive_key_names_at_any_depth():
@@ -70,11 +71,32 @@ class _Config(pydantic.BaseModel):
     password: pydantic.SecretStr
     pin: str = pydantic.Field(..., format="password")
     code: str = FieldWithUIOptions(..., ui_options=UIOptions(widget="password"))
+    devices: str = FieldWithUIOptions(..., writeOnly=True)
+    certificate: str = pydantic.Field(..., writeOnly=True)
     plain: str
 
 
-def test_secret_field_names_reads_secret_str_password_format_and_password_widget():
-    assert secret_field_names(_Config) == frozenset({"password", "pin", "code"})
+def test_secret_field_names_reads_secret_str_password_format_password_widget_and_write_only():
+    assert secret_field_names(_Config) == frozenset({"password", "pin", "code", "devices", "certificate"})
+
+
+def test_write_only_declaration_leaves_the_portal_form_unchanged():
+    # A write-only secret still renders as an ordinary text input: no
+    # password format in the JSON schema and no widget in the UI schema.
+    class _Devices(UISchemaModelMixin, pydantic.BaseModel):
+        devices: str = FieldWithUIOptions(..., title="Devices", writeOnly=True)
+
+    prop = _Devices.schema()["properties"]["devices"]
+    assert prop["type"] == "string"
+    assert "format" not in prop
+    assert _Devices.ui_schema() == {}
+
+
+def test_write_only_false_is_not_a_secret():
+    class _Readable(pydantic.BaseModel):
+        notes: str = pydantic.Field(..., writeOnly=False)
+
+    assert secret_field_names(_Readable) == frozenset()
 
 
 def test_secret_field_names_is_empty_for_a_model_without_secrets():
@@ -85,11 +107,11 @@ def test_secret_field_names_is_empty_for_a_model_without_secrets():
 
 
 def test_redacts_fields_the_model_declares_as_secret_even_with_innocent_names():
-    data = {"username": "u", "pin": "1234", "code": "abcd", "plain": "p"}
+    data = {"username": "u", "pin": "1234", "code": "abcd", "devices": '[{"key": "K"}]', "plain": "p"}
 
     out = redact_secrets(data, model=_Config)
 
-    assert out == {"username": "u", "pin": REDACTED, "code": REDACTED, "plain": "p"}
+    assert out == {"username": "u", "pin": REDACTED, "code": REDACTED, "devices": REDACTED, "plain": "p"}
 
 
 class _AuthConfig(pydantic.BaseModel):
@@ -502,17 +524,92 @@ def test_redact_text_leaves_text_without_secret_pairs_as_is():
     assert redact_text(None) == ""
 
 
+def test_redact_url_masks_the_userinfo():
+    # Basic-auth credentials in the URL itself reach request_url, the
+    # exception text and the traceback exactly like a secret query parameter.
+    assert redact_url("https://user:p%40ss@api.example.com/v1/items?page=2") == (
+        f"https://{REDACTED}@api.example.com/v1/items?page=2"
+    )
+    # A bare token before the "@" (basic auth with an empty password) is the
+    # credential; mask it even though it is "only a username".
+    assert redact_url("https://k-999@api.example.com:8443/v1/items") == (
+        f"https://{REDACTED}@api.example.com:8443/v1/items"
+    )
+    assert redact_url("https://user:secret@api.example.com/v1/items?api_key=k123&page=2") == (
+        f"https://{REDACTED}@api.example.com/v1/items?api_key={REDACTED}&page=2"
+    )
+    assert redact_url("https://api.example.com/v1/items?page=2") == "https://api.example.com/v1/items?page=2"
+
+
+def test_redact_text_masks_the_userinfo_of_a_url_quoted_in_free_text():
+    text = "Client error '401 Unauthorized' for url 'https://user:secret@api.example.com/v1/items'"
+
+    assert redact_text(text) == (
+        f"Client error '401 Unauthorized' for url 'https://{REDACTED}@api.example.com/v1/items'"
+    )
+
+
+def test_redact_url_masks_a_url_nested_in_an_innocent_query_value():
+    # parse_qsl decodes the value first, so the encoded form is caught too.
+    for url in (
+        "https://host/cb?next=https://u:pw@x.test/&page=2",
+        "https://host/cb?next=https%3A%2F%2Fu%3Apw%40x.test%2F&page=2",
+    ):
+        redacted = redact_url(url)
+        assert "pw" not in redacted
+        assert "page=2" in redacted
+    assert "t123" not in redact_url("https://host/cb?next=https%3A%2F%2Fx.test%2F%3Ftoken%3Dt123")
+    # A nested URL with nothing secret in it is left exactly as given.
+    plain = "https://host/cb?next=https%3A%2F%2Fx.test%2Fhome"
+    assert redact_url(plain) == plain
+
+
+def test_redact_url_masks_scheme_relative_and_double_encoded_nested_urls():
+    for url in (
+        "https://host/cb?next=//u:pw@x.test/",
+        "https://host/cb?next=%2F%2Fu%3Apw%40x.test%2F",
+        "https://host/cb?next=https%253A%252F%252Fu%253Apw%2540x.test%252F",
+    ):
+        assert "pw" not in redact_url(url)
+        assert "pw" not in redact_text(f"Client error for url '{url}'")
+    double_encoded_token = "https://host/cb?next=https%253A%252F%252Fx.test%252F%253Ftoken%253Dt123"
+    assert "t123" not in redact_url(double_encoded_token)
+    # An encoded value with nothing secret in it is left exactly as given.
+    plain = "https://host/cb?q=caf%25C3%25A9&page=2"
+    assert redact_url(plain) == plain
+
+
+def test_redact_url_and_text_bound_deeply_nested_query_urls():
+    # Redaction runs inside the runner's error handling: a pathological URL
+    # must be masked, never raise RecursionError.
+    url = "https://h/?next=" * 400 + "https://x/?token=t123"
+
+    assert "t123" not in redact_url(url)
+    assert "t123" not in redact_text(f"Client error for url '{url}'")
+
+
+def test_redact_text_masks_the_userinfo_of_a_url_nested_in_a_query_value():
+    text = "Client error for url 'https://host/cb?next=https://u:pw@x.test/'"
+
+    assert "u:pw" not in redact_text(text)
+
+
 def test_redact_url_masks_a_url_it_cannot_parse_instead_of_raising():
-    assert redact_url("https://[broken]?token=abc") == REDACTED
+    # An unbalanced bracket is rejected by urlsplit on every supported
+    # Python. A balanced one around a non-address host ("[broken]") is
+    # rejected only by 3.11+ and 3.10's later security releases (CI's
+    # 3.10.22 yes, uv's 3.10.14 no); where it parses, only the query gets
+    # masked and the except branch is never reached.
+    assert redact_url("https://[broken?token=abc") == REDACTED
 
 
 def test_redact_text_masks_a_malformed_url_whole_and_never_raises():
     # Redaction runs inside the runner's error handling: raising there
     # would lose the failure event and the structured response.
-    assert redact_text("Client error for url 'https://[broken]?token=abc' (HTTP 403)") == (
+    assert redact_text("Client error for url 'https://[broken?token=abc' (HTTP 403)") == (
         f"Client error for url '{REDACTED}' (HTTP 403)"
     )
-    assert redact_text("https://[broken]?token=abc then page=2") == f"{REDACTED} then page=2"
+    assert redact_text("https://[broken?token=abc then page=2") == f"{REDACTED} then page=2"
 
 
 def test_redact_text_masks_the_whole_value_of_a_sensitive_key():
@@ -568,3 +665,15 @@ def test_redact_text_masks_encoded_names_and_apostrophes_outside_a_url_too():
     )
     # A URL as the value of an innocent pair is still parsed as a URL.
     assert redact_text("url=https://x.test/a?token=t&page=2 next") == f"url=https://x.test/a?token={REDACTED}&page=2 next"
+
+
+def test_redact_text_is_linear_on_long_runs_without_equals():
+    # A long token quoted in an exception (a JWT, a hex or base64 blob) used
+    # to take quadratic time: the key=value branch retried from every
+    # position of the run. This runs inside the async error handling, so a
+    # slow scan stalls the instance's event loop. The bound is generous; the
+    # quadratic version took over 40 s on these inputs.
+    start = time.perf_counter()
+    for text in ("a" * 50_000, "h" * 50_000, "x" + "http" * 12_500):
+        assert redact_text(text) == text
+    assert time.perf_counter() - start < 1

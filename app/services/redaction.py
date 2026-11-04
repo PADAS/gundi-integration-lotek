@@ -12,8 +12,12 @@ Two signals mark a value as secret, and either one is enough:
   ``_``) contains one of ``SENSITIVE_KEY_FRAGMENTS``. Deliberately broad:
   ``token_url`` is redacted too, and that over-redaction is the safe side.
 - Its field declaration. The connector's config model marks the field as
-  ``SecretStr``/``SecretBytes``, ``format="password"``, or a ``password`` UI
-  widget. That catches secrets with innocent names such as ``client_id``.
+  ``SecretStr``/``SecretBytes``, ``format="password"``, a ``password`` UI
+  widget, or ``writeOnly=True``. That catches secrets with innocent names
+  such as ``client_id``. ``writeOnly`` (the JSON Schema keyword for a value
+  that is submitted but never read back) is the one that leaves the portal
+  form unchanged: use it for a secret that is not a password input, such as
+  a JSON document of device keys or a pasted certificate.
   The model is walked alongside the data, so a declaration on a nested
   model (direct, ``Optional``, in a ``List`` or a ``Dict`` value) counts
   too, and a field is matched by its name or its alias: the portal saves a
@@ -132,12 +136,13 @@ def secret_field_names(config_model: Models) -> FrozenSet[str]:
     """The keys under which a connector's config model stores a secret.
 
     Each secret field contributes its name and its alias (the portal saves
-    under the alias). Reads three declarations: a ``SecretStr``/``SecretBytes``
+    under the alias). Reads four declarations: a ``SecretStr``/``SecretBytes``
     annotation (directly, in a container or in a union), ``Field(...,
     format="password")`` (the JSON-schema hint the portal renders as a
-    password input), and ``FieldWithUIOptions(ui_options=UIOptions(widget=
-    "password"))``. Root level only; ``redact_secrets`` follows nested models
-    itself. Empty for anything that is not a model.
+    password input), ``FieldWithUIOptions(ui_options=UIOptions(widget=
+    "password"))``, and ``Field(..., writeOnly=True)`` (a secret the portal
+    renders as an ordinary input). Root level only; ``redact_secrets``
+    follows nested models itself. Empty for anything that is not a model.
     """
     return frozenset(
         key for key, fields in _fields_by_key(_as_models(config_model)).items()
@@ -190,7 +195,8 @@ def _is_secret_field(field: ModelField) -> bool:
     if isinstance(field.type_, type) and issubclass(field.type_, _SECRET_TYPES):
         return True
     field_info = field.field_info
-    if (getattr(field_info, "extra", None) or {}).get("format") == "password":
+    extra = getattr(field_info, "extra", None) or {}
+    if extra.get("format") == "password" or extra.get("writeOnly") is True:
         return True
     ui_options = getattr(field_info, "ui_options", None)
     if getattr(ui_options, "widget", None) == "password":
@@ -316,29 +322,63 @@ def _parse_json(text: str) -> Tuple[Any, bool]:
 
 
 def redact_url(url: str) -> str:
-    """``url`` with secret-looking query parameters masked; returned as given
-    when it has no query string or nothing in it is secret. A URL that
-    cannot be parsed (``https://[broken]?token=abc`` raises in ``urlsplit``)
-    is replaced whole: redaction runs inside the runner's error handling,
-    where raising would lose the failure event and the response."""
-    url = str(url)
+    """``url`` with its userinfo and secret-looking query parameters masked;
+    returned as given when it carries neither. The userinfo
+    (``https://user:password@host/``, or a bare token before the ``@``) is
+    masked whole rather than by part: a username alone is often the API key
+    (HTTP basic auth with an empty password), and the mask still shows that
+    credentials were there. A URL that cannot be parsed (an unbalanced
+    bracket, ``https://[broken?token=abc``, raises in ``urlsplit``) is
+    replaced whole: redaction runs inside the runner's error handling, where
+    raising would lose the failure event and the response."""
+    return _redact_url(str(url), depth=0)
+
+
+def _redact_url(url: str, depth: int) -> str:
     try:
         parts = urlsplit(url)
     except ValueError:
         return REDACTED
-    if not parts.query:
+    # An unencoded "@" is legal in the authority only as the userinfo
+    # delimiter, so everything before the last one is userinfo.
+    userinfo, at, host = parts.netloc.rpartition("@")
+    netloc = f"{REDACTED}@{host}" if at else parts.netloc
+    query = _redact_query(parts.query, depth) if parts.query else parts.query
+    if netloc == parts.netloc and query == parts.query:
         return url
-    query = _redact_query(parts.query)
-    return url if query == parts.query else urlunsplit(parts._replace(query=query))
+    return urlunsplit(parts._replace(netloc=netloc, query=query))
 
 
-def _redact_query(query: str) -> str:
+def _redact_query(query: str, depth: int = 0) -> str:
     """``query`` with secret-looking parameters masked, by the decoded
     parameter name (``api%5Fkey`` is ``api_key``), and re-encoded; returned
-    as given when nothing in it is secret."""
+    as given when nothing in it is secret. An innocent parameter whose value
+    is itself a URL (``?next=https://user:pw@host/``, encoded or not) has
+    that URL redacted too, userinfo and query alike. Past ``_RESCAN_DEPTH``
+    nested URLs the value is masked whole, so a pathological URL cannot
+    recurse without end inside the runner's error handling."""
     pairs = parse_qsl(query, keep_blank_values=True)
-    redacted = [(key, REDACTED if _is_sensitive_key(key) and value else value) for key, value in pairs]
+    redacted = [(key, _redact_query_value(key, value, depth)) for key, value in pairs]
     return query if redacted == pairs else urlencode(redacted, safe="*")
+
+
+def _redact_query_value(key: str, value: str, depth: int) -> str:
+    if not value:
+        return value
+    if _is_sensitive_key(key):
+        return REDACTED
+    if "://" in value or value.startswith("//"):
+        # A URL, absolute or scheme-relative ("//user:pw@host/").
+        return REDACTED if depth >= _RESCAN_DEPTH else _redact_url(value, depth + 1)
+    decoded = unquote(value)
+    if decoded == value:
+        return value
+    # Still percent-encoded after parse_qsl's own decoding (a URL encoded
+    # twice): look again at the decoded form, within the same depth budget.
+    if depth >= _RESCAN_DEPTH:
+        return REDACTED
+    redacted = _redact_query_value(key, decoded, depth + 1)
+    return value if redacted == decoded else redacted
 
 
 # Free text is scanned for two shapes, in one pass so that a pair inside a
@@ -356,9 +396,13 @@ def _redact_query(query: str) -> str:
 #     innocent key's value is scanned again on its own, so "url=https://
 #     x?token=t" still has its query masked and a pair quoted inside a
 #     value is still found.
+# A key starts only where a run of key characters starts. A start inside the
+# run could only find the "=" the run's start already found (the key is
+# greedy), and retrying from every position of a long run with no "=" (a JWT,
+# a hex blob) took quadratic time inside the async error handling.
 _URL_OR_PAIR = re.compile(
     r"""(?P<quote>['"])?(?P<url>https?://[^\s<>"]+)"""
-    r"""|(?P<key>[A-Za-z0-9_.\-\[\]%]+)=(?P<value>(?:"[^"]*"|'[^']*'|[^\s])+)"""
+    r"""|(?<![A-Za-z0-9_.\-\[\]%])(?P<key>[A-Za-z0-9_.\-\[\]%]+)=(?P<value>(?:"[^"]*"|'[^']*'|[^\s])+)"""
 )
 
 
